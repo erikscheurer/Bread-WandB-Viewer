@@ -723,6 +723,102 @@ export function getChartScript(): string {
             return smoothed;
         }
 
+        function getDatasetRunKey(dataset) {
+            return dataset && (dataset._runId || dataset._runName);
+        }
+
+        function withColorAlpha(color, alpha) {
+            if (typeof color !== 'string') return color;
+
+            const alphaHex = Math.round(Math.max(0, Math.min(1, alpha)) * 255)
+                .toString(16)
+                .padStart(2, '0');
+            if (/^#[0-9a-f]{6}$/i.test(color)) {
+                return color + alphaHex;
+            }
+            if (/^#[0-9a-f]{8}$/i.test(color)) {
+                return color.slice(0, 7) + alphaHex;
+            }
+            return color;
+        }
+
+        function setHoveredRun(chart, runKey) {
+            if (!chart) return;
+            if (!runKey) {
+                clearHoveredRun(chart);
+                return;
+            }
+            if (chart.$hoveredRunKey === runKey) return;
+
+            chart.data.datasets.forEach(dataset => {
+                if (!dataset.$hoverBaseStyle) {
+                    dataset.$hoverBaseStyle = {
+                        borderColor: dataset.borderColor,
+                        backgroundColor: dataset.backgroundColor,
+                        borderWidth: dataset.borderWidth
+                    };
+                }
+
+                const baseStyle = dataset.$hoverBaseStyle;
+                const isHoveredRun = runKey &&
+                    getDatasetRunKey(dataset) === runKey;
+                dataset.borderColor = runKey && !isHoveredRun
+                    ? withColorAlpha(baseStyle.borderColor, 0.18)
+                    : baseStyle.borderColor;
+                dataset.backgroundColor = runKey && !isHoveredRun
+                    ? withColorAlpha(baseStyle.backgroundColor, 0.08)
+                    : baseStyle.backgroundColor;
+                dataset.borderWidth = isHoveredRun
+                    ? Math.max(Number(baseStyle.borderWidth) || 2, 2) + 2
+                    : baseStyle.borderWidth;
+            });
+
+            chart.$hoveredRunKey = runKey || null;
+            chart.update('none');
+        }
+
+        function clearHoveredRun(chart, update = true) {
+            if (!chart || !chart.$hoveredRunKey) return;
+
+            chart.data.datasets.forEach(dataset => {
+                const baseStyle = dataset.$hoverBaseStyle;
+                if (!baseStyle) return;
+
+                dataset.borderColor = baseStyle.borderColor;
+                dataset.backgroundColor = baseStyle.backgroundColor;
+                dataset.borderWidth = baseStyle.borderWidth;
+                delete dataset.$hoverBaseStyle;
+            });
+            chart.$hoveredRunKey = null;
+            if (update) {
+                chart.update('none');
+            }
+        }
+
+        function findHoveredRunKey(chart, event, activeElements) {
+            if (!chart || !activeElements || activeElements.length === 0) {
+                return null;
+            }
+
+            const pointerY = Number(event && event.y);
+            let closest = null;
+            let closestDistance = Infinity;
+            activeElements.forEach(active => {
+                const dataset = chart.data.datasets[active.datasetIndex];
+                const runKey = getDatasetRunKey(dataset);
+                if (!runKey || !active.element) return;
+
+                const distance = Number.isFinite(pointerY)
+                    ? Math.abs(active.element.y - pointerY)
+                    : 0;
+                if (distance < closestDistance) {
+                    closest = runKey;
+                    closestDistance = distance;
+                }
+            });
+            return closest;
+        }
+
         /**
          * Create unified Chart.js chart
          */
@@ -757,6 +853,17 @@ export function getChartScript(): string {
                         legend: {
                             display: true,
                             position: 'top',
+                            onHover: function(_event, legendItem, legend) {
+                                const chart = legend.chart;
+                                const dataset = chart.data.datasets[legendItem.datasetIndex];
+                                const runKey = getDatasetRunKey(dataset);
+                                setHoveredRun(chart, runKey);
+                                chart.canvas.style.cursor = 'pointer';
+                            },
+                            onLeave: function(_event, _legendItem, legend) {
+                                clearHoveredRun(legend.chart);
+                                legend.chart.canvas.style.cursor = '';
+                            },
                             onClick: function(event, legendItem, legend) {
                                 const chart = legend.chart;
                                 const clickedDataset = chart.data.datasets[legendItem.datasetIndex];
@@ -817,12 +924,45 @@ export function getChartScript(): string {
                                 usePointStyle: true,
                                 padding: 10,
                                 font: { size: options.isModal ? 12 : 11 },
+                                generateLabels: function(chart) {
+                                    const labels = Chart.defaults.plugins.legend.labels
+                                        .generateLabels(chart);
+                                    const hoveredRunKey = chart.$hoveredRunKey;
+                                    if (!hoveredRunKey) {
+                                        return labels;
+                                    }
+
+                                    const currentTheme = getChartThemeColors();
+                                    return labels.map(item => {
+                                        const dataset = chart.data.datasets[item.datasetIndex];
+                                        const isHovered = getDatasetRunKey(dataset) === hoveredRunKey;
+                                        return {
+                                            ...item,
+                                            fillStyle: isHovered
+                                                ? item.fillStyle
+                                                : withColorAlpha(item.fillStyle, 0.18),
+                                            strokeStyle: isHovered
+                                                ? item.strokeStyle
+                                                : withColorAlpha(item.strokeStyle, 0.18),
+                                            fontColor: isHovered
+                                                ? currentTheme.foreground
+                                                : currentTheme.muted,
+                                            lineWidth: isHovered ? 3 : item.lineWidth
+                                        };
+                                    });
+                                },
                                 filter: (item, data) => !data.datasets[item.datasetIndex]._isRaw
                             }
                         },
                         tooltip: {
                             filter: function(context) {
-                                return !context.dataset._isRaw;
+                                if (context.dataset._isRaw) {
+                                    return false;
+                                }
+
+                                const hoveredRunKey = context.chart.$hoveredRunKey;
+                                return !hoveredRunKey ||
+                                    getDatasetRunKey(context.dataset) === hoveredRunKey;
                             },
                             callbacks: {
                                 label: function(context) {
@@ -897,6 +1037,15 @@ export function getChartScript(): string {
                             }
                         }
                     },
+                    onHover: function(event, activeElements, chart) {
+                        setHoveredRun(
+                            chart,
+                            findHoveredRunKey(chart, event, activeElements)
+                        );
+                        if (options.onHover) {
+                            options.onHover(event, activeElements, chart);
+                        }
+                    },
                     ...(options.onClick && { onClick: options.onClick })
                 }
             });
@@ -915,6 +1064,7 @@ export function getChartScript(): string {
         function updateChartSmoothing(chart, smoothing, showRawData = true) {
             if (!chart || !chart.data.datasets) return;
 
+            clearHoveredRun(chart, false);
             const originals = chart.data.datasets.filter(d => d._isOriginal);
             if (originals.length === 0) return;
             const originalVisibility = originals.map(d => {
