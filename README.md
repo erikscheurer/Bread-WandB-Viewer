@@ -251,7 +251,7 @@ For developers and power users interested in how this extension works.
 - [x] Make drag-to-zoom select the X-axis range by default and fit the Y-axis to
   data in the selected window. Shift-dragging should pan both axes.
   Dragging a box should zoom both axes, but dragging a horizontal line should only zoom the X-axis.
-- [ ] Double clicking one run's name in the chart legend should hide all other runs, and double clicking again should restore all runs to visible.
+- [x] Double clicking one run's name in the chart legend should hide all other runs, and double clicking again should restore all runs to visible.
 - [x] Allow users to resize the chart area in the multi-run viewer by dragging the divider between the chart area and the other charts below it.
 - [ ] Global log-y and log-x toggles should carry over to the fullscreen chart view
 

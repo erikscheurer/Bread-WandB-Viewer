@@ -688,14 +688,54 @@ export function getChartScript(): string {
                                 if (!clickedDataset) return;
 
                                 const runKey = clickedDataset._runId || clickedDataset._runName;
-                                const shouldShow = !chart.isDatasetVisible(legendItem.datasetIndex);
-                                chart.data.datasets.forEach((dataset, datasetIndex) => {
-                                    const datasetRunKey = dataset._runId || dataset._runName;
-                                    if (datasetRunKey === runKey) {
-                                        chart.setDatasetVisibility(datasetIndex, shouldShow);
+                                const setRunVisibility = (targetRunKey, visible) => {
+                                    chart.data.datasets.forEach((dataset, datasetIndex) => {
+                                        const datasetRunKey = dataset._runId || dataset._runName;
+                                        if (datasetRunKey === targetRunKey) {
+                                            chart.setDatasetVisibility(datasetIndex, visible);
+                                        }
+                                    });
+                                };
+                                const clickCount = event.native && event.native.detail
+                                    ? event.native.detail
+                                    : 1;
+
+                                if (clickCount > 1) {
+                                    if (chart.$legendClickTimer) {
+                                        clearTimeout(chart.$legendClickTimer);
+                                        chart.$legendClickTimer = null;
                                     }
-                                });
-                                chart.update();
+
+                                    if (chart.$isolatedRunKey === runKey) {
+                                        chart.data.datasets.forEach((_dataset, datasetIndex) => {
+                                            chart.setDatasetVisibility(datasetIndex, true);
+                                        });
+                                        chart.$isolatedRunKey = null;
+                                    } else {
+                                        chart.data.datasets.forEach((dataset, datasetIndex) => {
+                                            const datasetRunKey = dataset._runId || dataset._runName;
+                                            chart.setDatasetVisibility(datasetIndex, datasetRunKey === runKey);
+                                        });
+                                        chart.$isolatedRunKey = runKey;
+                                    }
+                                    chart.update();
+                                    return;
+                                }
+
+                                if (chart.$legendClickTimer) {
+                                    clearTimeout(chart.$legendClickTimer);
+                                }
+                                chart.$legendClickTimer = setTimeout(() => {
+                                    const runIsVisible = chart.data.datasets.some((dataset, datasetIndex) => {
+                                        const datasetRunKey = dataset._runId || dataset._runName;
+                                        return datasetRunKey === runKey &&
+                                            chart.isDatasetVisible(datasetIndex);
+                                    });
+                                    setRunVisibility(runKey, !runIsVisible);
+                                    chart.$isolatedRunKey = null;
+                                    chart.$legendClickTimer = null;
+                                    chart.update();
+                                }, 250);
                             },
                             labels: {
                                 color: '#d4d4d4',
