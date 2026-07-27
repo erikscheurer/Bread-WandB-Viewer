@@ -70,6 +70,7 @@ Compare training runs side-by-side to understand what hyperparameters and config
 - Color-coded run identification
 - Interactive sidebar for toggling runs on/off
 - Resizable sidebar for better workspace management
+- Resizable chart heights with draggable dividers
 - Automatic folder scanning for all runs
 
 Ideal for hyperparameter tuning, ablation studies, and experiment analysis. No need to switch to your browser to compare metrics.
@@ -96,11 +97,11 @@ Features:
 Advanced chart controls for detailed metric analysis.
 
 - **Smoothing:** Adjustable EMA smoothing with real-time preview
-- **Zoom:** Drag to select region and zoom in
-- **Pan:** Shift+drag to navigate zoomed charts
+- **Zoom:** Drag horizontally to select X and fit Y to visible data, or drag a box to zoom both axes
+- **Pan:** Shift+drag in any direction to pan the X and Y axes
 - **Fullscreen:** Click expand icon on any chart
 - **Log Scales:** Toggle X and Y axis logarithmic scales
-- **Raw Data Overlay:** View smoothed and raw data simultaneously
+- **Raw Data Overlay:** Show the raw trace behind its smoothed run in overview and fullscreen charts, with both values combined in one tooltip
 - **Auto-decimation:** Large datasets (500+ points) automatically downsampled for performance
 
 ### 📂 Automatic File Watching
@@ -172,8 +173,9 @@ code --install-extension wandb-viewer-0.2.2.vsix
 
 | Action | Shortcut |
 |--------|----------|
-| Zoom into region | Click chart + drag |
-| Pan across chart | Shift + drag |
+| Zoom X range and fit Y | Drag horizontally across chart |
+| Zoom X and Y range | Drag a box across chart |
+| Pan X and Y | Shift + drag |
 | Reset zoom | Double-click chart |
 
 ---
@@ -239,16 +241,19 @@ For developers and power users interested in how this extension works.
 
 ### Chart Interaction and State
 
-- [ ] Rework smoothing so the smoothed and raw series share the same visibility
+- [x] Rework smoothing so the smoothed and raw series share the same visibility
   state. Hiding a run should hide every series associated with that run.
-- [ ] Preserve logarithmic-axis settings when runs, smoothing, visibility, or other
+  Show the value of raw run in brackets next to the smoothed value when hovering over a smoothed series.
+- [x] Preserve logarithmic-axis settings when runs, smoothing, visibility, or other
   viewer settings change.
-- [ ] Allow cursor-based range selection in overview charts, not only in fullscreen
+- [x] Allow cursor-based range selection in overview charts, not only in fullscreen
   charts.
-- [ ] Make drag-to-zoom select the X-axis range by default without changing the
-  Y-axis range. Panning sideways should retain the current Y-axis scale.
+- [x] Make drag-to-zoom select the X-axis range by default and fit the Y-axis to
+  data in the selected window. Shift-dragging should pan both axes.
+  Dragging a box should zoom both axes, but dragging a horizontal line should only zoom the X-axis.
 - [ ] Double clicking one run's name in the chart legend should hide all other runs, and double clicking again should restore all runs to visible.
-- [ ] Allow users to resize the chart area in the multi-run viewer by dragging the divider between the chart area and the other charts below it.
+- [x] Allow users to resize the chart area in the multi-run viewer by dragging the divider between the chart area and the other charts below it.
+- [ ] Global log-y and log-x toggles should carry over to the fullscreen chart view
 
 ### Performance
 
@@ -262,6 +267,7 @@ For developers and power users interested in how this extension works.
   diff of the hyperparameter configurations for all runs currently displayed.
 - [ ] Increase contrast for light mode. Maybe rework the color palette to be similar to vs code theme
 - [ ] Colors for the multi-run viewer should be consistent upon reloading the viewer and across different sessions under changing number of runs.
+- [ ] Add sorting and filtering options to the multi-run viewer sidebar (e.g., sort by run name, creation date, latest update)
 
 ---
 

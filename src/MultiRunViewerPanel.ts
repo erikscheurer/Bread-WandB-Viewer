@@ -469,7 +469,7 @@ export class MultiRunViewerPanel {
                 <h3>${group.name}</h3>
                 <div class="charts-grid">
                     ${group.metrics.map(metric => `
-                        <div class="chart-container">
+                        <div class="chart-container" data-chart-type="${type}" data-metric-name="${this._escapeHtml(metric.metricName)}">
                             <div class="chart-header">
                                 <div class="chart-title">${this._escapeHtml(metric.metricName)}</div>
                                 <div class="chart-actions">
@@ -480,6 +480,17 @@ export class MultiRunViewerPanel {
                             <div class="chart-wrapper">
                                 <canvas id="chart-${type}-${metric.index}" data-chart-type="${type}" data-chart-index="${metric.index}" data-metric-name="${this._escapeHtml(metric.metricName)}"></canvas>
                             </div>
+                            <div
+                                class="chart-resize-handle"
+                                role="separator"
+                                aria-label="Resize ${this._escapeHtml(metric.metricName)} chart"
+                                aria-orientation="horizontal"
+                                aria-valuemin="160"
+                                aria-valuemax="1200"
+                                aria-valuenow="200"
+                                tabindex="0"
+                                title="Drag to resize chart height; use arrow keys when focused"
+                            ></div>
                         </div>
                     `).join('')}
                 </div>
@@ -553,6 +564,14 @@ export class MultiRunViewerPanel {
             let trainingMetrics = ${JSON.stringify(mergedMetrics.training)};
             let systemMetrics = ${JSON.stringify(mergedMetrics.system)};
             let activeFullscreenMetric = null;
+            const MIN_CHART_HEIGHT = 160;
+            const MAX_CHART_HEIGHT = 1200;
+            const DEFAULT_CHART_HEIGHT = 200;
+            const persistedViewState = vscode.getState() || {};
+            const savedChartHeights = persistedViewState.chartHeights &&
+                typeof persistedViewState.chartHeights === 'object'
+                ? persistedViewState.chartHeights
+                : {};
 
             // Sidebar resizing
             let isResizing = false;
@@ -592,6 +611,117 @@ export class MultiRunViewerPanel {
 
             // Initialize button position
             updateCollapseButtonPosition();
+
+            // Per-chart height resizing
+            function getChartResizeKey(container) {
+                return container.dataset.chartType + ':' + container.dataset.metricName;
+            }
+
+            function clampChartHeight(height) {
+                return Math.min(MAX_CHART_HEIGHT, Math.max(MIN_CHART_HEIGHT, height));
+            }
+
+            function resizeChartContainer(container, height) {
+                const clampedHeight = Math.round(clampChartHeight(height));
+                const wrapper = container.querySelector('.chart-wrapper');
+                const handle = container.querySelector('.chart-resize-handle');
+                if (!wrapper || !handle) return;
+
+                wrapper.style.height = clampedHeight + 'px';
+                handle.setAttribute('aria-valuenow', String(clampedHeight));
+
+                const canvas = wrapper.querySelector('canvas');
+                const chart = canvas ? chartInstances[canvas.id] : null;
+                if (chart) {
+                    chart.resize();
+                }
+            }
+
+            function saveChartHeight(container) {
+                const wrapper = container.querySelector('.chart-wrapper');
+                if (!wrapper) return;
+
+                savedChartHeights[getChartResizeKey(container)] = Math.round(
+                    wrapper.getBoundingClientRect().height
+                );
+                vscode.setState({
+                    ...persistedViewState,
+                    chartHeights: savedChartHeights
+                });
+            }
+
+            document.querySelectorAll('.chart-container').forEach(container => {
+                const savedHeight = Number(savedChartHeights[getChartResizeKey(container)]);
+                if (Number.isFinite(savedHeight)) {
+                    resizeChartContainer(container, savedHeight);
+                }
+
+                const handle = container.querySelector('.chart-resize-handle');
+                if (!handle) return;
+
+                handle.addEventListener('pointerdown', event => {
+                    if (event.button !== 0) return;
+
+                    const wrapper = container.querySelector('.chart-wrapper');
+                    if (!wrapper) return;
+
+                    const startY = event.clientY;
+                    const startHeight = wrapper.getBoundingClientRect().height;
+                    handle.setPointerCapture(event.pointerId);
+                    handle.classList.add('active');
+                    document.body.classList.add('chart-resizing');
+
+                    const onPointerMove = moveEvent => {
+                        resizeChartContainer(
+                            container,
+                            startHeight + moveEvent.clientY - startY
+                        );
+                    };
+
+                    const finishResize = finishEvent => {
+                        handle.removeEventListener('pointermove', onPointerMove);
+                        handle.removeEventListener('pointerup', finishResize);
+                        handle.removeEventListener('pointercancel', finishResize);
+                        if (handle.hasPointerCapture(finishEvent.pointerId)) {
+                            handle.releasePointerCapture(finishEvent.pointerId);
+                        }
+                        handle.classList.remove('active');
+                        document.body.classList.remove('chart-resizing');
+                        saveChartHeight(container);
+                    };
+
+                    handle.addEventListener('pointermove', onPointerMove);
+                    handle.addEventListener('pointerup', finishResize);
+                    handle.addEventListener('pointercancel', finishResize);
+                    event.preventDefault();
+                });
+
+                handle.addEventListener('keydown', event => {
+                    if (
+                        event.key !== 'ArrowUp' &&
+                        event.key !== 'ArrowDown' &&
+                        event.key !== 'Home'
+                    ) {
+                        return;
+                    }
+
+                    const wrapper = container.querySelector('.chart-wrapper');
+                    if (!wrapper) return;
+
+                    if (event.key === 'Home') {
+                        resizeChartContainer(container, DEFAULT_CHART_HEIGHT);
+                    } else {
+                        const direction = event.key === 'ArrowDown' ? 1 : -1;
+                        const step = event.shiftKey ? 50 : 20;
+                        resizeChartContainer(
+                            container,
+                            wrapper.getBoundingClientRect().height + direction * step
+                        );
+                    }
+                    saveChartHeight(container);
+                    event.preventDefault();
+                });
+            });
 
             // Sidebar collapse/expand
             function toggleSidebar() {
@@ -702,6 +832,7 @@ export class MultiRunViewerPanel {
                     _originalData: dataset.data.map(d => ({ x: d.step, y: d.value })),
                     _originalColor: dataset.color,
                     _runName: dataset.runName,
+                    _runId: dataset.runId,
                     _isOriginal: true
                 }));
             }
@@ -726,7 +857,7 @@ export class MultiRunViewerPanel {
                 const smoothing = isModal
                     ? parseFloat(document.getElementById('modalSmoothing').value)
                     : globalSmoothing;
-                updateChartSmoothing(chart, smoothing, isModal ? true : showRaw);
+                updateChartSmoothing(chart, smoothing, isModal ? modalShowRaw : showRaw);
             }
 
             window.addEventListener('message', event => {
@@ -779,6 +910,9 @@ export class MultiRunViewerPanel {
 
                 document.getElementById('modalSmoothing').value = 0;
                 document.getElementById('modalSmoothingValue').textContent = '0.00';
+                document.getElementById('modalShowRawGroup').style.display = 'none';
+                modalShowRaw = showRaw;
+                document.getElementById('modalShowRawBtn').classList.toggle('active', modalShowRaw);
                 modalLogX = false;
                 modalLogY = false;
                 document.getElementById('modalLogXBtn').classList.remove('active');
@@ -822,7 +956,7 @@ export class MultiRunViewerPanel {
                             // Create the chart
                             chartInstances[canvasId] = createUnifiedChart(canvas, datasets, metric.metricName, {
                                 isModal: false,
-                                enableZoom: false
+                                enableZoom: true
                             });
 
                             // Apply current global smoothing to newly created chart
@@ -1136,6 +1270,45 @@ export class MultiRunViewerPanel {
             }
             .tab-content.active {
                 display: block;
+            }
+            .chart-resize-handle {
+                position: relative;
+                height: 16px;
+                margin: 6px -8px -10px;
+                border-top: 1px solid var(--vscode-panel-border, #555);
+                cursor: row-resize;
+                touch-action: none;
+                transition: border-color 0.15s, background-color 0.15s;
+            }
+            .chart-resize-handle::after {
+                content: '';
+                position: absolute;
+                top: 4px;
+                left: 50%;
+                width: 48px;
+                height: 4px;
+                border-radius: 2px;
+                background: var(--vscode-descriptionForeground, #999);
+                opacity: 0.85;
+                transform: translateX(-50%);
+                transition: background-color 0.15s, opacity 0.15s;
+            }
+            .chart-resize-handle:hover,
+            .chart-resize-handle:focus-visible,
+            .chart-resize-handle.active {
+                border-top-color: var(--vscode-focusBorder, #007acc);
+                background: var(--vscode-list-hoverBackground);
+                outline: none;
+            }
+            .chart-resize-handle:hover::after,
+            .chart-resize-handle:focus-visible::after,
+            .chart-resize-handle.active::after {
+                background: var(--vscode-focusBorder, #007acc);
+                opacity: 1;
+            }
+            body.chart-resizing {
+                cursor: row-resize;
+                user-select: none;
             }
         `;
     }

@@ -45,6 +45,23 @@ generated files by hand.
 before relying on it; they are not currently declared in this package's development
 dependencies.
 
+## Local extension installation
+
+After implementing extension behavior changes, package and install a fresh VSIX in
+the local VS Code before reporting completion, unless the user explicitly asks not
+to install it. Build the VSIX outside the repository so local packages are not
+accidentally committed:
+
+```bash
+npx vsce package --out /tmp/wandb-viewer-local.vsix
+code --install-extension /tmp/wandb-viewer-local.vsix --force
+```
+
+Inspect the package file list before installation as described in the change
+checklist. After installation, tell the user to run `Developer: Reload Window`;
+installing a VSIX does not replace code already loaded by the current extension
+host.
+
 ## Implementation conventions
 
 - Keep TypeScript compatible with the strict settings in `tsconfig.json` and with
@@ -77,6 +94,10 @@ dependencies.
   constructed record types in `wandbParser.ts`/`MultiRunScanner.ts` consistent.
 - Reuse the shared chart helpers in `chartTemplate.ts` for behavior common to the
   single-run and multi-run views rather than duplicating browser-side logic.
+- Treat raw and smoothed datasets as visual variants of one run. Preserve a stable
+  run identity across derived datasets, keep their visibility synchronized, expose
+  one legend and tooltip concept per run, and keep equivalent overview/fullscreen
+  controls behaviorally aligned.
 
 ## Privacy and security
 

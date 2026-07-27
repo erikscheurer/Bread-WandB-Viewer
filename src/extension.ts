@@ -412,6 +412,9 @@ class WandbEditorProvider implements vscode.CustomReadonlyEditorProvider {
 
                 document.getElementById('modalSmoothing').value = 0;
                 document.getElementById('modalSmoothingValue').textContent = '0.00';
+                document.getElementById('modalShowRawGroup').style.display = 'none';
+                modalShowRaw = showRaw;
+                document.getElementById('modalShowRawBtn').classList.toggle('active', modalShowRaw);
                 modalLogX = false;
                 modalLogY = false;
                 document.getElementById('modalLogXBtn').classList.remove('active');
@@ -465,7 +468,7 @@ class WandbEditorProvider implements vscode.CustomReadonlyEditorProvider {
                     _isOriginal: true
                 }];
 
-                chartInstances[canvasId] = createUnifiedChart(ctx, datasets, metricName, { isModal: false, enableZoom: false });
+                chartInstances[canvasId] = createUnifiedChart(ctx, datasets, metricName, { isModal: false, enableZoom: true });
             }
 
             let chartIndex = 0;

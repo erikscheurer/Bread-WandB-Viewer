@@ -277,6 +277,11 @@ export function getChartStyles(): string {
             height: 200px;
         }
 
+        .range-interactive-chart {
+            cursor: crosshair;
+            touch-action: none;
+        }
+
         .btn-small, .btn-fullscreen {
             background: transparent;
             border: 1px solid var(--vscode-button-border);
@@ -381,6 +386,7 @@ export function getChartScript(): string {
         let modalChart = null;
         let globalSmoothing = 0;
         let showRaw = true;
+        let modalShowRaw = true;
         let logX = false;
         let logY = false;
         let modalLogX = false;
@@ -389,6 +395,241 @@ export function getChartScript(): string {
         let chartImageMenuOpen = false;
 
         // ==================== CORE FUNCTIONS ====================
+
+        const RANGE_BOX_THRESHOLD = 20;
+        const RANGE_MIN_DISTANCE = 8;
+
+        const rangeSelectionPlugin = {
+            id: 'rangeSelection',
+            afterDraw(chart) {
+                const selection = chart.$rangeSelection;
+                if (!selection) return;
+
+                const ctx = chart.ctx;
+                const left = Math.min(selection.start.x, selection.end.x);
+                const right = Math.max(selection.start.x, selection.end.x);
+                const top = Math.min(selection.start.y, selection.end.y);
+                const bottom = Math.max(selection.start.y, selection.end.y);
+                const isBox = Math.abs(selection.end.y - selection.start.y) >= RANGE_BOX_THRESHOLD;
+
+                ctx.save();
+                if (isBox) {
+                    ctx.fillStyle = 'rgba(0, 122, 204, 0.16)';
+                    ctx.strokeStyle = 'rgba(0, 122, 204, 0.9)';
+                    ctx.lineWidth = 1;
+                    ctx.fillRect(left, top, right - left, bottom - top);
+                    ctx.strokeRect(left, top, right - left, bottom - top);
+                } else {
+                    ctx.strokeStyle = 'rgba(0, 122, 204, 0.95)';
+                    ctx.lineWidth = 3;
+                    ctx.lineCap = 'round';
+                    ctx.beginPath();
+                    ctx.moveTo(selection.start.x, selection.start.y);
+                    ctx.lineTo(selection.end.x, selection.start.y);
+                    ctx.stroke();
+                }
+                ctx.restore();
+            },
+            afterDestroy(chart) {
+                if (chart.$rangeInteractionCleanup) {
+                    chart.$rangeInteractionCleanup();
+                }
+            }
+        };
+
+        function getChartPointerPosition(chart, event) {
+            const rect = chart.canvas.getBoundingClientRect();
+            const area = chart.chartArea;
+            return {
+                x: Math.min(area.right, Math.max(area.left, event.clientX - rect.left)),
+                y: Math.min(area.bottom, Math.max(area.top, event.clientY - rect.top))
+            };
+        }
+
+        function isPointInChartArea(chart, point) {
+            const area = chart.chartArea;
+            return point.x >= area.left && point.x <= area.right &&
+                point.y >= area.top && point.y <= area.bottom;
+        }
+
+        function fitYAxisToVisibleX(chart, minX, maxX) {
+            const logarithmic = chart.scales.y.type === 'logarithmic';
+            let minY = Infinity;
+            let maxY = -Infinity;
+
+            chart.data.datasets.forEach((dataset, datasetIndex) => {
+                if (!chart.isDatasetVisible(datasetIndex)) return;
+
+                dataset.data.forEach(point => {
+                    if (!point || typeof point !== 'object') return;
+
+                    const x = Number(point.x);
+                    const y = Number(point.y);
+                    if (
+                        !Number.isFinite(x) ||
+                        !Number.isFinite(y) ||
+                        x < minX ||
+                        x > maxX ||
+                        (logarithmic && y <= 0)
+                    ) {
+                        return;
+                    }
+
+                    minY = Math.min(minY, y);
+                    maxY = Math.max(maxY, y);
+                });
+            });
+
+            if (!Number.isFinite(minY) || !Number.isFinite(maxY)) return;
+
+            if (logarithmic) {
+                const paddingFactor = minY === maxY
+                    ? 1.1
+                    : Math.pow(maxY / minY, 0.05);
+                minY /= paddingFactor;
+                maxY *= paddingFactor;
+            } else {
+                const range = maxY - minY;
+                const padding = range === 0
+                    ? Math.max(Math.abs(minY) * 0.05, 1e-9)
+                    : range * 0.05;
+                minY -= padding;
+                maxY += padding;
+            }
+
+            chart.zoomScale('y', { min: minY, max: maxY }, 'none');
+        }
+
+        function installRangeInteractions(chart) {
+            const canvas = chart.canvas;
+            const originalTitle = canvas.getAttribute('title');
+            let gesture = null;
+
+            canvas.classList.add('range-interactive-chart');
+            canvas.setAttribute(
+                'title',
+                'Drag horizontally to zoom X and fit Y; drag a box to zoom X and Y; Shift+drag to pan both axes; double-click to reset'
+            );
+
+            const finishGesture = event => {
+                if (!gesture) return;
+
+                if (gesture.type === 'select' && event.type !== 'pointercancel') {
+                    const selection = chart.$rangeSelection;
+                    if (selection) {
+                        const distanceX = Math.abs(selection.end.x - selection.start.x);
+                        const distanceY = Math.abs(selection.end.y - selection.start.y);
+
+                        if (distanceX >= RANGE_MIN_DISTANCE) {
+                            const xScale = chart.scales.x;
+                            const xStart = xScale.getValueForPixel(selection.start.x);
+                            const xEnd = xScale.getValueForPixel(selection.end.x);
+                            const xRange = {
+                                min: Math.min(xStart, xEnd),
+                                max: Math.max(xStart, xEnd)
+                            };
+                            const isBox = distanceY >= RANGE_BOX_THRESHOLD;
+                            let yRange = null;
+
+                            if (isBox) {
+                                const yScale = chart.scales.y;
+                                const yStart = yScale.getValueForPixel(selection.start.y);
+                                const yEnd = yScale.getValueForPixel(selection.end.y);
+                                yRange = {
+                                    min: Math.min(yStart, yEnd),
+                                    max: Math.max(yStart, yEnd)
+                                };
+                            }
+
+                            chart.zoomScale('x', xRange, 'none');
+
+                            if (yRange) {
+                                chart.zoomScale('y', yRange, 'none');
+                            } else {
+                                fitYAxisToVisibleX(chart, xRange.min, xRange.max);
+                            }
+                        }
+                    }
+                }
+                chart.$rangeSelection = null;
+                chart.draw();
+
+                if (canvas.hasPointerCapture(event.pointerId)) {
+                    canvas.releasePointerCapture(event.pointerId);
+                }
+                gesture = null;
+                canvas.style.cursor = '';
+            };
+
+            const onPointerDown = event => {
+                if (event.button !== 0) return;
+
+                const point = getChartPointerPosition(chart, event);
+                if (!isPointInChartArea(chart, point)) return;
+
+                gesture = {
+                    type: event.shiftKey ? 'pan' : 'select',
+                    start: point,
+                    last: point
+                };
+                canvas.setPointerCapture(event.pointerId);
+                canvas.style.cursor = gesture.type === 'pan' ? 'grabbing' : 'crosshair';
+
+                if (gesture.type === 'select') {
+                    chart.$rangeSelection = { start: point, end: point };
+                    chart.draw();
+                }
+                event.preventDefault();
+            };
+
+            const onPointerMove = event => {
+                if (!gesture) return;
+
+                const point = getChartPointerPosition(chart, event);
+                if (gesture.type === 'pan') {
+                    const deltaX = point.x - gesture.last.x;
+                    const deltaY = point.y - gesture.last.y;
+                    if (deltaX !== 0 || deltaY !== 0) {
+                        chart.pan(
+                            { x: deltaX, y: deltaY },
+                            [chart.scales.x, chart.scales.y],
+                            'none'
+                        );
+                    }
+                    gesture.last = point;
+                } else {
+                    chart.$rangeSelection.end = point;
+                    chart.draw();
+                }
+                event.preventDefault();
+            };
+
+            const onDoubleClick = event => {
+                chart.resetZoom('none');
+                event.preventDefault();
+            };
+
+            canvas.addEventListener('pointerdown', onPointerDown);
+            canvas.addEventListener('pointermove', onPointerMove);
+            canvas.addEventListener('pointerup', finishGesture);
+            canvas.addEventListener('pointercancel', finishGesture);
+            canvas.addEventListener('dblclick', onDoubleClick);
+
+            chart.$rangeInteractionCleanup = () => {
+                canvas.removeEventListener('pointerdown', onPointerDown);
+                canvas.removeEventListener('pointermove', onPointerMove);
+                canvas.removeEventListener('pointerup', finishGesture);
+                canvas.removeEventListener('pointercancel', finishGesture);
+                canvas.removeEventListener('dblclick', onDoubleClick);
+                canvas.classList.remove('range-interactive-chart');
+                canvas.style.cursor = '';
+                if (originalTitle === null) {
+                    canvas.removeAttribute('title');
+                } else {
+                    canvas.setAttribute('title', originalTitle);
+                }
+            };
+        }
 
         /**
          * EMA smoothing algorithm
@@ -415,11 +656,12 @@ export function getChartScript(): string {
             // Calculate max dataset size for decimation
             const maxPoints = Math.max(...datasets.map(d => d.data ? d.data.length : 0), 0);
 
-            return new Chart(ctx, {
+            const chart = new Chart(ctx, {
                 type: 'line',
                 data: {
                     datasets
                 },
+                plugins: options.enableZoom ? [rangeSelectionPlugin] : [],
                 options: {
                     parsing: {
                         xAxisKey: 'x',
@@ -440,40 +682,59 @@ export function getChartScript(): string {
                         legend: {
                             display: true,
                             position: 'top',
+                            onClick: function(event, legendItem, legend) {
+                                const chart = legend.chart;
+                                const clickedDataset = chart.data.datasets[legendItem.datasetIndex];
+                                if (!clickedDataset) return;
+
+                                const runKey = clickedDataset._runId || clickedDataset._runName;
+                                const shouldShow = !chart.isDatasetVisible(legendItem.datasetIndex);
+                                chart.data.datasets.forEach((dataset, datasetIndex) => {
+                                    const datasetRunKey = dataset._runId || dataset._runName;
+                                    if (datasetRunKey === runKey) {
+                                        chart.setDatasetVisibility(datasetIndex, shouldShow);
+                                    }
+                                });
+                                chart.update();
+                            },
                             labels: {
                                 color: '#d4d4d4',
                                 usePointStyle: true,
                                 padding: 10,
                                 font: { size: options.isModal ? 12 : 11 },
-                                filter: (item) => !item.text.includes(' (raw)')
+                                filter: (item, data) => !data.datasets[item.datasetIndex]._isRaw
                             }
                         },
                         tooltip: {
+                            filter: function(context) {
+                                return !context.dataset._isRaw;
+                            },
                             callbacks: {
                                 label: function(context) {
                                     const label = context.dataset.label || '';
                                     const value = context.parsed.y;
                                     const decimals = options.isModal ? 6 : 4;
-                                    const formatted = Math.abs(value) < 0.001 || Math.abs(value) > 10000
-                                        ? value.toExponential(decimals)
-                                        : value.toFixed(decimals);
-                                    return label + ': ' + formatted;
+                                    const formatValue = rawValue =>
+                                        Math.abs(rawValue) < 0.001 || Math.abs(rawValue) > 10000
+                                            ? rawValue.toExponential(decimals)
+                                            : rawValue.toFixed(decimals);
+                                    const formatted = formatValue(value);
+                                    const runKey = context.dataset._runId || context.dataset._runName;
+                                    const rawDataset = context.chart.data.datasets.find(dataset => {
+                                        const datasetRunKey = dataset._runId || dataset._runName;
+                                        return dataset._isRaw && datasetRunKey === runKey;
+                                    });
+                                    const rawPoint = rawDataset && rawDataset.data[context.dataIndex];
+                                    const rawValue = rawPoint && typeof rawPoint === 'object'
+                                        ? Number(rawPoint.y)
+                                        : NaN;
+                                    const rawSuffix = Number.isFinite(rawValue)
+                                        ? ' (' + formatValue(rawValue) + ')'
+                                        : '';
+                                    return label + ': ' + formatted + rawSuffix;
                                 }
                             }
-                        },
-                        ...(options.enableZoom && {
-                            zoom: {
-                                zoom: {
-                                    drag: {
-                                        enabled: true,
-                                        backgroundColor: 'rgba(255, 255, 255, 0.1)',
-                                        borderColor: 'rgba(255, 255, 255, 0.4)',
-                                        borderWidth: 1
-                                    },
-                                    mode: 'xy'
-                                }
-                            }
-                        })
+                        }
                     },
                     scales: {
                         x: {
@@ -524,6 +785,12 @@ export function getChartScript(): string {
                     ...(options.onClick && { onClick: options.onClick })
                 }
             });
+
+            if (options.enableZoom) {
+                installRangeInteractions(chart);
+            }
+
+            return chart;
         }
 
         /**
@@ -534,29 +801,37 @@ export function getChartScript(): string {
 
             const originals = chart.data.datasets.filter(d => d._isOriginal);
             if (originals.length === 0) return;
+            const originalVisibility = originals.map(d => {
+                const datasetIndex = chart.data.datasets.indexOf(d);
+                return chart.isDatasetVisible(datasetIndex);
+            });
+            const newDatasets = [];
 
             if (smoothing === 0) {
-                chart.data.datasets = originals.map(d => ({
-                    label: d._runName,
-                    data: d._originalData,
-                    borderColor: d._originalColor,
-                    backgroundColor: d._originalColor + '20',
-                    fill: true,
-                    tension: 0.1,
-                    pointRadius: d._originalData.length > 100 ? 0 : 2,
-                    pointHoverRadius: 4,
-                    borderWidth: 2,
-                    _originalData: d._originalData,
-                    _originalColor: d._originalColor,
-                    _runName: d._runName,
-                    _isOriginal: true
-                }));
+                originals.forEach((d, originalIndex) => {
+                    newDatasets.push({
+                        label: d._runName,
+                        data: d._originalData,
+                        borderColor: d._originalColor,
+                        backgroundColor: d._originalColor + '20',
+                        fill: true,
+                        tension: 0.1,
+                        pointRadius: d._originalData.length > 100 ? 0 : 2,
+                        pointHoverRadius: 4,
+                        borderWidth: 2,
+                        _originalData: d._originalData,
+                        _originalColor: d._originalColor,
+                        _runName: d._runName,
+                        _runId: d._runId,
+                        _isOriginal: true,
+                        _runVisible: originalVisibility[originalIndex]
+                    });
+                });
             } else {
-                const newDatasets = [];
-
-                originals.forEach(d => {
+                originals.forEach((d, originalIndex) => {
                     const values = d._originalData.map(p => p.y);
                     const smoothed = applySmoothing(values, smoothing);
+                    const runVisible = originalVisibility[originalIndex];
 
                     if (showRawData) {
                         newDatasets.push({
@@ -572,7 +847,10 @@ export function getChartScript(): string {
                             _originalData: d._originalData,
                             _originalColor: d._originalColor,
                             _runName: d._runName,
-                            _isOriginal: false
+                            _runId: d._runId,
+                            _isOriginal: false,
+                            _isRaw: true,
+                            _runVisible: runVisible
                         });
                     }
 
@@ -589,13 +867,18 @@ export function getChartScript(): string {
                         _originalData: d._originalData,
                         _originalColor: d._originalColor,
                         _runName: d._runName,
-                        _isOriginal: true
+                        _runId: d._runId,
+                        _isOriginal: true,
+                        _runVisible: runVisible
                     });
                 });
-
-                chart.data.datasets = newDatasets;
             }
 
+            chart.data.datasets = newDatasets;
+            chart.data.datasets.forEach((dataset, datasetIndex) => {
+                chart.setDatasetVisibility(datasetIndex, dataset._runVisible);
+                delete dataset._runVisible;
+            });
             chart.update('none');
         }
 
@@ -768,11 +1051,12 @@ export function getChartScript(): string {
                     _originalData: dataset.data.map(d => ({ x: d.step, y: d.value })),
                     _originalColor: dataset.color,
                     _runName: dataset.runName,
+                    _runId: dataset.runId,
                     _isOriginal: true
                 }));
 
                 chartInstances[canvasId] = createUnifiedChart(canvas, datasets, metric.metricName, {
-                    isModal: false, enableZoom: false
+                    isModal: false, enableZoom: true
                 });
                 updateChartSmoothing(chartInstances[canvasId], globalSmoothing, showRaw);
                 await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
@@ -878,12 +1162,13 @@ export function getChartScript(): string {
                                 _originalData: dataset.data.map(d => ({ x: d.step, y: d.value })),
                                 _originalColor: dataset.color,
                                 _runName: dataset.runName,
+                                _runId: dataset.runId,
                                 _isOriginal: true
                             }));
 
                             chartInstances[canvasId] = createUnifiedChart(
                                 canvas, datasets, metric.metricName,
-                                { isModal: false, enableZoom: false }
+                                { isModal: false, enableZoom: true }
                             );
                             updateChartSmoothing(chartInstances[canvasId], globalSmoothing, showRaw);
                         }
@@ -1029,7 +1314,17 @@ export function getChartScript(): string {
         function updateModalSmoothing() {
             const value = parseFloat(document.getElementById('modalSmoothing').value);
             document.getElementById('modalSmoothingValue').textContent = value.toFixed(2);
-            updateChartSmoothing(modalChart, value, true);
+            document.getElementById('modalShowRawGroup').style.display =
+                value > 0 ? 'flex' : 'none';
+            updateChartSmoothing(modalChart, value, modalShowRaw);
+        }
+
+        function toggleModalShowRaw() {
+            modalShowRaw = !modalShowRaw;
+            document.getElementById('modalShowRawBtn').classList.toggle('active', modalShowRaw);
+
+            const smoothing = parseFloat(document.getElementById('modalSmoothing').value);
+            updateChartSmoothing(modalChart, smoothing, modalShowRaw);
         }
 
         function toggleModalLogAxis(axis) {
@@ -1057,16 +1352,6 @@ export function getChartScript(): string {
         document.addEventListener('keydown', (e) => {
             if (e.key === 'Escape') closeFullscreen();
         });
-
-        // Double-click to reset zoom in modal
-        const modalCanvas = document.getElementById('modalChart');
-        if (modalCanvas) {
-            modalCanvas.addEventListener('dblclick', () => {
-                if (modalChart) {
-                    modalChart.resetZoom();
-                }
-            });
-        }
 
         // Tab switching
         document.querySelectorAll('.tab').forEach(tab => {
@@ -1149,11 +1434,14 @@ export function getModalHtml(leadingControlsHtml: string = ''): string {
                         <input type="range" id="modalSmoothing" min="0" max="0.99" step="0.01" value="0" oninput="updateModalSmoothing()">
                         <span class="smoothing-value" id="modalSmoothingValue">0.00</span>
                     </div>
+                    <div class="control-group" id="modalShowRawGroup" style="display: none;">
+                        <button class="toggle-btn active" id="modalShowRawBtn" onclick="toggleModalShowRaw()">Show Raw</button>
+                    </div>
                     <div class="axis-toggles">
                         <button class="toggle-btn" id="modalLogXBtn" onclick="toggleModalLogAxis('x')">Log X</button>
                         <button class="toggle-btn" id="modalLogYBtn" onclick="toggleModalLogAxis('y')">Log Y</button>
                     </div>
-                    <span class="zoom-hint">Drag to zoom • Double-click to reset</span>
+                    <span class="zoom-hint">Horizontal drag: zoom X + fit Y • Box: zoom X/Y • Shift+drag: pan X/Y • Double-click: reset</span>
                     <button class="modal-close" onclick="closeFullscreen()">&times;</button>
                 </div>
             </div>
