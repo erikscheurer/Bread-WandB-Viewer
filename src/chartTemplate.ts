@@ -1086,9 +1086,10 @@ export function getChartScript(): string {
 /**
  * Returns the controls bar HTML
  */
-export function getControlsBarHtml(): string {
+export function getControlsBarHtml(leadingControlsHtml: string = ''): string {
     return `
         <div class="controls-bar">
+            ${leadingControlsHtml}
             <div class="control-group">
                 <label for="searchInput">Search:</label>
                 <input type="text" id="searchInput" placeholder="Filter metrics (regex)..." oninput="filterMetrics()">
@@ -1136,12 +1137,13 @@ export function getControlsBarHtml(): string {
 /**
  * Returns the fullscreen modal HTML
  */
-export function getModalHtml(): string {
+export function getModalHtml(leadingControlsHtml: string = ''): string {
     return `
         <div id="fullscreenModal" class="modal">
             <div class="modal-header">
                 <div class="modal-title" id="modalTitle"></div>
                 <div class="modal-controls">
+                    ${leadingControlsHtml}
                     <div class="smoothing-control">
                         <label for="modalSmoothing">Smoothing:</label>
                         <input type="range" id="modalSmoothing" min="0" max="0.99" step="0.01" value="0" oninput="updateModalSmoothing()">

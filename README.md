@@ -105,10 +105,15 @@ Advanced chart controls for detailed metric analysis.
 
 ### 📂 Automatic File Watching
 
-The extension automatically detects when new .wandb files are created or updated and refreshes the view without manual intervention.
+While the viewer is visible, the extension detects new or updated `.wandb` files
+and refreshes changed run data at a throttled interval. Continually written runs
+therefore keep updating without waiting for training to stop.
 
-- No refresh button needed
-- Works seamlessly with running training scripts
+- Existing charts update in place, preserving zoom, log axes, smoothing, and
+  fullscreen state
+- Live parsing and chart updates pause while the viewer is hidden to save CPU and
+  resume with a catch-up scan when it becomes visible again
+- A modification-time check catches file updates missed by the filesystem watcher
 - Detects new runs added to folders
 - Updates existing run views when files change
 
@@ -226,10 +231,11 @@ For developers and power users interested in how this extension works.
 
 ### Run Refresh and Discovery
 
-- [x] Add a reload button to refresh the data for all runs currently displayed in
-  the viewer.
+- [x] Add a reload button to the main viewer toolbar and single-metric fullscreen
+  view that refreshes the data for all runs currently displayed while preserving
+  the fullscreen metric and zoom.
 - [ ] Periodically rescan the selected folder for new runs.
-- [ ] Add a dedicated button to trigger run discovery immediately.
+- [x] Add a dedicated sidebar button to trigger run discovery immediately.
 
 ### Chart Interaction and State
 
@@ -250,10 +256,12 @@ For developers and power users interested in how this extension works.
   deactivated and parse/load a run only when the user enables it, reducing initial
   startup time for folders containing many runs.
 
-### New Features
+### Functionality
 
 - [ ] Add a "Compare Configs" button to the multi-run viewer to show a side-by-side
   diff of the hyperparameter configurations for all runs currently displayed.
+- [ ] Increase contrast for light mode. Maybe rework the color palette to be similar to vs code theme
+- [ ] Colors for the multi-run viewer should be consistent upon reloading the viewer and across different sessions under changing number of runs.
 
 ---
 

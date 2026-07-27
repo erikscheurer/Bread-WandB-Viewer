@@ -36,6 +36,11 @@ There is no automated VS Code integration-test suite. For UI or parser changes,
 also launch the Extension Development Host with `F5` and exercise the affected
 single-run or multi-run workflow with representative `.wandb` files.
 
+TypeScript compilation does not remove obsolete files from `out/`. When deleting or
+moving a source module, ensure its stale compiled JavaScript and source map are not
+left in a packaged build; clean generated output and recompile rather than editing
+generated files by hand.
+
 `npm run lint` exists, but verify that ESLint and its configuration are available
 before relying on it; they are not currently declared in this package's development
 dependencies.
@@ -49,11 +54,20 @@ dependencies.
 - Keep extension-host code and webview code separate. Data crosses the boundary via
   `webview.postMessage`/`onDidReceiveMessage`; validate message fields before using
   them as paths, identifiers, or HTML content.
+- Give webview actions with transient UI state an explicit host response, preferably
+  sent from a `finally` block. Do not rely on assigning `webview.html` to reset a
+  button or spinner because unchanged HTML may leave the existing DOM in place.
+- For data-only refreshes, update existing webview charts through messages instead
+  of replacing `webview.html`; rebuilding the document discards zoom, log-axis,
+  smoothing, fullscreen, and other browser-side state.
 - Preserve VS Code disposal lifecycles. Register commands, watchers, panels, and
   listeners in the relevant `context.subscriptions` or `_disposables` collection.
 - Avoid blocking the extension host during scans and large-file processing. Retain
-  the existing quick metadata reads, debouncing, decimation, lazy rendering, and
-  bounded LRU cache unless a change intentionally replaces them.
+  the existing quick metadata reads, event coalescing, decimation, lazy rendering,
+  and bounded LRU cache unless a change intentionally replaces them.
+- A trailing debounce can starve live updates when training writes continuously.
+  Throttle/coalesce watcher events, serialize refresh work, pause parsing and
+  polling while the panel is hidden, and perform one catch-up scan when visible.
 - Treat `.wandb` input as untrusted binary data. Bounds-check record lengths, skip
   malformed records when safe, and provide useful errors instead of crashing the
   extension host.
@@ -83,4 +97,7 @@ dependencies.
    there when practical.
 5. Manually exercise affected VS Code webviews for UI, watcher, parser, or lifecycle
    changes.
-6. Do not commit packaged `.vsix` artifacts unless the task is explicitly a release.
+6. When producing a VSIX, inspect its file list. It must include `out/extension.js`
+   and the `protobufjs` runtime dependencies while excluding `wandb/`, `.env`,
+   source maps, local datasets, and other private development artifacts.
+7. Do not commit packaged `.vsix` artifacts unless the task is explicitly a release.

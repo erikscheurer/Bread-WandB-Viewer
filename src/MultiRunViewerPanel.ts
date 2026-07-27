@@ -14,6 +14,10 @@ export class MultiRunViewerPanel {
     private _manager: MultiRunManager;
     private _folderWatcher: vscode.Disposable | null = null;
     private _folderPath: string;
+    private _pendingFileChanges = new Map<string, FileChangeEvent>();
+    private _processingFileChanges = false;
+    private _needsVisibleCatchUp = false;
+    private _disposed = false;
 
     public static createOrShow(extensionUri: vscode.Uri, folderPath: string) {
         if (MultiRunViewerPanel.currentPanel) {
@@ -77,6 +81,23 @@ export class MultiRunViewerPanel {
                             });
                         }
                         break;
+                    case 'rediscoverRuns':
+                        try {
+                            const discoveredCount = await this._rediscoverRuns();
+                            const message = discoveredCount === 0
+                                ? 'No new runs found.'
+                                : discoveredCount === 1
+                                    ? 'Discovered 1 new run.'
+                                    : `Discovered ${discoveredCount} new runs.`;
+                            vscode.window.showInformationMessage(message);
+                        } catch {
+                            vscode.window.showErrorMessage('Failed to rediscover runs.');
+                        } finally {
+                            await this._panel.webview.postMessage({
+                                command: 'rediscoverRunsComplete'
+                            });
+                        }
+                        break;
                     case 'generateAIContext':
                         await this._handleGenerateAIContext(message.action);
                         break;
@@ -95,10 +116,27 @@ export class MultiRunViewerPanel {
             this._disposables
         );
 
-        // Watch for file changes
-        this._folderWatcher = watchFolder(folderPath, (_event: FileChangeEvent) => {
-            this._update();
-        });
+        this._panel.onDidChangeViewState(event => {
+            if (!event.webviewPanel.visible) {
+                this._needsVisibleCatchUp = true;
+                return;
+            }
+
+            if (this._needsVisibleCatchUp) {
+                this._needsVisibleCatchUp = false;
+                void this._queueVisibleCatchUp();
+            } else {
+                void this._processPendingFileChanges();
+            }
+        }, null, this._disposables);
+
+        // Watch for file changes only while the panel is visible. When it becomes
+        // visible again, a metadata scan catches up on changes made while hidden.
+        this._folderWatcher = watchFolder(
+            folderPath,
+            event => this._queueFileChange(event),
+            () => this._panel.visible && !this._disposed
+        );
     }
 
     private async _reloadSelectedRuns(): Promise<void> {
@@ -108,7 +146,115 @@ export class MultiRunViewerPanel {
         }
 
         this._manager.invalidateSelectedRuns();
-        await this._update(false);
+        await this._refreshRunDataInWebview();
+    }
+
+    private _queueFileChange(event: FileChangeEvent): void {
+        this._pendingFileChanges.set(event.filePath, event);
+        void this._processPendingFileChanges();
+    }
+
+    private async _queueVisibleCatchUp(): Promise<void> {
+        try {
+            const discoveredRuns = await scanFolderForRuns(this._folderPath);
+            const existingRuns = new Map(
+                this._manager.getRuns().map(run => [run.runId, run])
+            );
+            const discoveredRunIds = new Set(discoveredRuns.map(run => run.runId));
+
+            for (const run of discoveredRuns) {
+                const existingRun = existingRuns.get(run.runId);
+                if (!existingRun) {
+                    this._pendingFileChanges.set(run.filePath, {
+                        type: 'added',
+                        filePath: run.filePath,
+                        metadata: run
+                    });
+                } else if (existingRun.lastModified !== run.lastModified) {
+                    this._pendingFileChanges.set(run.filePath, {
+                        type: 'modified',
+                        filePath: run.filePath,
+                        metadata: run
+                    });
+                }
+            }
+
+            for (const existingRun of existingRuns.values()) {
+                if (!discoveredRunIds.has(existingRun.runId)) {
+                    this._pendingFileChanges.set(existingRun.filePath, {
+                        type: 'deleted',
+                        filePath: existingRun.filePath
+                    });
+                }
+            }
+
+            await this._processPendingFileChanges();
+        } catch (error) {
+            console.error('Failed to catch up on run changes:', error);
+        }
+    }
+
+    private async _processPendingFileChanges(): Promise<void> {
+        if (
+            this._processingFileChanges ||
+            this._disposed ||
+            !this._panel.visible
+        ) {
+            return;
+        }
+
+        this._processingFileChanges = true;
+
+        try {
+            while (this._pendingFileChanges.size > 0 && this._panel.visible) {
+                const changes = Array.from(this._pendingFileChanges.values());
+                this._pendingFileChanges.clear();
+
+                if (changes.some(change => change.type !== 'modified')) {
+                    await this._update(true);
+                    continue;
+                }
+
+                const selectedRunIds = new Set(this._manager.getSelectedRunIds());
+                let selectedRunChanged = false;
+
+                for (const change of changes) {
+                    if (!change.metadata) {
+                        continue;
+                    }
+
+                    this._manager.updateRun(change.metadata);
+                    if (selectedRunIds.has(change.metadata.runId)) {
+                        selectedRunChanged = true;
+                    }
+                }
+
+                if (selectedRunChanged) {
+                    await this._refreshRunDataInWebview();
+                }
+            }
+        } catch (error) {
+            console.error('Failed to process live run updates:', error);
+        } finally {
+            this._processingFileChanges = false;
+        }
+    }
+
+    private async _refreshRunDataInWebview(): Promise<void> {
+        await this._manager.parseSelectedRuns();
+        await this._panel.webview.postMessage({
+            command: 'runDataUpdated',
+            mergedMetrics: this._manager.mergeMetrics()
+        });
+    }
+
+    private async _rediscoverRuns(): Promise<number> {
+        const knownRunIds = new Set(this._manager.getRuns().map(run => run.runId));
+        await this._update(true);
+
+        return this._manager.getRuns()
+            .filter(run => !knownRunIds.has(run.runId))
+            .length;
     }
 
     private async _update(scanForRuns: boolean = true): Promise<void> {
@@ -255,7 +401,7 @@ export class MultiRunViewerPanel {
                 <div class="sidebar-controls">
                     <button class="btn-icon" onclick="selectAllRuns()" title="Select All">☑</button>
                     <button class="btn-icon" onclick="deselectAllRuns()" title="Deselect All">☐</button>
-                    <button class="btn-icon reload-runs-btn" id="reloadRunsBtn" onclick="reloadSelectedRuns()" title="Reload data for selected runs" ${selectedRunIds.length === 0 ? 'disabled' : ''}>⟳ Reload</button>
+                    <button class="btn-icon rediscover-runs-btn" id="rediscoverRunsBtn" onclick="rediscoverRuns()" title="Search the opened directory for new runs">↻ Rediscover</button>
                 </div>
             </div>
 
@@ -276,7 +422,11 @@ export class MultiRunViewerPanel {
         <div class="main-content">
             <div class="controls-bar-wrapper">
                 ${logoBase64 ? `<img src="data:image/png;base64,${logoBase64}" alt="Bread Logo" class="logo">` : ''}
-                ${getControlsBarHtml()}
+                ${getControlsBarHtml(`
+                    <div class="control-group">
+                        <button class="toggle-btn reload-runs-btn" id="reloadRunsBtn" onclick="reloadSelectedRuns('reloadRunsBtn')" title="Reload data for selected runs" ${selectedRunIds.length === 0 ? 'disabled' : ''}>⟳ Reload runs</button>
+                    </div>
+                `)}
             </div>
 
             <div class="tabs">
@@ -294,7 +444,9 @@ export class MultiRunViewerPanel {
         </div>
     </div>
 
-    ${getModalHtml()}
+    ${getModalHtml(`
+        <button class="toggle-btn reload-runs-btn" id="modalReloadRunsBtn" onclick="reloadSelectedRuns('modalReloadRunsBtn')" title="Reload data for selected runs" ${selectedRunIds.length === 0 ? 'disabled' : ''}>⟳ Reload runs</button>
+    `)}
 
     <script>
         ${getChartScript()}
@@ -326,7 +478,7 @@ export class MultiRunViewerPanel {
                                 </div>
                             </div>
                             <div class="chart-wrapper">
-                                <canvas id="chart-${type}-${metric.index}" data-chart-type="${type}" data-chart-index="${metric.index}"></canvas>
+                                <canvas id="chart-${type}-${metric.index}" data-chart-type="${type}" data-chart-index="${metric.index}" data-metric-name="${this._escapeHtml(metric.metricName)}"></canvas>
                             </div>
                         </div>
                     `).join('')}
@@ -398,8 +550,9 @@ export class MultiRunViewerPanel {
     private _generateChartInitScript(mergedMetrics: { training: MergedMetric[], system: MergedMetric[] }): string {
         return `
             const vscode = acquireVsCodeApi();
-            const trainingMetrics = ${JSON.stringify(mergedMetrics.training)};
-            const systemMetrics = ${JSON.stringify(mergedMetrics.system)};
+            let trainingMetrics = ${JSON.stringify(mergedMetrics.training)};
+            let systemMetrics = ${JSON.stringify(mergedMetrics.system)};
+            let activeFullscreenMetric = null;
 
             // Sidebar resizing
             let isResizing = false;
@@ -488,8 +641,8 @@ export class MultiRunViewerPanel {
                 vscode.postMessage({ command: 'deselectAll' });
             }
 
-            function reloadSelectedRuns() {
-                const button = document.getElementById('reloadRunsBtn');
+            function reloadSelectedRuns(buttonId) {
+                const button = document.getElementById(buttonId);
                 if (!button || button.disabled) return;
 
                 button.disabled = true;
@@ -502,12 +655,111 @@ export class MultiRunViewerPanel {
                 const message = event.data;
                 if (message.command !== 'reloadSelectedRunsComplete') return;
 
-                const button = document.getElementById('reloadRunsBtn');
+                ['reloadRunsBtn', 'modalReloadRunsBtn'].forEach(buttonId => {
+                    const button = document.getElementById(buttonId);
+                    if (!button) return;
+
+                    button.textContent = '⟳ Reload runs';
+                    button.disabled = !message.canReload;
+                    button.removeAttribute('aria-busy');
+                });
+
+            });
+
+            function rediscoverRuns() {
+                const button = document.getElementById('rediscoverRunsBtn');
+                if (!button || button.disabled) return;
+
+                button.disabled = true;
+                button.textContent = '↻ Discovering…';
+                button.setAttribute('aria-busy', 'true');
+                vscode.postMessage({ command: 'rediscoverRuns' });
+            }
+
+            window.addEventListener('message', event => {
+                const message = event.data;
+                if (message.command !== 'rediscoverRunsComplete') return;
+
+                const button = document.getElementById('rediscoverRunsBtn');
                 if (!button) return;
 
-                button.textContent = '⟳ Reload';
-                button.disabled = !message.canReload;
+                button.textContent = '↻ Rediscover';
+                button.disabled = false;
                 button.removeAttribute('aria-busy');
+            });
+
+            function createRunDatasets(metric, isModal) {
+                return metric.datasets.map(dataset => ({
+                    label: dataset.runName,
+                    data: dataset.data.map(d => ({ x: d.step, y: d.value })),
+                    borderColor: dataset.color,
+                    backgroundColor: dataset.color + '20',
+                    fill: true,
+                    tension: 0.1,
+                    pointRadius: dataset.data.length > (isModal ? 100 : 50) ? 0 : (isModal ? 3 : 2),
+                    pointHoverRadius: isModal ? 5 : 4,
+                    borderWidth: 2,
+                    _originalData: dataset.data.map(d => ({ x: d.step, y: d.value })),
+                    _originalColor: dataset.color,
+                    _runName: dataset.runName,
+                    _isOriginal: true
+                }));
+            }
+
+            function updateChartData(chart, metric, isModal) {
+                if (!chart) return;
+
+                if (!metric) {
+                    chart.data.datasets = [];
+                    chart.update('none');
+                    return;
+                }
+
+                const datasets = createRunDatasets(metric, isModal);
+                const maxPoints = Math.max(
+                    ...datasets.map(dataset => dataset.data.length),
+                    0
+                );
+                chart.options.plugins.decimation.enabled = maxPoints > 500;
+                chart.data.datasets = datasets;
+
+                const smoothing = isModal
+                    ? parseFloat(document.getElementById('modalSmoothing').value)
+                    : globalSmoothing;
+                updateChartSmoothing(chart, smoothing, isModal ? true : showRaw);
+            }
+
+            window.addEventListener('message', event => {
+                const message = event.data;
+                if (message.command !== 'runDataUpdated' || !message.mergedMetrics) {
+                    return;
+                }
+
+                trainingMetrics = message.mergedMetrics.training || [];
+                systemMetrics = message.mergedMetrics.system || [];
+
+                Object.entries(chartInstances).forEach(([canvasId, chart]) => {
+                    const canvas = document.getElementById(canvasId);
+                    if (!canvas) return;
+
+                    const metrics = canvas.dataset.chartType === 'training'
+                        ? trainingMetrics
+                        : systemMetrics;
+                    const metric = metrics.find(
+                        candidate => candidate.metricName === canvas.dataset.metricName
+                    );
+                    updateChartData(chart, metric, false);
+                });
+
+                if (modalChart && activeFullscreenMetric) {
+                    const metrics = activeFullscreenMetric.type === 'training'
+                        ? trainingMetrics
+                        : systemMetrics;
+                    const metric = metrics.find(
+                        candidate => candidate.metricName === activeFullscreenMetric.metricName
+                    );
+                    updateChartData(modalChart, metric, true);
+                }
             });
 
             // Fullscreen modal
@@ -515,6 +767,11 @@ export class MultiRunViewerPanel {
                 const metrics = type === 'training' ? trainingMetrics : systemMetrics;
                 const metric = metrics[metricIndex];
                 if (!metric) return;
+
+                activeFullscreenMetric = {
+                    metricName: metric.metricName,
+                    type
+                };
 
                 document.getElementById('modalTitle').textContent = metric.metricName;
                 document.getElementById('fullscreenModal').classList.add('active');
@@ -530,23 +787,12 @@ export class MultiRunViewerPanel {
                 if (modalChart) modalChart.destroy();
 
                 const ctx = document.getElementById('modalChart');
-                const datasets = metric.datasets.map(dataset => ({
-                    label: dataset.runName,
-                    data: dataset.data.map(d => ({ x: d.step, y: d.value })),
-                    borderColor: dataset.color,
-                    backgroundColor: dataset.color + '20',
-                    fill: true,
-                    tension: 0.1,
-                    pointRadius: dataset.data.length > 100 ? 0 : 3,
-                    pointHoverRadius: 5,
-                    borderWidth: 2,
-                    _originalData: dataset.data.map(d => ({ x: d.step, y: d.value })),
-                    _originalColor: dataset.color,
-                    _runName: dataset.runName,
-                    _isOriginal: true
-                }));
+                const datasets = createRunDatasets(metric, true);
 
-                modalChart = createUnifiedChart(ctx, datasets, metric.metricName, { isModal: true, enableZoom: true });
+                modalChart = createUnifiedChart(ctx, datasets, metric.metricName, {
+                    isModal: true,
+                    enableZoom: true
+                });
             }
 
             // Lazy chart initialization using IntersectionObserver
@@ -571,21 +817,7 @@ export class MultiRunViewerPanel {
                             if (!metric) return;
 
                             // Create chart datasets
-                            const datasets = metric.datasets.map(dataset => ({
-                                label: dataset.runName,
-                                data: dataset.data.map(d => ({ x: d.step, y: d.value })),
-                                borderColor: dataset.color,
-                                backgroundColor: dataset.color + '20',
-                                fill: true,
-                                tension: 0.1,
-                                pointRadius: dataset.data.length > 50 ? 0 : 2,
-                                pointHoverRadius: 4,
-                                borderWidth: 2,
-                                _originalData: dataset.data.map(d => ({ x: d.step, y: d.value })),
-                                _originalColor: dataset.color,
-                                _runName: dataset.runName,
-                                _isOriginal: true
-                            }));
+                            const datasets = createRunDatasets(metric, false);
 
                             // Create the chart
                             chartInstances[canvasId] = createUnifiedChart(canvas, datasets, metric.metricName, {
@@ -614,6 +846,7 @@ export class MultiRunViewerPanel {
 
                 console.log('Lazy chart rendering initialized for ' + (trainingMetrics.length + systemMetrics.length) + ' charts');
             });
+
         `;
     }
 
@@ -700,11 +933,13 @@ export class MultiRunViewerPanel {
             .btn-icon:hover {
                 background: var(--vscode-button-hoverBackground);
             }
-            .btn-icon:disabled {
+            .btn-icon:disabled,
+            .reload-runs-btn:disabled {
                 cursor: wait;
                 opacity: 0.65;
             }
-            .reload-runs-btn {
+            .reload-runs-btn,
+            .rediscover-runs-btn {
                 white-space: nowrap;
             }
             .sidebar-tabs {
@@ -1088,6 +1323,7 @@ export class MultiRunViewerPanel {
     }
 
     public dispose() {
+        this._disposed = true;
         MultiRunViewerPanel.currentPanel = undefined;
         this._panel.dispose();
         if (this._folderWatcher) {

@@ -19,6 +19,7 @@ export interface FileChangeEvent {
 }
 
 const DEBOUNCE_MS = 1500;
+const POLL_INTERVAL_MS = 5000;
 
 /**
  * Recursively scan a folder for all .wandb files
@@ -112,78 +113,134 @@ export async function quickParseMetadata(filePath: string): Promise<RunScanResul
  */
 export function watchFolder(
     folderPath: string,
-    callback: (event: FileChangeEvent) => void
+    callback: (event: FileChangeEvent) => void,
+    isActive: () => boolean = () => true
 ): vscode.Disposable {
     const watchedFiles = new Map<string, number>(); // filePath -> lastModified
-    let debounceTimer: NodeJS.Timeout | null = null;
-    const pendingEvents = new Map<string, FileChangeEvent>();
+    const pendingPaths = new Set<string>();
+    let processTimer: NodeJS.Timeout | null = null;
+    let processing = false;
+    let disposed = false;
 
     // Initial scan to populate watchedFiles
     scanFolderForRuns(folderPath).then(runs => {
+        if (disposed) {
+            return;
+        }
+
         runs.forEach(run => {
             watchedFiles.set(run.filePath, run.lastModified);
         });
+    }).catch(error => {
+        console.error(`Could not initialize folder watcher for ${folderPath}:`, error);
     });
 
+    const processPath = async (filePath: string): Promise<void> => {
+        try {
+            const exists = fs.existsSync(filePath);
+
+            if (!exists && watchedFiles.has(filePath)) {
+                watchedFiles.delete(filePath);
+                callback({
+                    type: 'deleted',
+                    filePath
+                });
+                return;
+            }
+
+            if (!exists) {
+                return;
+            }
+
+            const stats = await fs.promises.stat(filePath);
+            const lastModified = watchedFiles.get(filePath);
+
+            if (lastModified === undefined) {
+                const metadata = await quickParseMetadata(filePath);
+                watchedFiles.set(filePath, metadata.lastModified);
+                callback({
+                    type: 'added',
+                    filePath,
+                    metadata
+                });
+            } else if (stats.mtimeMs > lastModified) {
+                const metadata = await quickParseMetadata(filePath);
+                watchedFiles.set(filePath, metadata.lastModified);
+                callback({
+                    type: 'modified',
+                    filePath,
+                    metadata
+                });
+            }
+        } catch (error) {
+            console.error(`Error processing file change for ${filePath}:`, error);
+        }
+    };
+
+    const processPendingPaths = async (): Promise<void> => {
+        processTimer = null;
+        if (disposed || processing || !isActive()) {
+            return;
+        }
+
+        processing = true;
+        const paths = Array.from(pendingPaths);
+        pendingPaths.clear();
+
+        try {
+            for (const filePath of paths) {
+                await processPath(filePath);
+            }
+        } finally {
+            processing = false;
+            if (!disposed && pendingPaths.size > 0 && isActive()) {
+                processTimer = setTimeout(processPendingPaths, DEBOUNCE_MS);
+            }
+        }
+    };
+
+    const queuePath = (filePath: string): void => {
+        if (disposed || !isActive()) {
+            return;
+        }
+
+        pendingPaths.add(filePath);
+        if (!processTimer && !processing) {
+            // Do not reset this timer on every write. This makes the debounce a
+            // throttle, so continuously appended runs still refresh regularly.
+            processTimer = setTimeout(processPendingPaths, DEBOUNCE_MS);
+        }
+    };
+
     // Watch the folder recursively
-    const watcher = fs.watch(folderPath, { recursive: true }, (eventType, filename) => {
+    const watcher = fs.watch(folderPath, { recursive: true }, (_eventType, filename) => {
         if (!filename || !filename.endsWith('.wandb')) {
             return;
         }
 
-        const fullPath = path.join(folderPath, filename);
+        queuePath(path.join(folderPath, filename));
+    });
 
-        // Debounce: collect events and process after delay
-        if (debounceTimer) {
-            clearTimeout(debounceTimer);
+    // fs.watch is best-effort on some filesystems. Check known files occasionally
+    // while the viewer is visible so a missed modification is still detected.
+    const pollTimer = setInterval(() => {
+        if (disposed || !isActive()) {
+            return;
         }
 
-        debounceTimer = setTimeout(async () => {
-            try {
-                const exists = fs.existsSync(fullPath);
-
-                if (!exists && watchedFiles.has(fullPath)) {
-                    // File was deleted
-                    watchedFiles.delete(fullPath);
-                    callback({
-                        type: 'deleted',
-                        filePath: fullPath
-                    });
-                } else if (exists) {
-                    const stats = await fs.promises.stat(fullPath);
-                    const lastModified = watchedFiles.get(fullPath);
-
-                    if (lastModified === undefined) {
-                        // New file
-                        const metadata = await quickParseMetadata(fullPath);
-                        watchedFiles.set(fullPath, metadata.lastModified);
-                        callback({
-                            type: 'added',
-                            filePath: fullPath,
-                            metadata
-                        });
-                    } else if (stats.mtimeMs > lastModified) {
-                        // File was modified
-                        const metadata = await quickParseMetadata(fullPath);
-                        watchedFiles.set(fullPath, metadata.lastModified);
-                        callback({
-                            type: 'modified',
-                            filePath: fullPath,
-                            metadata
-                        });
-                    }
-                }
-            } catch (error) {
-                console.error(`Error processing file change for ${fullPath}:`, error);
-            }
-        }, DEBOUNCE_MS);
-    });
+        for (const filePath of watchedFiles.keys()) {
+            queuePath(filePath);
+        }
+    }, POLL_INTERVAL_MS);
 
     return {
         dispose: () => {
-            if (debounceTimer) {
-                clearTimeout(debounceTimer);
+            disposed = true;
+            if (processTimer) {
+                clearTimeout(processTimer);
             }
+            clearInterval(pollTimer);
+            pendingPaths.clear();
             watcher.close();
         }
     };
