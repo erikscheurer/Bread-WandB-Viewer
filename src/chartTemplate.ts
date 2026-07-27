@@ -380,6 +380,13 @@ export function getChartScript(): string {
         // ==================== CONSTANTS ====================
         const CHART_COLORS = ${JSON.stringify(RUN_COLORS)};
 
+        Chart.Tooltip.positioners.cursor = function(_elements, eventPosition) {
+            return {
+                x: eventPosition.x,
+                y: eventPosition.y
+            };
+        };
+
         // ==================== STATE ====================
         let chartInstances = {};
         let modalChart = null;
@@ -966,16 +973,21 @@ export function getChartScript(): string {
                             }
                         },
                         tooltip: {
+                            position: 'cursor',
                             filter: function(context) {
                                 return !context.dataset._isRaw;
                             },
                             callbacks: {
                                 labelColor: function(context) {
                                     const color = context.dataset.borderColor;
+                                    const isHovered = getDatasetRunKey(context.dataset) ===
+                                        context.chart.$hoveredRunKey;
                                     return {
                                         borderColor: color,
-                                        backgroundColor: color,
-                                        borderWidth: 0
+                                        backgroundColor: isHovered
+                                            ? color
+                                            : withColorAlpha(color, 0.12),
+                                        borderWidth: isHovered ? 0 : 2
                                     };
                                 },
                                 label: function(context) {
