@@ -236,7 +236,7 @@ For developers and power users interested in how this extension works.
 - [x] Add a reload button to the main viewer toolbar and single-metric fullscreen
   view that refreshes the data for all runs currently displayed while preserving
   the fullscreen metric and zoom.
-- [ ] Periodically rescan the selected folder for new runs.
+- [x] Periodically rescan the selected folder for new runs.
 - [x] Add a dedicated sidebar button to trigger run discovery immediately.
 
 ### Chart Interaction and State

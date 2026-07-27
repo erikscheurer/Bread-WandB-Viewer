@@ -21,6 +21,7 @@ export interface FileChangeEvent {
 
 const DEBOUNCE_MS = 1500;
 const POLL_INTERVAL_MS = 5000;
+const DISCOVERY_INTERVAL_MS = 15000;
 
 /**
  * Recursively scan a folder for all .wandb files
@@ -124,6 +125,7 @@ export function watchFolder(
     const initializationChanges = new Set<string>();
     let processTimer: NodeJS.Timeout | null = null;
     let processing = false;
+    let rescanning = false;
     let initializing = true;
     let disposed = false;
 
@@ -281,6 +283,69 @@ export function watchFolder(
         }
     }, POLL_INTERVAL_MS);
 
+    // Reconcile the full folder periodically as fs.watch can miss newly created
+    // files on some filesystems. Keep this separate from the faster known-file
+    // poll so large folders are not scanned more often than necessary.
+    const discoveryTimer = setInterval(async () => {
+        if (disposed || rescanning || !isActive()) {
+            return;
+        }
+
+        rescanning = true;
+        try {
+            const discoveredRuns = await scanFolderForRuns(folderPath);
+            if (disposed || !isActive()) {
+                return;
+            }
+
+            const discoveredByPath = new Map(
+                discoveredRuns.map(run => [run.filePath, run])
+            );
+
+            for (const run of discoveredRuns) {
+                const previousVersion = watchedFiles.get(run.filePath);
+                if (!previousVersion) {
+                    watchedFiles.set(run.filePath, {
+                        lastModified: run.lastModified,
+                        fileSize: run.fileSize
+                    });
+                    callback({
+                        type: 'added',
+                        filePath: run.filePath,
+                        metadata: run
+                    });
+                } else if (
+                    previousVersion.lastModified !== run.lastModified ||
+                    previousVersion.fileSize !== run.fileSize
+                ) {
+                    watchedFiles.set(run.filePath, {
+                        lastModified: run.lastModified,
+                        fileSize: run.fileSize
+                    });
+                    callback({
+                        type: 'modified',
+                        filePath: run.filePath,
+                        metadata: run
+                    });
+                }
+            }
+
+            for (const filePath of Array.from(watchedFiles.keys())) {
+                if (!discoveredByPath.has(filePath)) {
+                    watchedFiles.delete(filePath);
+                    callback({
+                        type: 'deleted',
+                        filePath
+                    });
+                }
+            }
+        } catch (error) {
+            console.error(`Could not rescan folder ${folderPath}:`, error);
+        } finally {
+            rescanning = false;
+        }
+    }, DISCOVERY_INTERVAL_MS);
+
     return {
         dispose: () => {
             disposed = true;
@@ -288,6 +353,7 @@ export function watchFolder(
                 clearTimeout(processTimer);
             }
             clearInterval(pollTimer);
+            clearInterval(discoveryTimer);
             pendingPaths.clear();
             forcedModifiedPaths.clear();
             initializationChanges.clear();
