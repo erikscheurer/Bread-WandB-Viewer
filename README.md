@@ -1,15 +1,41 @@
-# Bread Wandb Viewer
+# Bread Wandb Viewer — Community Fork
 
-[![Version](https://img.shields.io/visual-studio-marketplace/v/bread-tech.wandb-viewer)](https://marketplace.visualstudio.com/items?itemName=bread-tech.wandb-viewer)
-[![Installs](https://img.shields.io/visual-studio-marketplace/i/bread-tech.wandb-viewer)](https://marketplace.visualstudio.com/items?itemName=bread-tech.wandb-viewer)
-[![Rating](https://img.shields.io/visual-studio-marketplace/r/bread-tech.wandb-viewer)](https://marketplace.visualstudio.com/items?itemName=bread-tech.wandb-viewer)
-[![License](https://img.shields.io/github/license/Bread-Technologies/bread_wandb_viewer_extension)](LICENSE)
+[![License](https://img.shields.io/github/license/erikscheurer/Bread-WandB-Viewer)](LICENSE)
+
+> [!IMPORTANT]
+> This repository is a community fork of
+> [Bread Technologies' original Bread Wandb Viewer](https://github.com/Bread-Technologies/Bread-WandB-Viewer).
+> It is not the source repository for the `bread-tech.wandb-viewer` extension on
+> the VS Code Marketplace.
 
 **Compare ML training runs side-by-side in VS Code - no browser switching, no waiting**
 
 Stop switching to your browser to compare training runs. **Bread Wandb Viewer** brings Weights & Biases visualization directly into VS Code. Compare multiple runs side-by-side with interactive charts, export AI context for Claude Code/Cursor/Codex, and analyze experiments without leaving your editor.
 
 Perfect for machine learning engineers, deep learning researchers, and data scientists who want to stay in their development environment.
+
+## What This Fork Changes
+
+Compared with the upstream code at the point this repository was forked, this
+version adds:
+
+- **No telemetry** — the Application Insights integration and telemetry dependency
+  have been removed.
+- **Reliable live runs** — active `.wandb` files refresh without being starved by
+  continuous writes; missed changes are detected by polling; parsing pauses while
+  the panel is hidden and catches up when it becomes visible.
+- **Run discovery and manual refresh** — newly created runs are found
+  periodically or on demand, and displayed runs can be reloaded without rebuilding
+  the webview.
+- **State-preserving chart updates** — refreshes retain zoom, smoothing, log axes,
+  run visibility, and fullscreen state. Raw and smoothed traces behave as one run.
+- **Improved chart interaction** — X-range and box zoom, two-axis panning,
+  resizable chart rows, legend double-click isolation, linked run highlighting,
+  and clearer cursor-sorted tooltips.
+- **Better run comparison** — side-by-side configuration comparison with search,
+  plus run filtering and sorting by name, creation time, or latest update.
+- **Stable, theme-aware visuals** — deterministic `tab20` run colors, improved
+  light-theme contrast, and unfilled run curves.
 
 ## Multi-Run Comparison in Action
 
@@ -30,7 +56,7 @@ Perfect for machine learning engineers, deep learning researchers, and data scie
 - 📊 **System Metrics** - GPU utilization, memory, CPU, disk I/O tracking
 - 🔍 **Metadata Comparison** - Side-by-side config and hyperparameter diff highlighting
 - 🎨 **Smart Grouping** - Metrics auto-organized by prefix (loss/, train/, val/, gpu.0/)
-- 🔒 **100% Offline** - Direct .wandb file parsing with protobuf, no API calls or internet needed
+- 🔒 **Local Run Parsing** - Direct `.wandb` parsing with protobuf, without the W&B API or CLI
 - 🎛️ **Advanced Controls** - Log scales, raw data overlay toggle, adjustable smoothing
 - 📁 **Folder Scanning** - Automatically discover all runs in a directory
 
@@ -135,25 +161,39 @@ View comprehensive run information beyond just training metrics.
 - Disk I/O
 - Memory consumption
 
-### 🔒 100% Offline & Private
+### 🔒 Local & Private
 
 Your training data never leaves your machine.
 
 - Reads `.wandb` files directly using protobuf
 - No wandb CLI or API needed
-- No internet connection required
-- Works completely offline
 - Does not collect or transmit analytics or telemetry
+
+Run parsing and analysis are local. The chart UI currently loads Chart.js and its
+zoom plugin from jsDelivr when a webview opens, so displaying charts may require a
+network connection if those assets are not cached.
 
 ---
 
 ## Installation
 
-Install from the [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=bread-tech.wandb-viewer), or download the `.vsix` from [releases](https://github.com/Bread-Technologies/bread_wandb_viewer_extension/releases):
+This fork is not published as a separate Marketplace extension. Build and install
+it locally from the repository:
 
 ```bash
-code --install-extension wandb-viewer-0.2.2.vsix
+npm install
+npm run compile
+npx vsce package --out /tmp/wandb-viewer-local.vsix
+code --install-extension /tmp/wandb-viewer-local.vsix --force
 ```
+
+Then run `Developer: Reload Window` in VS Code. Because the fork retains the
+upstream extension identifier, installing this VSIX replaces an installed upstream
+copy.
+
+To install the original release instead, use the
+[VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=bread-tech.wandb-viewer)
+or [upstream releases](https://github.com/Bread-Technologies/Bread-WandB-Viewer/releases).
 
 ### Requirements
 
@@ -195,9 +235,9 @@ For developers and power users interested in how this extension works.
 ### Architecture
 
 - **Binary Parsing:** Direct protobuf parsing of `.wandb` files (LevelDB-style format)
-- **No Dependencies:** No wandb CLI, API, or internet connection required
+- **No W&B Cloud Dependencies:** No W&B CLI or API is required to parse runs
 - **Performance:** LRU cache (20 runs), LTTB decimation for large datasets, lazy chart initialization
-- **File Watching:** Automatic detection of file changes with 1-second debouncing
+- **File Watching:** Throttled filesystem events backed by modification polling and periodic run discovery
 - **Chart Library:** Chart.js 4.4.0 with zoom plugin for interactive visualizations
 
 ### Supported Record Types
@@ -216,69 +256,18 @@ For developers and power users interested in how this extension works.
 - **Metric Decimation:** LTTB algorithm for datasets >500 points
 - **Lazy Loading:** Charts initialized only when visible
 - **LRU Cache:** Parsed run data cached (max 20 runs)
-- **Debounced Updates:** File changes debounced to 1 second
+- **Coalesced Updates:** File changes are throttled and processed serially
 
----
-
-## Actively Maintained
-
-- ✅ Current version: 0.2.2
-- ✅ Compatible with VS Code 1.74+
-- ✅ Tested with wandb SDK 0.15+
-- ✅ Open Source - contributions welcome
-
----
-
-## Open Changes
-
-### Run Refresh and Discovery
-
-- [x] Add a reload button to the main viewer toolbar and single-metric fullscreen
-  view that refreshes the data for all runs currently displayed while preserving
-  the fullscreen metric and zoom.
-- [x] Periodically rescan the selected folder for new runs.
-- [x] Add a dedicated sidebar button to trigger run discovery immediately.
-
-### Chart Interaction and State
-
-- [x] Rework smoothing so the smoothed and raw series share the same visibility
-  state. Hiding a run should hide every series associated with that run.
-  Show the value of raw run in brackets next to the smoothed value when hovering over a smoothed series.
-- [x] Preserve logarithmic-axis settings when runs, smoothing, visibility, or other
-  viewer settings change.
-- [x] Allow cursor-based range selection in overview charts, not only in fullscreen
-  charts.
-- [x] Make drag-to-zoom select the X-axis range by default and fit the Y-axis to
-  data in the selected window. Shift-dragging should pan both axes.
-  Dragging a box should zoom both axes, but dragging a horizontal line should only zoom the X-axis.
-- [x] Double clicking one run's name in the chart legend should hide all other runs, and double clicking again should restore all runs to visible.
-- [x] Allow users to resize the chart area in the multi-run viewer by dragging the divider between the chart area and the other charts below it.
-- [x] Global log-y and log-x toggles should carry over to the fullscreen chart view
-- [x] When hovering on a specific run name in the chart legend, highlight the corresponding run in the plot. When hovering on a specific run in the plot, highlight the corresponding run name in the legend and in the pop-up with the values.
-
-### Performance
-
-- [ ] Investigate lazy loading for runs. Start the multi-run viewer with runs
-  deactivated and parse/load a run only when the user enables it, reducing initial
-  startup time for folders containing many runs.
-
-### Functionality
-
-- [x] Add a "Compare Configs" button to the multi-run viewer to show a side-by-side
-  diff of the hyperparameter configurations for all runs currently displayed.
-- [x] Increase contrast for light mode (select all, deselect all are white on white). Maybe rework the color palette to be similar to vs code theme
-- [x] Colors for the multi-run viewer should be consistent upon reloading the viewer and across different sessions under changing number of runs.
-- [x] Add sorting and filtering options to the multi-run viewer sidebar (e.g., sort by run name, creation date, latest update)
-- [x] Add a config search in the compare metrics tab that filters the columns based on the search term
 ---
 
 ## Issues & Support
 
 Found a bug or have a feature request?
 
-- **Report Issues:** [GitHub Issues](https://github.com/Bread-Technologies/bread_wandb_viewer_extension/issues)
+- **Report issues:** [GitHub Issues](https://github.com/erikscheurer/Bread-WandB-Viewer/issues)
 - **Pull Requests:** Contributions welcome!
-- **Documentation:** [Source Code](https://github.com/Bread-Technologies/bread_wandb_viewer_extension)
+- **Fork source:** [erikscheurer/Bread-WandB-Viewer](https://github.com/erikscheurer/Bread-WandB-Viewer)
+- **Original project:** [Bread-Technologies/Bread-WandB-Viewer](https://github.com/Bread-Technologies/Bread-WandB-Viewer)
 
 ---
 
@@ -292,4 +281,5 @@ Found a bug or have a feature request?
 
 ---
 
-Made with ❤️ by [Bread Technologies](https://github.com/Bread-Technologies)
+Originally created by [Bread Technologies](https://github.com/Bread-Technologies).
+This fork contains additional community changes described above.
