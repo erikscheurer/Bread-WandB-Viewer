@@ -66,16 +66,15 @@ to install it. Build the VSIX outside the repository so local packages are not
 accidentally committed:
 
 ```bash
-npx vsce package --out /tmp/wandb-viewer-local.vsix
+npm run package:vsix -- /tmp/wandb-viewer-local.vsix
 code --install-extension /tmp/wandb-viewer-local.vsix --force
 ```
 
-If `vsce` dependency discovery fails in the current environment,
-`--no-dependencies` may be used only as a staging step. Do not install that archive
-as-is: add the `protobufjs` production runtime and its transitive runtime
-dependencies (`long` and the required `@protobufjs/*` helpers) before installation,
-then inspect the completed archive. Do not include TypeScript declarations or
-source maps in this fallback bundle.
+The packaging script uses `vsce` to create the extension manifest, adds the
+`protobufjs` production runtime and its transitive runtime dependencies, removes
+TypeScript declarations and source maps, and validates the completed archive. Do
+not replace it with a bare `vsce --no-dependencies` package, which cannot run the
+parser.
 
 Inspect the package file list before installation as described in the change
 checklist. After installation, tell the user to run `Developer: Reload Window`;

@@ -7,7 +7,11 @@
   "icon": "media/icon.png",
   "repository": {
     "type": "git",
-    "url": "https://github.com/Bread-Technologies/bread_wandb_viewer_extension"
+    "url": "https://github.com/erikscheurer/Bread-WandB-Viewer.git"
+  },
+  "homepage": "https://github.com/erikscheurer/Bread-WandB-Viewer#readme",
+  "bugs": {
+    "url": "https://github.com/erikscheurer/Bread-WandB-Viewer/issues"
   },
   "engines": {
     "vscode": "^1.74.0"
@@ -88,7 +92,8 @@
     "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
-    "lint": "eslint src --ext ts"
+    "lint": "eslint src --ext ts",
+    "package:vsix": "bash scripts/package-vsix.sh"
   },
   "dependencies": {
     "protobufjs": "^7.2.6"

@@ -1,6 +1,10 @@
 .vscode/**
 .vscode-test/**
+.github/**
+scripts/**
 src/**
+AGENTS.md
+test-ai-context.js
 .gitignore
 tsconfig.json
 *.vsix

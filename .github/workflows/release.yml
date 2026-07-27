@@ -1,0 +1,74 @@
+name: Build and Release Extension
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Verify tag matches extension version
+        if: github.event_name == 'push'
+        run: |
+          package_version="$(node -p "require('./package.json').version")"
+          if [ "${GITHUB_REF_NAME}" != "v${package_version}" ]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match package version v${package_version}."
+            exit 1
+          fi
+
+      - name: Compile extension
+        run: npm run compile
+
+      - name: Test AI context generation
+        run: node test-ai-context.js
+
+      - name: Package extension
+        run: npm run package:vsix -- wandb-viewer.vsix
+
+      - name: Validate VSIX contents
+        run: |
+          unzip -Z1 wandb-viewer.vsix > /tmp/wandb-viewer-vsix-files.txt
+          cat /tmp/wandb-viewer-vsix-files.txt
+
+          grep -Fxq 'extension/out/extension.js' /tmp/wandb-viewer-vsix-files.txt
+          grep -Fxq 'extension/node_modules/protobufjs/index.js' /tmp/wandb-viewer-vsix-files.txt
+          grep -Fxq 'extension/node_modules/long/index.js' /tmp/wandb-viewer-vsix-files.txt
+
+          if grep -Eq '(^|/)wandb/|(^|/)\.env$|\.map$|(^|/)telemetry/' \
+              /tmp/wandb-viewer-vsix-files.txt; then
+            echo 'VSIX contains a forbidden private or generated file.'
+            exit 1
+          fi
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wandb-viewer-${{ github.sha }}
+          path: wandb-viewer.vsix
+          if-no-files-found: error
+
+      - name: Create GitHub Release
+        if: github.event_name == 'push'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: wandb-viewer.vsix
+          fail_on_unmatched_files: true
+          generate_release_notes: true
