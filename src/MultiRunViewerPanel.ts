@@ -1129,7 +1129,7 @@ export class MultiRunViewerPanel {
                     data: dataset.data.map(d => ({ x: d.step, y: d.value })),
                     borderColor: dataset.color,
                     backgroundColor: dataset.color + '20',
-                    fill: true,
+                    fill: false,
                     tension: 0.1,
                     pointRadius: dataset.data.length > (isModal ? 100 : 50) ? 0 : (isModal ? 3 : 2),
                     pointHoverRadius: isModal ? 5 : 4,

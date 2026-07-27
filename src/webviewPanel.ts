@@ -359,7 +359,7 @@ export class WandbViewerPanel {
                         data: data.map(d => d.value),
                         borderColor: color,
                         backgroundColor: color + '20',
-                        fill: true,
+                        fill: false,
                         tension: 0.1,
                         pointRadius: data.length > 50 ? 0 : 3,
                         pointHoverRadius: 5
