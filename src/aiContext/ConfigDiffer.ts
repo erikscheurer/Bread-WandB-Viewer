@@ -13,6 +13,7 @@ import { formatNumber } from './formatNumber';
 export function compareConfigs(runConfigs: Map<string, WandbConfig>): ConfigComparison {
     const allKeys = new Set<string>();
     const keyValues = new Map<string, Map<string, any>>();
+    const runIds = Array.from(runConfigs.keys());
 
     // Collect all keys and values per run
     for (const [runId, config] of runConfigs) {
@@ -35,11 +36,11 @@ export function compareConfigs(runConfigs: Map<string, WandbConfig>): ConfigComp
             Array.from(values.values()).map(v => JSON.stringify(v))
         );
 
-        if (uniqueValues.size === 1) {
+        if (values.size === runIds.length && uniqueValues.size === 1) {
             // All runs have the same value
             common[key] = Array.from(values.values())[0];
         } else {
-            // Values differ across runs
+            // Values differ across runs or the parameter is missing from one.
             differences[key] = Object.fromEntries(values);
         }
     }

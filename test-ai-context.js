@@ -12,7 +12,8 @@ runConfigs.set('run1', {
     learning_rate: 0.001,
     batch_size: 32,
     model: 'transformer',
-    epochs: 50
+    epochs: 50,
+    run1_only: true
 });
 runConfigs.set('run2', {
     learning_rate: 0.0001,
@@ -24,6 +25,12 @@ runConfigs.set('run2', {
 const comparison = compareConfigs(runConfigs);
 console.log('Common params:', Object.keys(comparison.common));
 console.log('Differences:', Object.keys(comparison.differences));
+if (
+    !Object.prototype.hasOwnProperty.call(comparison.differences, 'run1_only') ||
+    Object.prototype.hasOwnProperty.call(comparison.differences.run1_only, 'run2')
+) {
+    throw new Error('Parameters missing from a run must be reported as differences');
+}
 console.log('✓ Config comparison works\n');
 
 // Test 2: Metric Summarizer

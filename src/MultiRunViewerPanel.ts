@@ -5,6 +5,7 @@ import { MultiRunManager, MergedMetric } from './MultiRunManager';
 import { scanFolderForRuns, watchFolder, FileChangeEvent, RunScanResult } from './MultiRunScanner';
 import { getChartStyles, getChartScript, getModalHtml, getControlsBarHtml } from './chartTemplate';
 import { generateAIContext, calculateTokenEstimate } from './aiContext/ContextGenerator';
+import { compareConfigs } from './aiContext/ConfigDiffer';
 
 export class MultiRunViewerPanel {
     public static currentPanel: MultiRunViewerPanel | undefined;
@@ -333,6 +334,7 @@ export class MultiRunViewerPanel {
     ): string {
         const selectedSet = new Set(selectedRunIds);
         const selectedRuns = runs.filter(run => selectedSet.has(run.runId));
+        const configComparisonHtml = this._generateConfigComparisonHtml(selectedRuns);
 
         // Generate sidebar run list
         const runListHtml = runs.map(run => {
@@ -428,6 +430,7 @@ export class MultiRunViewerPanel {
                 ${getControlsBarHtml(`
                     <div class="control-group">
                         <button class="toggle-btn reload-runs-btn" id="reloadRunsBtn" onclick="reloadSelectedRuns('reloadRunsBtn')" title="Reload data for selected runs" ${selectedRunIds.length === 0 ? 'disabled' : ''}>⟳ Reload runs</button>
+                        <button class="toggle-btn compare-configs-btn" onclick="openConfigComparison()" title="Compare selected run configurations" ${selectedRunIds.length < 2 ? 'disabled' : ''}>⇄ Compare configs</button>
                     </div>
                 `)}
             </div>
@@ -451,12 +454,102 @@ export class MultiRunViewerPanel {
         <button class="toggle-btn reload-runs-btn" id="modalReloadRunsBtn" onclick="reloadSelectedRuns('modalReloadRunsBtn')" title="Reload data for selected runs" ${selectedRunIds.length === 0 ? 'disabled' : ''}>⟳ Reload runs</button>
     `)}
 
+    ${configComparisonHtml}
+
     <script>
         ${getChartScript()}
         ${this._generateChartInitScript(mergedMetrics)}
     </script>
 </body>
 </html>`;
+    }
+
+    private _generateConfigComparisonHtml(selectedRuns: RunScanResult[]): string {
+        const runConfigs = new Map<string, Record<string, any>>();
+        for (const run of selectedRuns) {
+            runConfigs.set(
+                run.runId,
+                this._manager.getParsedData(run.runId)?.config || {}
+            );
+        }
+
+        const comparison = compareConfigs(runConfigs);
+        const differenceKeys = Object.keys(comparison.differences)
+            .sort((a, b) => a.localeCompare(b));
+        const commonKeys = Object.keys(comparison.common)
+            .sort((a, b) => a.localeCompare(b));
+        const runHeaders = selectedRuns.map(run => `
+            <th scope="col">
+                <span class="config-compare-run-name">${this._escapeHtml(run.runName)}</span>
+                <span class="config-compare-run-id">${this._escapeHtml(run.runId)}</span>
+            </th>
+        `).join('');
+        const differenceRows = differenceKeys.map(key => {
+            const values = comparison.differences[key];
+            const cells = selectedRuns.map(run => {
+                const hasValue = Object.prototype.hasOwnProperty.call(values, run.runId);
+                return `<td>${hasValue
+                    ? this._formatConfigValue(values[run.runId])
+                    : '<span class="config-missing">Not set</span>'}</td>`;
+            }).join('');
+
+            return `
+                <tr>
+                    <th scope="row">${this._escapeHtml(key)}</th>
+                    ${cells}
+                </tr>
+            `;
+        }).join('');
+        const commonRows = commonKeys.map(key => `
+            <tr>
+                <th scope="row">${this._escapeHtml(key)}</th>
+                <td>${this._formatConfigValue(comparison.common[key])}</td>
+            </tr>
+        `).join('');
+
+        return `
+            <div class="config-compare-modal" id="configCompareModal" role="dialog" aria-modal="true" aria-labelledby="configCompareTitle" onclick="closeConfigComparison(event)">
+                <div class="config-compare-dialog" onclick="event.stopPropagation()">
+                    <div class="config-compare-header">
+                        <div>
+                            <h2 id="configCompareTitle">Configuration comparison</h2>
+                            <div class="config-compare-summary">
+                                ${selectedRuns.length} runs ·
+                                ${comparison.metadata.differingCount} differing ·
+                                ${comparison.metadata.commonCount} common
+                            </div>
+                        </div>
+                        <button class="modal-close" onclick="closeConfigComparison()" aria-label="Close configuration comparison">&times;</button>
+                    </div>
+                    <div class="config-compare-body">
+                        ${differenceRows ? `
+                            <div class="config-compare-table-wrapper">
+                                <table class="config-compare-table">
+                                    <thead>
+                                        <tr>
+                                            <th scope="col">Parameter</th>
+                                            ${runHeaders}
+                                        </tr>
+                                    </thead>
+                                    <tbody>${differenceRows}</tbody>
+                                </table>
+                            </div>
+                        ` : '<div class="config-compare-identical">All selected run configurations are identical.</div>'}
+                        <details class="config-common-params">
+                            <summary>Common parameters (${comparison.metadata.commonCount})</summary>
+                            ${commonRows ? `
+                                <table class="config-common-table">
+                                    <thead>
+                                        <tr><th scope="col">Parameter</th><th scope="col">Value</th></tr>
+                                    </thead>
+                                    <tbody>${commonRows}</tbody>
+                                </table>
+                            ` : '<div class="no-config">No parameters are common to every selected run.</div>'}
+                        </details>
+                    </div>
+                </div>
+            </div>
+        `;
     }
 
     private _generateMetricsHtml(metrics: MergedMetric[], type: string): string {
@@ -773,6 +866,32 @@ export class MultiRunViewerPanel {
             function deselectAllRuns() {
                 vscode.postMessage({ command: 'deselectAll' });
             }
+
+            function openConfigComparison() {
+                const modal = document.getElementById('configCompareModal');
+                if (!modal) return;
+
+                modal.classList.add('active');
+                document.body.classList.add('modal-open');
+                const closeButton = modal.querySelector('.modal-close');
+                if (closeButton) {
+                    closeButton.focus();
+                }
+            }
+
+            function closeConfigComparison() {
+                const modal = document.getElementById('configCompareModal');
+                if (!modal || !modal.classList.contains('active')) return;
+
+                modal.classList.remove('active');
+                document.body.classList.remove('modal-open');
+            }
+
+            document.addEventListener('keydown', event => {
+                if (event.key === 'Escape') {
+                    closeConfigComparison();
+                }
+            });
 
             function reloadSelectedRuns(buttonId) {
                 const button = document.getElementById(buttonId);
@@ -1208,6 +1327,146 @@ export class MultiRunViewerPanel {
                 text-align: center;
                 color: var(--vscode-descriptionForeground);
                 font-size: 0.8em;
+            }
+            .compare-configs-btn {
+                white-space: nowrap;
+            }
+            .compare-configs-btn:disabled {
+                cursor: not-allowed;
+                opacity: 0.55;
+            }
+            .config-compare-modal {
+                display: none;
+                position: fixed;
+                inset: 0;
+                z-index: 2000;
+                align-items: center;
+                justify-content: center;
+                padding: 24px;
+                background: rgba(0, 0, 0, 0.6);
+            }
+            .config-compare-modal.active {
+                display: flex;
+            }
+            .config-compare-dialog {
+                display: flex;
+                flex-direction: column;
+                width: min(1400px, 94vw);
+                height: min(900px, 90vh);
+                overflow: hidden;
+                border: 1px solid var(--vscode-panel-border);
+                border-radius: 6px;
+                background: var(--vscode-editor-background);
+                box-shadow: 0 12px 40px rgba(0, 0, 0, 0.45);
+            }
+            .config-compare-header {
+                display: flex;
+                align-items: flex-start;
+                justify-content: space-between;
+                gap: 20px;
+                padding: 18px 20px;
+                border-bottom: 1px solid var(--vscode-panel-border);
+                background: var(--vscode-sideBar-background);
+            }
+            .config-compare-header h2 {
+                margin: 0 0 4px;
+                font-size: 1.2em;
+            }
+            .config-compare-summary {
+                color: var(--vscode-descriptionForeground);
+                font-size: 0.85em;
+            }
+            .config-compare-body {
+                flex: 1;
+                min-height: 0;
+                overflow: auto;
+                padding: 18px 20px 24px;
+            }
+            .config-compare-table-wrapper {
+                max-width: 100%;
+                overflow: auto;
+                border: 1px solid var(--vscode-panel-border);
+                border-radius: 4px;
+            }
+            .config-compare-table,
+            .config-common-table {
+                width: 100%;
+                border-collapse: separate;
+                border-spacing: 0;
+                font-size: 0.85em;
+            }
+            .config-compare-table th,
+            .config-compare-table td,
+            .config-common-table th,
+            .config-common-table td {
+                min-width: 180px;
+                padding: 9px 11px;
+                text-align: left;
+                vertical-align: top;
+                border-right: 1px solid var(--vscode-panel-border);
+                border-bottom: 1px solid var(--vscode-panel-border);
+                overflow-wrap: anywhere;
+            }
+            .config-compare-table th:first-child,
+            .config-common-table th:first-child {
+                min-width: 220px;
+                font-weight: 600;
+            }
+            .config-compare-table thead th {
+                position: sticky;
+                top: 0;
+                z-index: 2;
+                background: var(--vscode-editorGroupHeader-tabsBackground);
+            }
+            .config-compare-table tbody th {
+                position: sticky;
+                left: 0;
+                z-index: 1;
+                background: var(--vscode-editor-background);
+            }
+            .config-compare-table tr:last-child > *,
+            .config-common-table tr:last-child > * {
+                border-bottom: none;
+            }
+            .config-compare-table tr > *:last-child,
+            .config-common-table tr > *:last-child {
+                border-right: none;
+            }
+            .config-compare-run-name,
+            .config-compare-run-id {
+                display: block;
+            }
+            .config-compare-run-id {
+                margin-top: 3px;
+                color: var(--vscode-descriptionForeground);
+                font-family: var(--vscode-editor-font-family);
+                font-size: 0.8em;
+                font-weight: 400;
+            }
+            .config-missing {
+                color: var(--vscode-descriptionForeground);
+                font-style: italic;
+            }
+            .config-compare-identical {
+                padding: 28px;
+                text-align: center;
+                border: 1px solid var(--vscode-panel-border);
+                border-radius: 4px;
+                color: var(--vscode-descriptionForeground);
+            }
+            .config-common-params {
+                margin-top: 18px;
+                border: 1px solid var(--vscode-panel-border);
+                border-radius: 4px;
+            }
+            .config-common-params summary {
+                padding: 10px 12px;
+                cursor: pointer;
+                background: var(--vscode-sideBar-background);
+                font-weight: 600;
+            }
+            .config-common-table {
+                border-top: 1px solid var(--vscode-panel-border);
             }
 
             /* Collapse buttons */
