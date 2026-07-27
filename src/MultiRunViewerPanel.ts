@@ -916,10 +916,10 @@ export class MultiRunViewerPanel {
                 document.getElementById('modalShowRawGroup').style.display = 'none';
                 modalShowRaw = showRaw;
                 document.getElementById('modalShowRawBtn').classList.toggle('active', modalShowRaw);
-                modalLogX = false;
-                modalLogY = false;
-                document.getElementById('modalLogXBtn').classList.remove('active');
-                document.getElementById('modalLogYBtn').classList.remove('active');
+                modalLogX = logX;
+                modalLogY = logY;
+                document.getElementById('modalLogXBtn').classList.toggle('active', modalLogX);
+                document.getElementById('modalLogYBtn').classList.toggle('active', modalLogY);
 
                 if (modalChart) modalChart.destroy();
 
@@ -930,6 +930,7 @@ export class MultiRunViewerPanel {
                     isModal: true,
                     enableZoom: true
                 });
+                updateChartAxes(modalChart, modalLogX, modalLogY);
             }
 
             // Lazy chart initialization using IntersectionObserver
