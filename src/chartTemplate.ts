@@ -1151,11 +1151,40 @@ export function getChartScript(): string {
         /**
          * Update chart axes
          */
+        function isChartInViewport(chart) {
+            const canvas = chart && chart.canvas;
+            if (!canvas || !canvas.isConnected) {
+                return false;
+            }
+
+            const tabContent = canvas.closest('.tab-content');
+            const container = canvas.closest('.chart-container');
+            if (
+                (tabContent && !tabContent.classList.contains('active')) ||
+                (container && container.classList.contains('hidden'))
+            ) {
+                return false;
+            }
+
+            const bounds = container || canvas;
+            const rect = bounds.getBoundingClientRect();
+            return rect.width > 0 &&
+                rect.height > 0 &&
+                rect.bottom > 0 &&
+                rect.right > 0 &&
+                rect.top < window.innerHeight &&
+                rect.left < window.innerWidth;
+        }
+
         function updateChartAxes(chart, logXAxis, logYAxis) {
             if (!chart) return;
             chart.options.scales.x.type = logXAxis ? 'logarithmic' : 'linear';
             chart.options.scales.y.type = logYAxis ? 'logarithmic' : 'linear';
-            chart.update();
+            if (isChartInViewport(chart)) {
+                chart.update();
+            } else {
+                chart.update('none');
+            }
         }
 
         // ==================== GLOBAL CONTROLS ====================
