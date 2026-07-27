@@ -970,6 +970,14 @@ export function getChartScript(): string {
                                 return !context.dataset._isRaw;
                             },
                             callbacks: {
+                                labelColor: function(context) {
+                                    const color = context.dataset.borderColor;
+                                    return {
+                                        borderColor: color,
+                                        backgroundColor: color,
+                                        borderWidth: 0
+                                    };
+                                },
                                 label: function(context) {
                                     const label = context.dataset.label || '';
                                     const value = context.parsed.y;
