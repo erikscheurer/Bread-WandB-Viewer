@@ -85,6 +85,9 @@ host.
 - A trailing debounce can starve live updates when training writes continuously.
   Throttle/coalesce watcher events, serialize refresh work, pause parsing and
   polling while the panel is hidden, and perform one catch-up scan when visible.
+- Do not let a watcher's asynchronous baseline scan absorb file events that arrive
+  during initialization. Preserve and replay those paths, and compare both
+  modification time and file size when deciding whether parsed run data is stale.
 - Treat `.wandb` input as untrusted binary data. Bounds-check record lengths, skip
   malformed records when safe, and provide useful errors instead of crashing the
   extension host.

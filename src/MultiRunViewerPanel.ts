@@ -170,7 +170,10 @@ export class MultiRunViewerPanel {
                         filePath: run.filePath,
                         metadata: run
                     });
-                } else if (existingRun.lastModified !== run.lastModified) {
+                } else if (
+                    existingRun.lastModified !== run.lastModified ||
+                    existingRun.fileSize !== run.fileSize
+                ) {
                     this._pendingFileChanges.set(run.filePath, {
                         type: 'modified',
                         filePath: run.filePath,

@@ -9,6 +9,7 @@ export interface RunScanResult {
     runName: string;
     project?: string;
     lastModified: number;
+    fileSize: number;
     isVisible: boolean;
 }
 
@@ -104,6 +105,7 @@ export async function quickParseMetadata(filePath: string): Promise<RunScanResul
         runName,
         project,
         lastModified: stats.mtimeMs,
+        fileSize: stats.size,
         isVisible: true // Auto-select by default
     };
 }
@@ -116,10 +118,13 @@ export function watchFolder(
     callback: (event: FileChangeEvent) => void,
     isActive: () => boolean = () => true
 ): vscode.Disposable {
-    const watchedFiles = new Map<string, number>(); // filePath -> lastModified
+    const watchedFiles = new Map<string, { lastModified: number; fileSize: number }>();
     const pendingPaths = new Set<string>();
+    const forcedModifiedPaths = new Set<string>();
+    const initializationChanges = new Set<string>();
     let processTimer: NodeJS.Timeout | null = null;
     let processing = false;
+    let initializing = true;
     let disposed = false;
 
     // Initial scan to populate watchedFiles
@@ -129,18 +134,44 @@ export function watchFolder(
         }
 
         runs.forEach(run => {
-            watchedFiles.set(run.filePath, run.lastModified);
+            watchedFiles.set(run.filePath, {
+                lastModified: run.lastModified,
+                fileSize: run.fileSize
+            });
         });
     }).catch(error => {
         console.error(`Could not initialize folder watcher for ${folderPath}:`, error);
+    }).finally(() => {
+        initializing = false;
+
+        // A file may change after the viewer's scan but before this baseline scan
+        // reaches it. Preserve those watcher events and force one notification so
+        // the newer baseline cannot silently leave older parsed data cached.
+        for (const filePath of initializationChanges) {
+            pendingPaths.add(filePath);
+            forcedModifiedPaths.add(filePath);
+        }
+        initializationChanges.clear();
+
+        if (
+            !disposed &&
+            pendingPaths.size > 0 &&
+            isActive() &&
+            !processTimer &&
+            !processing
+        ) {
+            processTimer = setTimeout(processPendingPaths, DEBOUNCE_MS);
+        }
     });
 
     const processPath = async (filePath: string): Promise<void> => {
         try {
             const exists = fs.existsSync(filePath);
+            const forceModified = forcedModifiedPaths.has(filePath);
 
-            if (!exists && watchedFiles.has(filePath)) {
+            if (!exists && (watchedFiles.has(filePath) || forceModified)) {
                 watchedFiles.delete(filePath);
+                forcedModifiedPaths.delete(filePath);
                 callback({
                     type: 'deleted',
                     filePath
@@ -153,19 +184,31 @@ export function watchFolder(
             }
 
             const stats = await fs.promises.stat(filePath);
-            const lastModified = watchedFiles.get(filePath);
+            const previousVersion = watchedFiles.get(filePath);
 
-            if (lastModified === undefined) {
+            if (previousVersion === undefined) {
                 const metadata = await quickParseMetadata(filePath);
-                watchedFiles.set(filePath, metadata.lastModified);
+                watchedFiles.set(filePath, {
+                    lastModified: metadata.lastModified,
+                    fileSize: metadata.fileSize
+                });
+                forcedModifiedPaths.delete(filePath);
                 callback({
                     type: 'added',
                     filePath,
                     metadata
                 });
-            } else if (stats.mtimeMs > lastModified) {
+            } else if (
+                forceModified ||
+                stats.mtimeMs !== previousVersion.lastModified ||
+                stats.size !== previousVersion.fileSize
+            ) {
                 const metadata = await quickParseMetadata(filePath);
-                watchedFiles.set(filePath, metadata.lastModified);
+                watchedFiles.set(filePath, {
+                    lastModified: metadata.lastModified,
+                    fileSize: metadata.fileSize
+                });
+                forcedModifiedPaths.delete(filePath);
                 callback({
                     type: 'modified',
                     filePath,
@@ -201,6 +244,11 @@ export function watchFolder(
 
     const queuePath = (filePath: string): void => {
         if (disposed || !isActive()) {
+            return;
+        }
+
+        if (initializing) {
+            initializationChanges.add(filePath);
             return;
         }
 
@@ -241,6 +289,8 @@ export function watchFolder(
             }
             clearInterval(pollTimer);
             pendingPaths.clear();
+            forcedModifiedPaths.clear();
+            initializationChanges.clear();
             watcher.close();
         }
     };

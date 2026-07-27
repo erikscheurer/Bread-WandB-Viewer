@@ -299,7 +299,10 @@ export class MultiRunManager {
             this.state.runs.set(runResult.runId, runResult);
 
             // Invalidate cached data if file was modified
-            if (existingRun.lastModified !== runResult.lastModified) {
+            if (
+                existingRun.lastModified !== runResult.lastModified ||
+                existingRun.fileSize !== runResult.fileSize
+            ) {
                 this.state.parsedData.delete(runResult.runId);
             }
         }
