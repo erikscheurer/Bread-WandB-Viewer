@@ -4,18 +4,25 @@
 
 Bread Wandb Viewer is a TypeScript VS Code extension for opening local Weights &
 Biases `.wandb` files and comparing multiple training runs. It parses W&B data
-offline, renders Chart.js-based webviews, can export run data as AI-oriented
-Markdown, and does not collect or transmit telemetry.
+locally without the W&B API or CLI, renders Chart.js-based webviews, can export run
+data as AI-oriented Markdown, and does not collect or transmit telemetry. Run
+parsing is offline, but the webviews currently load Chart.js and its zoom plugin
+from jsDelivr.
 
 ## Repository map
 
-- `src/extension.ts`: extension activation, command registration, and custom editor.
+- `src/extension.ts`: extension activation, command registration, custom editor,
+  and initial/fullscreen datasets for that editor.
 - `src/wandbParser.ts`: `.wandb`/protobuf parsing and core run-data types.
 - `src/webviewPanel.ts`: single-run webview.
 - `src/MultiRunScanner.ts`: recursive run discovery, metadata reads, and file watching.
 - `src/MultiRunManager.ts`: multi-run selection, caching, colors, and merged metrics.
-- `src/MultiRunViewerPanel.ts`: multi-run webview and host/webview message handling.
-- `src/chartTemplate.ts`: shared chart HTML, CSS, and browser-side JavaScript.
+- `src/MultiRunViewerPanel.ts`: multi-run webview, initial/fullscreen dataset
+  construction, and host/webview message handling.
+- `src/chartTemplate.ts`: shared chart HTML, CSS, browser-side behavior, and dataset
+  rebuilding for smoothing and capture flows.
+- `src/runColors.ts`: deterministic Matplotlib `tab20` run palette and run-ID color
+  assignment.
 - `src/aiContext/`: configuration comparison, metric summaries, and Markdown export.
 - `src/wandb.proto`: W&B record schema.
 - `media/`: extension artwork and README assets.
@@ -41,6 +48,12 @@ moving a source module, ensure its stale compiled JavaScript and source map are 
 left in a packaged build; clean generated output and recompile rather than editing
 generated files by hand.
 
+Some legacy `out/` files are tracked while newer compiled modules are ignored, so
+`npm run compile` can leave tracked generated diffs. Package from the freshly
+compiled output, but do not stage or commit generated diffs. After packaging, clean
+up only generated changes caused by the current work; preserve any pre-existing
+worktree changes.
+
 `npm run lint` exists, but verify that ESLint and its configuration are available
 before relying on it; they are not currently declared in this package's development
 dependencies.
@@ -56,6 +69,13 @@ accidentally committed:
 npx vsce package --out /tmp/wandb-viewer-local.vsix
 code --install-extension /tmp/wandb-viewer-local.vsix --force
 ```
+
+If `vsce` dependency discovery fails in the current environment,
+`--no-dependencies` may be used only as a staging step. Do not install that archive
+as-is: add the `protobufjs` production runtime and its transitive runtime
+dependencies (`long` and the required `@protobufjs/*` helpers) before installation,
+then inspect the completed archive. Do not include TypeScript declarations or
+source maps in this fallback bundle.
 
 Inspect the package file list before installation as described in the change
 checklist. After installation, tell the user to run `Developer: Reload Window`;
@@ -97,10 +117,23 @@ host.
   constructed record types in `wandbParser.ts`/`MultiRunScanner.ts` consistent.
 - Reuse the shared chart helpers in `chartTemplate.ts` for behavior common to the
   single-run and multi-run views rather than duplicating browser-side logic.
+- Chart datasets are still constructed in several places:
+  `MultiRunViewerPanel.ts`, `extension.ts`, `webviewPanel.ts`, and the smoothing,
+  copy, and capture paths in `chartTemplate.ts`. When changing dataset defaults,
+  audit every constructor and test the initial render as well as rebuilt datasets.
 - Treat raw and smoothed datasets as visual variants of one run. Preserve a stable
   run identity across derived datasets, keep their visibility synchronized, expose
   one legend and tooltip concept per run, and keep equivalent overview/fullscreen
   controls behaviorally aligned.
+- Preserve the current multi-run chart interaction invariants:
+  - Run datasets render as unfilled curves (`fill: false`).
+  - Plot hover emphasizes the nearest run in the legend and tooltip without
+    changing line styling; legend hover may highlight the corresponding line.
+  - Tooltips keep all visible runs, sort entries from highest to lowest Y value,
+    and give only the pointer-nearest run a solid swatch and highlighted row.
+- Do not conflate lazy chart rendering with lazy run parsing. Charts are already
+  initialized when they become visible and that behavior should be retained. Lazy
+  parsing/enabling of runs is a separate, currently deferred idea.
 
 ## Privacy and security
 
@@ -120,7 +153,9 @@ host.
 4. For AI-context changes, also run `node test-ai-context.js` and add focused cases
    there when practical.
 5. Manually exercise affected VS Code webviews for UI, watcher, parser, or lifecycle
-   changes.
+   changes. For chart changes, check both overview and fullscreen views before and
+   after smoothing or raw-data toggles; initial and rebuilt datasets use different
+   construction paths.
 6. When producing a VSIX, inspect its file list. It must include `out/extension.js`
    and the `protobufjs` runtime dependencies while excluding `wandb/`, `.env`,
    source maps, local datasets, and other private development artifacts.
