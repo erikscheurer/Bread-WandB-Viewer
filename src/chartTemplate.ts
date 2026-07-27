@@ -396,6 +396,81 @@ export function getChartScript(): string {
 
         // ==================== CORE FUNCTIONS ====================
 
+        function readThemeColor(variableName, fallback) {
+            const value = getComputedStyle(document.body)
+                .getPropertyValue(variableName)
+                .trim();
+            return value || fallback;
+        }
+
+        function getChartThemeColors() {
+            const isLightTheme = document.body.classList.contains('vscode-light') ||
+                document.body.classList.contains('vscode-high-contrast-light');
+            return {
+                foreground: readThemeColor(
+                    '--vscode-foreground',
+                    isLightTheme ? '#1f1f1f' : '#d4d4d4'
+                ),
+                muted: readThemeColor(
+                    '--vscode-descriptionForeground',
+                    isLightTheme ? '#616161' : '#aaaaaa'
+                ),
+                grid: readThemeColor(
+                    '--vscode-panel-border',
+                    isLightTheme ? 'rgba(31, 31, 31, 0.18)' : 'rgba(212, 212, 212, 0.18)'
+                )
+            };
+        }
+
+        function applyChartTheme(chart, update = false) {
+            if (!chart || !chart.options) return;
+
+            const themeColors = getChartThemeColors();
+            const legendLabels = chart.options.plugins &&
+                chart.options.plugins.legend &&
+                chart.options.plugins.legend.labels;
+            if (legendLabels) {
+                legendLabels.color = themeColors.foreground;
+            }
+
+            ['x', 'y'].forEach(axis => {
+                const scale = chart.options.scales && chart.options.scales[axis];
+                if (!scale) return;
+
+                if (scale.title) {
+                    scale.title.color = themeColors.muted;
+                }
+                if (scale.grid) {
+                    scale.grid.color = themeColors.grid;
+                }
+                if (scale.ticks) {
+                    scale.ticks.color = themeColors.muted;
+                }
+            });
+
+            if (update) {
+                chart.update('none');
+            }
+        }
+
+        let chartThemeSignature = JSON.stringify(getChartThemeColors());
+        const chartThemeObserver = new MutationObserver(() => {
+            const nextSignature = JSON.stringify(getChartThemeColors());
+            if (nextSignature === chartThemeSignature) {
+                return;
+            }
+
+            chartThemeSignature = nextSignature;
+            Object.values(chartInstances).forEach(chart => {
+                applyChartTheme(chart, true);
+            });
+            applyChartTheme(modalChart, true);
+        });
+        chartThemeObserver.observe(document.body, {
+            attributes: true,
+            attributeFilter: ['class', 'style']
+        });
+
         const RANGE_BOX_THRESHOLD = 20;
         const RANGE_MIN_DISTANCE = 8;
 
@@ -655,6 +730,7 @@ export function getChartScript(): string {
         function createUnifiedChart(ctx, datasets, metricName, options = {}) {
             // Calculate max dataset size for decimation
             const maxPoints = Math.max(...datasets.map(d => d.data ? d.data.length : 0), 0);
+            const themeColors = getChartThemeColors();
 
             const chart = new Chart(ctx, {
                 type: 'line',
@@ -738,7 +814,7 @@ export function getChartScript(): string {
                                 }, 250);
                             },
                             labels: {
-                                color: '#d4d4d4',
+                                color: themeColors.foreground,
                                 usePointStyle: true,
                                 padding: 10,
                                 font: { size: options.isModal ? 12 : 11 },
@@ -782,23 +858,23 @@ export function getChartScript(): string {
                             title: {
                                 display: true,
                                 text: 'Step',
-                                color: '#aaa',
+                                color: themeColors.muted,
                                 font: { size: options.isModal ? 14 : 12, weight: 'bold' }
                             },
-                            grid: { color: '#333' },
-                            ticks: { color: '#aaa', font: { size: options.isModal ? 12 : 11 } }
+                            grid: { color: themeColors.grid },
+                            ticks: { color: themeColors.muted, font: { size: options.isModal ? 12 : 11 } }
                         },
                         y: {
                             type: 'linear',
                             title: {
                                 display: true,
                                 text: metricName,
-                                color: '#aaa',
+                                color: themeColors.muted,
                                 font: { size: options.isModal ? 14 : 12, weight: 'bold' }
                             },
-                            grid: { color: '#333' },
+                            grid: { color: themeColors.grid },
                             ticks: {
-                                color: '#aaa',
+                                color: themeColors.muted,
                                 font: { size: options.isModal ? 12 : 11 },
                                 callback: function(value) {
                                     const decimals = options.isModal ? 4 : 2;
@@ -830,6 +906,7 @@ export function getChartScript(): string {
                 installRangeInteractions(chart);
             }
 
+            applyChartTheme(chart);
             return chart;
         }
 

@@ -265,7 +265,7 @@ For developers and power users interested in how this extension works.
 
 - [x] Add a "Compare Configs" button to the multi-run viewer to show a side-by-side
   diff of the hyperparameter configurations for all runs currently displayed.
-- [ ] Increase contrast for light mode. Maybe rework the color palette to be similar to vs code theme
+- [x] Increase contrast for light mode (select all, deselect all are white on white). Maybe rework the color palette to be similar to vs code theme
 - [ ] Colors for the multi-run viewer should be consistent upon reloading the viewer and across different sessions under changing number of runs.
 - [ ] Add sorting and filtering options to the multi-run viewer sidebar (e.g., sort by run name, creation date, latest update)
 

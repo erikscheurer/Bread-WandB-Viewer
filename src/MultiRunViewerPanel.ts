@@ -1161,15 +1161,20 @@ export class MultiRunViewerPanel {
             }
             .btn-icon {
                 background: transparent;
-                border: 1px solid var(--vscode-button-border);
-                color: var(--vscode-button-foreground);
+                border: 1px solid var(--vscode-button-border, var(--vscode-panel-border));
+                color: var(--vscode-foreground);
                 padding: 4px 8px;
                 cursor: pointer;
                 border-radius: 3px;
                 font-size: 0.9em;
             }
             .btn-icon:hover {
-                background: var(--vscode-button-hoverBackground);
+                background: var(--vscode-toolbar-hoverBackground, var(--vscode-list-hoverBackground));
+                color: var(--vscode-foreground);
+            }
+            .btn-icon:focus-visible {
+                outline: 1px solid var(--vscode-focusBorder);
+                outline-offset: 1px;
             }
             .btn-icon:disabled,
             .reload-runs-btn:disabled {
@@ -1227,7 +1232,7 @@ export class MultiRunViewerPanel {
                 width: 16px;
                 height: 16px;
                 cursor: pointer;
-                accent-color: var(--vscode-checkbox-background);
+                accent-color: var(--vscode-focusBorder, var(--vscode-button-background));
             }
             .run-color {
                 width: 12px;
