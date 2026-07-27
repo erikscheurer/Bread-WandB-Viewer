@@ -504,24 +504,24 @@ export class MultiRunViewerPanel {
         const commonKeys = Object.keys(comparison.common)
             .sort((a, b) => a.localeCompare(b));
         const parameterHeaders = [
-            ...differenceKeys.map(key => `
-                <th scope="col" class="config-different-column">${this._escapeHtml(key)}</th>
+            ...differenceKeys.map((key, index) => `
+                <th scope="col" class="config-different-column" data-config-key="${this._escapeHtml(key)}" data-config-group="different" data-config-column-index="${index}">${this._escapeHtml(key)}</th>
             `),
             ...commonKeys.map((key, index) => `
-                <th scope="col" class="config-common-column ${index === 0 ? 'config-common-start' : ''}">${this._escapeHtml(key)}</th>
+                <th scope="col" class="config-common-column ${index === 0 ? 'config-common-start' : ''}" data-config-key="${this._escapeHtml(key)}" data-config-group="common" data-config-column-index="${differenceKeys.length + index}">${this._escapeHtml(key)}</th>
             `)
         ].join('');
         const runRows = selectedRuns.map(run => {
             const runColor = this._manager.getRunColor(run.runId);
-            const differenceCells = differenceKeys.map(key => {
+            const differenceCells = differenceKeys.map((key, index) => {
                 const values = comparison.differences[key];
                 const hasValue = Object.prototype.hasOwnProperty.call(values, run.runId);
-                return `<td>${hasValue
+                return `<td data-config-group="different" data-config-column-index="${index}">${hasValue
                     ? this._formatConfigComparisonValue(values[run.runId])
                     : '<span class="config-missing">Not set</span>'}</td>`;
             }).join('');
             const commonCells = commonKeys.map((key, index) => `
-                <td class="config-common-column ${index === 0 ? 'config-common-start' : ''}">
+                <td class="config-common-column ${index === 0 ? 'config-common-start' : ''}" data-config-group="common" data-config-column-index="${differenceKeys.length + index}">
                     ${this._formatConfigComparisonValue(comparison.common[key])}
                 </td>
             `).join('');
@@ -554,18 +554,21 @@ export class MultiRunViewerPanel {
                             ${comparison.metadata.commonCount} common
                         </div>
                     </div>
+                    ${parameterHeaders
+                        ? '<input type="search" id="configFilterInput" class="config-filter-input" placeholder="Filter parameters…" aria-label="Filter configuration parameters">'
+                        : ''}
                 </div>
                 ${parameterHeaders ? `
-                    <div class="config-compare-table-wrapper">
-                        <table class="config-compare-table">
+                    <div class="config-compare-table-wrapper" id="configCompareTableWrapper">
+                        <table class="config-compare-table" id="configCompareTable">
                             <thead>
                                 <tr class="config-parameter-groups">
                                     <th scope="col" rowspan="2" class="config-run-column">Run</th>
                                     ${differenceKeys.length > 0
-                                        ? `<th scope="colgroup" colspan="${differenceKeys.length}" class="config-different-group">Differing parameters</th>`
+                                        ? `<th scope="colgroup" colspan="${differenceKeys.length}" class="config-different-group" id="configDifferentGroup">Differing parameters</th>`
                                         : ''}
                                     ${commonKeys.length > 0
-                                        ? `<th scope="colgroup" colspan="${commonKeys.length}" class="config-common-group config-common-start">Common parameters</th>`
+                                        ? `<th scope="colgroup" colspan="${commonKeys.length}" class="config-common-group config-common-start" id="configCommonGroup">Common parameters</th>`
                                         : ''}
                                 </tr>
                                 <tr>${parameterHeaders}</tr>
@@ -573,6 +576,7 @@ export class MultiRunViewerPanel {
                             <tbody>${runRows}</tbody>
                         </table>
                     </div>
+                    <div class="config-compare-empty" id="configFilterEmpty" hidden>No parameters match this filter.</div>
                 ` : '<div class="config-compare-empty">The selected runs do not contain configuration parameters.</div>'}
             </div>
         `;
@@ -832,6 +836,87 @@ export class MultiRunViewerPanel {
                 runSortSelect.addEventListener('change', () => applyRunListView());
             }
             applyRunListView(false);
+
+            // Configuration-column filtering
+            const configFilterInput = document.getElementById('configFilterInput');
+            const configCompareTable = document.getElementById('configCompareTable');
+            const configCompareTableWrapper = document.getElementById('configCompareTableWrapper');
+            const configFilterEmpty = document.getElementById('configFilterEmpty');
+            const configDifferentGroup = document.getElementById('configDifferentGroup');
+            const configCommonGroup = document.getElementById('configCommonGroup');
+
+            function applyConfigFilter(shouldPersist = true) {
+                if (!configFilterInput || !configCompareTable) return;
+
+                const filterText = configFilterInput.value.trim().toLocaleLowerCase();
+                const headers = Array.from(
+                    configCompareTable.querySelectorAll('th[data-config-key]')
+                );
+                let visibleDifferent = 0;
+                let visibleCommon = 0;
+
+                headers.forEach(header => {
+                    const isVisible = !filterText ||
+                        (header.dataset.configKey || '')
+                            .toLocaleLowerCase()
+                            .includes(filterText);
+                    const columnIndex = header.dataset.configColumnIndex;
+                    configCompareTable
+                        .querySelectorAll('[data-config-column-index="' + columnIndex + '"]')
+                        .forEach(cell => {
+                            cell.hidden = !isVisible;
+                        });
+
+                    if (isVisible && header.dataset.configGroup === 'common') {
+                        visibleCommon++;
+                    } else if (isVisible) {
+                        visibleDifferent++;
+                    }
+                });
+
+                if (configDifferentGroup) {
+                    configDifferentGroup.colSpan = Math.max(visibleDifferent, 1);
+                    configDifferentGroup.hidden = visibleDifferent === 0;
+                }
+                if (configCommonGroup) {
+                    configCommonGroup.colSpan = Math.max(visibleCommon, 1);
+                    configCommonGroup.hidden = visibleCommon === 0;
+                }
+
+                configCompareTable
+                    .querySelectorAll('[data-config-group="common"]')
+                    .forEach(cell => cell.classList.remove('config-common-start'));
+                const firstVisibleCommon = headers.find(header =>
+                    !header.hidden && header.dataset.configGroup === 'common'
+                );
+                if (firstVisibleCommon) {
+                    const columnIndex = firstVisibleCommon.dataset.configColumnIndex;
+                    configCompareTable
+                        .querySelectorAll('[data-config-column-index="' + columnIndex + '"]')
+                        .forEach(cell => cell.classList.add('config-common-start'));
+                }
+
+                const hasVisibleColumns = visibleDifferent + visibleCommon > 0;
+                if (configCompareTableWrapper) {
+                    configCompareTableWrapper.hidden = !hasVisibleColumns;
+                }
+                if (configFilterEmpty) {
+                    configFilterEmpty.hidden = hasVisibleColumns;
+                }
+                if (shouldPersist) {
+                    updatePersistedViewState({
+                        configFilter: configFilterInput.value
+                    });
+                }
+            }
+
+            if (configFilterInput && typeof persistedViewState.configFilter === 'string') {
+                configFilterInput.value = persistedViewState.configFilter;
+            }
+            if (configFilterInput) {
+                configFilterInput.addEventListener('input', () => applyConfigFilter());
+            }
+            applyConfigFilter(false);
 
             // Per-chart height resizing
             function getChartResizeKey(container) {
@@ -1480,6 +1565,7 @@ export class MultiRunViewerPanel {
                 display: flex;
                 align-items: center;
                 justify-content: space-between;
+                flex-wrap: wrap;
                 gap: 16px;
                 margin-bottom: 14px;
             }
@@ -1490,6 +1576,23 @@ export class MultiRunViewerPanel {
             .config-compare-summary {
                 color: var(--vscode-descriptionForeground);
                 font-size: 0.85em;
+            }
+            .config-filter-input {
+                flex: 0 1 320px;
+                min-width: 180px;
+                padding: 6px 8px;
+                border: 1px solid var(--vscode-input-border, var(--vscode-panel-border));
+                border-radius: 3px;
+                outline: none;
+                color: var(--vscode-input-foreground);
+                background: var(--vscode-input-background);
+                font-family: var(--vscode-font-family);
+                font-size: 0.85em;
+            }
+            .config-filter-input:focus {
+                border-color: var(--vscode-focusBorder);
+                outline: 1px solid var(--vscode-focusBorder);
+                outline-offset: -1px;
             }
             .config-compare-table-wrapper {
                 max-width: 100%;
@@ -1512,6 +1615,9 @@ export class MultiRunViewerPanel {
                 white-space: nowrap;
                 border-right: 1px solid var(--vscode-panel-border);
                 border-bottom: 1px solid var(--vscode-panel-border);
+            }
+            .config-compare-table [hidden] {
+                display: none;
             }
             .config-compare-table thead th {
                 position: sticky;

@@ -268,7 +268,7 @@ For developers and power users interested in how this extension works.
 - [x] Increase contrast for light mode (select all, deselect all are white on white). Maybe rework the color palette to be similar to vs code theme
 - [x] Colors for the multi-run viewer should be consistent upon reloading the viewer and across different sessions under changing number of runs.
 - [x] Add sorting and filtering options to the multi-run viewer sidebar (e.g., sort by run name, creation date, latest update)
-
+- [x] Add a config search in the compare metrics tab that filters the columns based on the search term
 ---
 
 ## Issues & Support
