@@ -159,6 +159,20 @@ export class MultiRunManager {
     }
 
     /**
+     * Invalidate cached data for selected runs so they are parsed from disk again.
+     */
+    invalidateSelectedRuns(): void {
+        for (const runId of this.state.selectedRunIds) {
+            this.state.parsedData.delete(runId);
+
+            const index = this.cacheAccessOrder.indexOf(runId);
+            if (index > -1) {
+                this.cacheAccessOrder.splice(index, 1);
+            }
+        }
+    }
+
+    /**
      * Get parsed data for a run (may be null if not parsed yet)
      */
     getParsedData(runId: string): WandbRunData | undefined {

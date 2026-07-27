@@ -626,29 +626,9 @@ export function getChartScript(): string {
             });
         }
 
-        function trackGlobalSmoothing() {
-            const value = parseFloat(document.getElementById('globalSmoothing').value);
-
-            vscode.postMessage({
-                command: 'telemetry',
-                eventName: 'chart.smoothingChanged',
-                properties: {
-                    smoothingValue: value.toFixed(2),
-                    scope: 'global'
-                }
-            });
-        }
-
         function toggleShowRaw() {
             showRaw = !showRaw;
             document.getElementById('showRawBtn').classList.toggle('active', showRaw);
-
-            // Track raw data toggle
-            vscode.postMessage({
-                command: 'telemetry',
-                eventName: 'chart.rawDataToggled',
-                properties: { enabled: showRaw.toString(), scope: 'global' }
-            });
 
             Object.values(chartInstances).forEach(chart => {
                 updateChartSmoothing(chart, globalSmoothing, showRaw);
@@ -663,14 +643,6 @@ export function getChartScript(): string {
                 logY = !logY;
                 document.getElementById('logYBtn').classList.toggle('active', logY);
             }
-
-            // Track log scale toggle
-            const enabled = axis === 'x' ? logX : logY;
-            vscode.postMessage({
-                command: 'telemetry',
-                eventName: 'chart.logScaleToggled',
-                properties: { axis: axis, enabled: enabled.toString(), scope: 'global' }
-            });
 
             Object.values(chartInstances).forEach(chart => {
                 updateChartAxes(chart, logX, logY);
@@ -688,14 +660,12 @@ export function getChartScript(): string {
             }
 
             const selector = '.chart-container, .metric-card';
-            let matchCount = 0;
             document.querySelectorAll(selector).forEach(container => {
                 const titleEl = container.querySelector('.chart-title, .metric-title');
                 if (titleEl) {
                     const title = titleEl.textContent;
                     const matches = !searchText || regex.test(title);
                     container.classList.toggle('hidden', !matches);
-                    if (matches) matchCount++;
                 }
             });
 
@@ -703,18 +673,6 @@ export function getChartScript(): string {
                 const visibleCharts = group.querySelectorAll(selector + ':not(.hidden)');
                 group.classList.toggle('hidden', visibleCharts.length === 0 && searchText);
             });
-
-            // Track metric filtering (debounce to avoid spam)
-            if (searchText) {
-                clearTimeout(window.filterDebounce);
-                window.filterDebounce = setTimeout(() => {
-                    vscode.postMessage({
-                        command: 'telemetry',
-                        eventName: 'ui.metricFiltered',
-                        properties: { matchCount: matchCount.toString(), hasText: 'true' }
-                    });
-                }, 1000);
-            }
         }
 
         function closeAllMenus() {
@@ -841,11 +799,6 @@ export function getChartScript(): string {
                 vscode.postMessage({ command: 'copyChartImageFallback', imageBase64: base64Data });
             }
 
-            vscode.postMessage({
-                command: 'telemetry',
-                eventName: 'chartImage.singleCopied',
-                properties: { metricType: type }
-            });
         }
 
         // ==================== CHART IMAGE CAPTURE ====================
@@ -984,16 +937,6 @@ export function getChartScript(): string {
                     statusEl.innerHTML = '&#10003; Saving ' + chartImages.length + ' chart(s)...';
                 }
 
-                // Telemetry
-                vscode.postMessage({
-                    command: 'telemetry',
-                    eventName: 'chartImage.captured',
-                    properties: {
-                        action: action,
-                        chartCount: String(chartImages.length)
-                    }
-                });
-
                 setTimeout(() => {
                     const el = document.getElementById('captureStatus');
                     if (el) el.remove();
@@ -1002,12 +945,6 @@ export function getChartScript(): string {
             } catch (error) {
                 statusEl.innerHTML = '&#10007; Failed: ' + (error.message || String(error));
                 setTimeout(() => statusEl.remove(), 3000);
-
-                vscode.postMessage({
-                    command: 'telemetry',
-                    eventName: 'chartImage.error',
-                    properties: { error: String(error.message || error).substring(0, 100) }
-                });
             }
         }
 
@@ -1095,19 +1032,6 @@ export function getChartScript(): string {
             updateChartSmoothing(modalChart, value, true);
         }
 
-        function trackModalSmoothing() {
-            const value = parseFloat(document.getElementById('modalSmoothing').value);
-
-            vscode.postMessage({
-                command: 'telemetry',
-                eventName: 'chart.smoothingChanged',
-                properties: {
-                    smoothingValue: value.toFixed(2),
-                    scope: 'modal'
-                }
-            });
-        }
-
         function toggleModalLogAxis(axis) {
             if (axis === 'x') {
                 modalLogX = !modalLogX;
@@ -1116,14 +1040,6 @@ export function getChartScript(): string {
                 modalLogY = !modalLogY;
                 document.getElementById('modalLogYBtn').classList.toggle('active', modalLogY);
             }
-
-            // Track modal log scale toggle
-            const enabled = axis === 'x' ? modalLogX : modalLogY;
-            vscode.postMessage({
-                command: 'telemetry',
-                eventName: 'chart.logScaleToggled',
-                properties: { axis: axis, enabled: enabled.toString(), scope: 'modal' }
-            });
 
             updateChartAxes(modalChart, modalLogX, modalLogY);
         }
@@ -1147,12 +1063,6 @@ export function getChartScript(): string {
         if (modalCanvas) {
             modalCanvas.addEventListener('dblclick', () => {
                 if (modalChart) {
-                    // Track zoom reset
-                    vscode.postMessage({
-                        command: 'telemetry',
-                        eventName: 'chart.zoomReset',
-                        properties: { method: 'doubleClick' }
-                    });
                     modalChart.resetZoom();
                 }
             });
@@ -1162,15 +1072,6 @@ export function getChartScript(): string {
         document.querySelectorAll('.tab').forEach(tab => {
             tab.addEventListener('click', () => {
                 const targetId = tab.dataset.tab || tab.getAttribute('data-tab');
-
-                // Track tab switching
-                if (targetId) {
-                    vscode.postMessage({
-                        command: 'telemetry',
-                        eventName: 'ui.tabSwitched',
-                        properties: { tab: targetId }
-                    });
-                }
 
                 document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
                 document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
@@ -1194,7 +1095,7 @@ export function getControlsBarHtml(): string {
             </div>
             <div class="control-group smoothing-control">
                 <label for="globalSmoothing">Smoothing:</label>
-                <input type="range" id="globalSmoothing" min="0" max="0.99" step="0.01" value="0" oninput="updateGlobalSmoothing()" onchange="trackGlobalSmoothing()">
+                <input type="range" id="globalSmoothing" min="0" max="0.99" step="0.01" value="0" oninput="updateGlobalSmoothing()">
                 <span class="smoothing-value" id="globalSmoothingValue">0.00</span>
             </div>
             <div class="control-group" id="showRawGroup" style="display: none;">
@@ -1243,7 +1144,7 @@ export function getModalHtml(): string {
                 <div class="modal-controls">
                     <div class="smoothing-control">
                         <label for="modalSmoothing">Smoothing:</label>
-                        <input type="range" id="modalSmoothing" min="0" max="0.99" step="0.01" value="0" oninput="updateModalSmoothing()" onchange="trackModalSmoothing()">
+                        <input type="range" id="modalSmoothing" min="0" max="0.99" step="0.01" value="0" oninput="updateModalSmoothing()">
                         <span class="smoothing-value" id="modalSmoothingValue">0.00</span>
                     </div>
                     <div class="axis-toggles">

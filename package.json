@@ -91,8 +91,7 @@
     "lint": "eslint src --ext ts"
   },
   "dependencies": {
-    "protobufjs": "^7.2.6",
-    "@vscode/extension-telemetry": "^0.9.0"
+    "protobufjs": "^7.2.6"
   },
   "devDependencies": {
     "@types/node": "^18.0.0",

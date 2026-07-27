@@ -137,7 +137,7 @@ Your training data never leaves your machine.
 - No wandb CLI or API needed
 - No internet connection required
 - Works completely offline
-- Zero telemetry on your training data (see Privacy section below)
+- Does not collect or transmit analytics or telemetry
 
 ---
 
@@ -173,38 +173,11 @@ code --install-extension wandb-viewer-0.2.2.vsix
 
 ---
 
-## Privacy & Analytics
+## Privacy
 
-This extension collects **anonymous** usage analytics to help improve the product. We take your privacy seriously.
-
-### What We Collect
-
-- Feature usage (which features you use)
-- Performance metrics (parse times, load times)
-- Error events (crashes and bugs)
-- Chart interactions (smoothing settings, zoom actions)
-
-### What We DO NOT Collect
-
-- ❌ Run names or project names
-- ❌ Metric values or training data
-- ❌ File paths or code
-- ❌ Hyperparameters or configurations
-- ❌ Any personally identifiable information (PII)
-
-### How to Opt Out
-
-**Option 1: Via Settings UI**
-1. Open Settings (`Cmd+,` or `Ctrl+,`)
-2. Search for "telemetry level"
-3. Set **Telemetry Level** to "off"
-
-**Option 2: Via settings.json**
-1. Open Command Palette (`Cmd+Shift+P` / `Ctrl+Shift+P`)
-2. Type "Preferences: Open User Settings (JSON)"
-3. Add: `"telemetry.telemetryLevel": "off"`
-
-The extension respects your editor's global `telemetry.telemetryLevel` setting. Learn more about [VS Code telemetry](https://code.visualstudio.com/docs/configure/telemetry#_extensions-and-telemetry).
+The extension does not collect or transmit usage analytics, error telemetry, run
+metadata, metric values, file paths, code, hyperparameters, or configuration data.
+W&B run parsing and analysis happen locally.
 
 ---
 
@@ -246,6 +219,41 @@ For developers and power users interested in how this extension works.
 - ✅ Compatible with VS Code 1.74+
 - ✅ Tested with wandb SDK 0.15+
 - ✅ Open Source - contributions welcome
+
+---
+
+## Open Changes
+
+### Run Refresh and Discovery
+
+- [x] Add a reload button to refresh the data for all runs currently displayed in
+  the viewer.
+- [ ] Periodically rescan the selected folder for new runs.
+- [ ] Add a dedicated button to trigger run discovery immediately.
+
+### Chart Interaction and State
+
+- [ ] Rework smoothing so the smoothed and raw series share the same visibility
+  state. Hiding a run should hide every series associated with that run.
+- [ ] Preserve logarithmic-axis settings when runs, smoothing, visibility, or other
+  viewer settings change.
+- [ ] Allow cursor-based range selection in overview charts, not only in fullscreen
+  charts.
+- [ ] Make drag-to-zoom select the X-axis range by default without changing the
+  Y-axis range. Panning sideways should retain the current Y-axis scale.
+- [ ] Double clicking one run's name in the chart legend should hide all other runs, and double clicking again should restore all runs to visible.
+- [ ] Allow users to resize the chart area in the multi-run viewer by dragging the divider between the chart area and the other charts below it.
+
+### Performance
+
+- [ ] Investigate lazy loading for runs. Start the multi-run viewer with runs
+  deactivated and parse/load a run only when the user enables it, reducing initial
+  startup time for folders containing many runs.
+
+### New Features
+
+- [ ] Add a "Compare Configs" button to the multi-run viewer to show a side-by-side
+  diff of the hyperparameter configurations for all runs currently displayed.
 
 ---
 

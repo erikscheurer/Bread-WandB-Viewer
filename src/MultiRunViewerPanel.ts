@@ -5,9 +5,6 @@ import { MultiRunManager, MergedMetric } from './MultiRunManager';
 import { scanFolderForRuns, watchFolder, FileChangeEvent, RunScanResult } from './MultiRunScanner';
 import { getChartStyles, getChartScript, getModalHtml, getControlsBarHtml } from './chartTemplate';
 import { generateAIContext, calculateTokenEstimate } from './aiContext/ContextGenerator';
-import { TelemetryService } from './telemetry/TelemetryService';
-import { isTelemetryConfigured } from './telemetry/config';
-import { bucketRunCount, bucketTokenCount } from './telemetry/helpers';
 
 export class MultiRunViewerPanel {
     public static currentPanel: MultiRunViewerPanel | undefined;
@@ -57,52 +54,28 @@ export class MultiRunViewerPanel {
             async message => {
                 switch (message.command) {
                     case 'toggleRun':
-                        const wasSelected = this._manager.isRunSelected(message.runId);
                         this._manager.toggleRun(message.runId);
-
-                        // Track run toggle
-                        if (isTelemetryConfigured()) {
-                            const selectedCount = this._manager.getSelectedRunIds().length;
-                            TelemetryService.getInstance().sendEvent('multiRun.runToggled', {
-                                action: wasSelected ? 'deselected' : 'selected',
-                                totalSelected: bucketRunCount(selectedCount),
-                                method: 'checkbox'
-                            });
-                        }
-
-                        this._update();
+                        await this._update(false);
                         break;
                     case 'selectAll':
                         this._manager.selectAll();
-
-                        // Track select all
-                        if (isTelemetryConfigured()) {
-                            const selectedCount = this._manager.getSelectedRunIds().length;
-                            TelemetryService.getInstance().sendEvent('multiRun.runToggled', {
-                                action: 'selected',
-                                totalSelected: bucketRunCount(selectedCount),
-                                method: 'selectAll'
-                            });
-                        }
-
-                        this._update();
+                        await this._update(false);
                         break;
                     case 'deselectAll':
                         this._manager.deselectAll();
-
-                        // Track deselect all
-                        if (isTelemetryConfigured()) {
-                            TelemetryService.getInstance().sendEvent('multiRun.runToggled', {
-                                action: 'deselected',
-                                totalSelected: '0',
-                                method: 'deselectAll'
+                        await this._update(false);
+                        break;
+                    case 'reloadSelectedRuns':
+                        try {
+                            await this._reloadSelectedRuns();
+                        } catch {
+                            vscode.window.showErrorMessage('Failed to reload the selected runs.');
+                        } finally {
+                            await this._panel.webview.postMessage({
+                                command: 'reloadSelectedRunsComplete',
+                                canReload: this._manager.getSelectedCount() > 0
                             });
                         }
-
-                        this._update();
-                        break;
-                    case 'refreshRuns':
-                        this._update();
                         break;
                     case 'generateAIContext':
                         await this._handleGenerateAIContext(message.action);
@@ -116,16 +89,6 @@ export class MultiRunViewerPanel {
                     case 'showWarning':
                         vscode.window.showWarningMessage(message.message);
                         break;
-                    case 'telemetry':
-                        // Handle telemetry events from webview
-                        if (isTelemetryConfigured()) {
-                            TelemetryService.getInstance().sendEvent(
-                                message.eventName,
-                                message.properties || {},
-                                message.measurements || {}
-                            );
-                        }
-                        break;
                 }
             },
             null,
@@ -138,43 +101,50 @@ export class MultiRunViewerPanel {
         });
     }
 
-    private async _update() {
+    private async _reloadSelectedRuns(): Promise<void> {
+        if (this._manager.getSelectedCount() === 0) {
+            vscode.window.showInformationMessage('Select at least one run to reload.');
+            return;
+        }
+
+        this._manager.invalidateSelectedRuns();
+        await this._update(false);
+    }
+
+    private async _update(scanForRuns: boolean = true): Promise<void> {
         const overallStart = Date.now();
         console.log('=== Multi-Run View Update Started ===');
 
-        const t1 = Date.now();
-        const runs = await scanFolderForRuns(this._folderPath);
-        const scanTime = Date.now() - t1;
-        console.log(`[1] Folder scan: ${scanTime}ms (found ${runs.length} runs)`);
+        if (scanForRuns) {
+            const t1 = Date.now();
+            const discoveredRuns = await scanFolderForRuns(this._folderPath);
+            const scanTime = Date.now() - t1;
+            console.log(`[1] Folder scan: ${scanTime}ms (found ${discoveredRuns.length} runs)`);
 
-        // Track scan completion
-        if (isTelemetryConfigured()) {
-            TelemetryService.getInstance().sendEvent('multiRun.scanCompleted', {
-                runCount: bucketRunCount(runs.length)
-            }, {
-                scanTimeMs: scanTime
-            });
-        }
+            // Update manager with discovered runs
+            const t2 = Date.now();
+            const currentRuns = new Set(this._manager.getRuns().map(run => run.runId));
+            const discoveredRunIds = new Set(discoveredRuns.map(run => run.runId));
 
-        // Update manager with new runs
-        const t2 = Date.now();
-        const currentRuns = new Set(this._manager.getRuns().map(r => r.runId));
-        const newRuns = new Set(runs.map(r => r.runId));
-
-        // Add new runs
-        for (const run of runs) {
-            if (!currentRuns.has(run.runId)) {
-                this._manager.addRun(run);
+            for (const run of discoveredRuns) {
+                if (currentRuns.has(run.runId)) {
+                    this._manager.updateRun(run);
+                } else {
+                    this._manager.addRun(run);
+                }
             }
+
+            for (const existingRun of this._manager.getRuns()) {
+                if (!discoveredRunIds.has(existingRun.runId)) {
+                    this._manager.removeRun(existingRun.runId);
+                }
+            }
+            console.log(`[2] Run management: ${Date.now() - t2}ms`);
+        } else {
+            console.log('[1-2] Folder scan skipped');
         }
 
-        // Remove deleted runs
-        for (const existingRun of this._manager.getRuns()) {
-            if (!newRuns.has(existingRun.runId)) {
-                this._manager.removeRun(existingRun.runId);
-            }
-        }
-        console.log(`[2] Run management: ${Date.now() - t2}ms`);
+        const runs = this._manager.getRuns();
 
         // Parse selected runs and merge metrics
         const t3 = Date.now();
@@ -285,7 +255,7 @@ export class MultiRunViewerPanel {
                 <div class="sidebar-controls">
                     <button class="btn-icon" onclick="selectAllRuns()" title="Select All">☑</button>
                     <button class="btn-icon" onclick="deselectAllRuns()" title="Deselect All">☐</button>
-                    <button class="btn-icon" onclick="refreshRuns()" title="Refresh">⟳</button>
+                    <button class="btn-icon reload-runs-btn" id="reloadRunsBtn" onclick="reloadSelectedRuns()" title="Reload data for selected runs" ${selectedRunIds.length === 0 ? 'disabled' : ''}>⟳ Reload</button>
                 </div>
             </div>
 
@@ -477,13 +447,6 @@ export class MultiRunViewerPanel {
                 const expandBtn = document.getElementById('expandBtn');
                 const isCollapsed = sidebar.classList.contains('collapsed');
 
-                // Track sidebar toggle
-                vscode.postMessage({
-                    command: 'telemetry',
-                    eventName: 'ui.sidebarToggled',
-                    properties: { state: isCollapsed ? 'collapsed' : 'expanded' }
-                });
-
                 if (isCollapsed) {
                     collapseBtn.style.display = 'none';
                     expandBtn.style.display = 'block';
@@ -497,13 +460,6 @@ export class MultiRunViewerPanel {
             function switchSidebarTab(tab) {
                 const tabs = document.querySelectorAll('.sidebar-tab');
                 const contents = document.querySelectorAll('.sidebar-content');
-
-                // Track sidebar tab switching
-                vscode.postMessage({
-                    command: 'telemetry',
-                    eventName: 'ui.sidebarTabSwitched',
-                    properties: { tab: tab }
-                });
 
                 tabs.forEach(t => t.classList.remove('active'));
                 contents.forEach(c => c.classList.remove('active'));
@@ -532,22 +488,33 @@ export class MultiRunViewerPanel {
                 vscode.postMessage({ command: 'deselectAll' });
             }
 
-            function refreshRuns() {
-                vscode.postMessage({ command: 'refreshRuns' });
+            function reloadSelectedRuns() {
+                const button = document.getElementById('reloadRunsBtn');
+                if (!button || button.disabled) return;
+
+                button.disabled = true;
+                button.textContent = '⟳ Reloading…';
+                button.setAttribute('aria-busy', 'true');
+                vscode.postMessage({ command: 'reloadSelectedRuns' });
             }
+
+            window.addEventListener('message', event => {
+                const message = event.data;
+                if (message.command !== 'reloadSelectedRunsComplete') return;
+
+                const button = document.getElementById('reloadRunsBtn');
+                if (!button) return;
+
+                button.textContent = '⟳ Reload';
+                button.disabled = !message.canReload;
+                button.removeAttribute('aria-busy');
+            });
 
             // Fullscreen modal
             function openFullscreen(metricIndex, type) {
                 const metrics = type === 'training' ? trainingMetrics : systemMetrics;
                 const metric = metrics[metricIndex];
                 if (!metric) return;
-
-                // Track fullscreen modal opening
-                vscode.postMessage({
-                    command: 'telemetry',
-                    eventName: 'chart.fullscreenOpened',
-                    properties: { metricType: type }
-                });
 
                 document.getElementById('modalTitle').textContent = metric.metricName;
                 document.getElementById('fullscreenModal').classList.add('active');
@@ -732,6 +699,13 @@ export class MultiRunViewerPanel {
             }
             .btn-icon:hover {
                 background: var(--vscode-button-hoverBackground);
+            }
+            .btn-icon:disabled {
+                cursor: wait;
+                opacity: 0.65;
+            }
+            .reload-runs-btn {
+                white-space: nowrap;
             }
             .sidebar-tabs {
                 display: flex;
@@ -985,26 +959,9 @@ export class MultiRunViewerPanel {
             );
             const tokens = calculateTokenEstimate(context);
 
-            // Track AI context generation
-            if (isTelemetryConfigured()) {
-                TelemetryService.getInstance().sendEvent('aiContext.generated', {
-                    selectedRunCount: bucketRunCount(selectedRuns.length),
-                    tokenEstimate: bucketTokenCount(tokens),
-                    action: action
-                });
-            }
-
             if (action === 'copy') {
                 // Copy to clipboard
                 await vscode.env.clipboard.writeText(context);
-
-                // Track copy action
-                if (isTelemetryConfigured()) {
-                    TelemetryService.getInstance().sendEvent('aiContext.copied', {
-                        tokenEstimate: bucketTokenCount(tokens),
-                        selectedRunCount: bucketRunCount(selectedRuns.length)
-                    });
-                }
 
                 vscode.window.showInformationMessage(
                     `Context copied to clipboard (${tokens} tokens)`
@@ -1023,29 +980,12 @@ export class MultiRunViewerPanel {
                 if (uri) {
                     await vscode.workspace.fs.writeFile(uri, Buffer.from(context, 'utf8'));
 
-                    // Track save action
-                    if (isTelemetryConfigured()) {
-                        const ext = path.extname(uri.fsPath).slice(1) || 'md';
-                        TelemetryService.getInstance().sendEvent('aiContext.saved', {
-                            tokenEstimate: bucketTokenCount(tokens),
-                            selectedRunCount: bucketRunCount(selectedRuns.length),
-                            fileExtension: ext
-                        });
-                    }
-
                     vscode.window.showInformationMessage(
                         `Context saved to ${path.basename(uri.fsPath)} (${tokens} tokens)`
                     );
                 }
             }
         } catch (error) {
-            // Track error
-            if (isTelemetryConfigured()) {
-                TelemetryService.getInstance().sendError('aiContext.error', error as Error, {
-                    selectedRunCount: bucketRunCount(selectedRuns.length)
-                });
-            }
-
             vscode.window.showErrorMessage(
                 `Failed to generate AI context: ${error instanceof Error ? error.message : String(error)}`
             );
@@ -1066,20 +1006,11 @@ export class MultiRunViewerPanel {
                 const buffer = Buffer.from(imageBase64, 'base64');
                 await vscode.workspace.fs.writeFile(uri, buffer);
 
-                if (isTelemetryConfigured()) {
-                    TelemetryService.getInstance().sendEvent('chartImage.saved', {
-                        chartCount: String(chartCount)
-                    });
-                }
-
                 vscode.window.showInformationMessage(
                     `Chart image saved to ${path.basename(uri.fsPath)} (${chartCount} charts)`
                 );
             }
         } catch (error) {
-            if (isTelemetryConfigured()) {
-                TelemetryService.getInstance().sendError('chartImage.saveError', error as Error);
-            }
             vscode.window.showErrorMessage(
                 `Failed to save chart image: ${error instanceof Error ? error.message : String(error)}`
             );
@@ -1092,10 +1023,6 @@ export class MultiRunViewerPanel {
             const tmpPath = path.join(os.tmpdir(), `wandb-charts-${Date.now()}.png`);
             const buffer = Buffer.from(imageBase64, 'base64');
             fs.writeFileSync(tmpPath, buffer);
-
-            if (isTelemetryConfigured()) {
-                TelemetryService.getInstance().sendEvent('chartImage.fallbackUsed', {});
-            }
 
             const selection = await vscode.window.showInformationMessage(
                 `Chart image saved to temporary file.`,

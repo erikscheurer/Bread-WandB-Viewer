@@ -11,21 +11,9 @@ import {
 import { WandbViewerPanel } from './webviewPanel';
 import { MultiRunViewerPanel } from './MultiRunViewerPanel';
 import { getChartStyles, getChartScript, getControlsBarHtml, getModalHtml } from './chartTemplate';
-import { TelemetryService } from './telemetry/TelemetryService';
-import { TELEMETRY_CONFIG, isTelemetryConfigured } from './telemetry/config';
-import { getFileSizeCategory, bucketMetricCount } from './telemetry/helpers';
 
 export function activate(context: vscode.ExtensionContext) {
     console.log('W&B Viewer extension activated');
-
-    // Initialize telemetry
-    if (isTelemetryConfigured()) {
-        TelemetryService.initialize(context, TELEMETRY_CONFIG.appInsightsKey);
-        TelemetryService.getInstance().sendEvent('extension.activated', {
-            vsCodeVersion: vscode.version,
-            extensionVersion: context.extension.packageJSON.version
-        });
-    }
 
     // Register custom editor for .wandb files
     context.subscriptions.push(
@@ -69,7 +57,6 @@ export function activate(context: vscode.ExtensionContext) {
             }
 
             try {
-                const startTime = Date.now();
                 await vscode.window.withProgress(
                     {
                         location: vscode.ProgressLocation.Notification,
@@ -78,25 +65,9 @@ export function activate(context: vscode.ExtensionContext) {
                     },
                     async () => {
                         const runData = parseWandbFile(runFiles.wandbFile!);
-                        const parseTime = Date.now() - startTime;
                         const logMetrics = runFiles.outputLog
                             ? parseOutputLog(runFiles.outputLog)
                             : {};
-
-                        // Track successful file open
-                        if (isTelemetryConfigured()) {
-                            const fileSize = fs.statSync(runFiles.wandbFile!).size;
-                            const metricCount = Object.keys(runData.metrics).length + Object.keys(runData.systemMetrics).length;
-                            TelemetryService.getInstance().sendEvent('file.wandb.opened', {
-                                openMethod: uri ? 'contextMenu' : 'command',
-                                fileSize: getFileSizeCategory(fileSize),
-                                parseSuccess: 'true',
-                                hasOutputLog: runFiles.outputLog ? 'true' : 'false',
-                                metricCount: bucketMetricCount(metricCount)
-                            }, {
-                                parseTimeMs: parseTime
-                            });
-                        }
 
                         WandbViewerPanel.createOrShow(
                             context.extensionUri,
@@ -108,14 +79,6 @@ export function activate(context: vscode.ExtensionContext) {
                     }
                 );
             } catch (error) {
-                // Track parse error
-                if (isTelemetryConfigured() && runFiles.wandbFile) {
-                    const fileSize = fs.statSync(runFiles.wandbFile).size;
-                    TelemetryService.getInstance().sendError('file.wandb.parseError', error as Error, {
-                        fileSize: getFileSizeCategory(fileSize)
-                    });
-                }
-
                 vscode.window.showErrorMessage(
                     `Failed to parse W&B run: ${error instanceof Error ? error.message : String(error)}`
                 );
@@ -148,13 +111,6 @@ export function activate(context: vscode.ExtensionContext) {
             }
 
             try {
-                // Track multi-run viewer opening
-                if (isTelemetryConfigured()) {
-                    TelemetryService.getInstance().sendEvent('multiRun.viewerOpened', {
-                        openMethod: uri ? 'contextMenu' : 'command'
-                    });
-                }
-
                 await vscode.window.withProgress(
                     {
                         location: vscode.ProgressLocation.Notification,
@@ -264,28 +220,11 @@ class WandbEditorProvider implements vscode.CustomReadonlyEditorProvider {
         };
 
         try {
-            const startTime = Date.now();
             const runData = parseWandbFile(wandbFilePath);
-            const parseTime = Date.now() - startTime;
             const runFiles = getRunFiles(runDir);
             const logMetrics = runFiles.outputLog
                 ? parseOutputLog(runFiles.outputLog)
                 : {};
-
-            // Track file opened via custom editor
-            if (isTelemetryConfigured()) {
-                const fileSize = fs.statSync(wandbFilePath).size;
-                const metricCount = Object.keys(runData.metrics).length + Object.keys(runData.systemMetrics).length;
-                TelemetryService.getInstance().sendEvent('file.wandb.opened', {
-                    openMethod: 'editor',
-                    fileSize: getFileSizeCategory(fileSize),
-                    parseSuccess: 'true',
-                    hasOutputLog: runFiles.outputLog ? 'true' : 'false',
-                    metricCount: bucketMetricCount(metricCount)
-                }, {
-                    parseTimeMs: parseTime
-                });
-            }
 
             webviewPanel.webview.html = this.getHtmlContent(
                 webviewPanel.webview,
@@ -322,14 +261,6 @@ class WandbEditorProvider implements vscode.CustomReadonlyEditorProvider {
                     const newLogMetrics = runFiles.outputLog
                         ? parseOutputLog(runFiles.outputLog)
                         : {};
-
-                    // Track live update
-                    if (isTelemetryConfigured()) {
-                        TelemetryService.getInstance().sendEvent('file.wandb.liveUpdateReceived', {
-                            metricsChanged: 'true',
-                            systemMetricsChanged: 'true'
-                        });
-                    }
 
                     // Merge metrics
                     const allMetrics = { ...newRunData.metrics };
@@ -377,15 +308,6 @@ class WandbEditorProvider implements vscode.CustomReadonlyEditorProvider {
                 }
             });
         } catch (error) {
-            // Track parse error
-            if (isTelemetryConfigured()) {
-                const fileSize = fs.statSync(wandbFilePath).size;
-                TelemetryService.getInstance().sendError('file.wandb.parseError', error as Error, {
-                    fileSize: getFileSizeCategory(fileSize),
-                    openMethod: 'editor'
-                });
-            }
-
             webviewPanel.webview.html = `
                 <html>
                 <body style="padding: 20px; font-family: sans-serif; color: #d4d4d4; background: #1e1e1e;">
@@ -760,8 +682,4 @@ class WandbEditorProvider implements vscode.CustomReadonlyEditorProvider {
     }
 }
 
-export function deactivate() {
-    if (isTelemetryConfigured()) {
-        TelemetryService.getInstance().dispose();
-    }
-}
+export function deactivate() {}
