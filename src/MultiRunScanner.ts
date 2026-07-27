@@ -8,6 +8,7 @@ export interface RunScanResult {
     runId: string;
     runName: string;
     project?: string;
+    createdAt: number;
     lastModified: number;
     fileSize: number;
     isVisible: boolean;
@@ -64,6 +65,7 @@ export async function scanFolderForRuns(folderPath: string): Promise<RunScanResu
  */
 export async function quickParseMetadata(filePath: string): Promise<RunScanResult> {
     const stats = await fs.promises.stat(filePath);
+    let createdAt = stats.birthtimeMs || stats.ctimeMs;
 
     // Extract runId from filename as fallback
     let runId = path.basename(filePath, '.wandb').replace('run-', '');
@@ -88,6 +90,15 @@ export async function quickParseMetadata(filePath: string): Promise<RunScanResul
                     runId = record.run.run_id || runId;
                     runName = record.run.display_name || record.run.run_id || runId;
                     project = record.run.project;
+                    const startTime = record.run.start_time || record.run.startTime;
+                    if (startTime) {
+                        const seconds = Number(startTime.seconds);
+                        const nanos = Number(startTime.nanos || 0);
+                        if (Number.isFinite(seconds) && seconds > 0) {
+                            createdAt = seconds * 1000 +
+                                (Number.isFinite(nanos) ? nanos / 1_000_000 : 0);
+                        }
+                    }
                     break; // Found what we need
                 }
             } catch (error) {
@@ -105,6 +116,7 @@ export async function quickParseMetadata(filePath: string): Promise<RunScanResul
         runId,
         runName,
         project,
+        createdAt,
         lastModified: stats.mtimeMs,
         fileSize: stats.size,
         isVisible: true // Auto-select by default
@@ -431,10 +443,16 @@ async function loadProtoSchema(): Promise<protobuf.Root> {
         .add(new protobuf.Field('run', 17, 'RunRecord'))
     );
 
+    wandbInternal.add(new protobuf.Type('Timestamp')
+        .add(new protobuf.Field('seconds', 1, 'int64'))
+        .add(new protobuf.Field('nanos', 2, 'int32'))
+    );
+
     wandbInternal.add(new protobuf.Type('RunRecord')
         .add(new protobuf.Field('run_id', 1, 'string'))
         .add(new protobuf.Field('project', 3, 'string'))
         .add(new protobuf.Field('display_name', 8, 'string'))
+        .add(new protobuf.Field('start_time', 17, 'Timestamp'))
     );
 
     cachedProtoRoot = root;

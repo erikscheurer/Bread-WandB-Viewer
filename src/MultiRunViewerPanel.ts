@@ -341,7 +341,14 @@ export class MultiRunViewerPanel {
             const isSelected = selectedSet.has(run.runId);
             const color = this._manager.getRunColor(run.runId);
             return `
-                <div class="run-item">
+                <div
+                    class="run-item"
+                    data-run-name="${this._escapeHtml(run.runName)}"
+                    data-run-id="${this._escapeHtml(run.runId)}"
+                    data-run-project="${this._escapeHtml(run.project || '')}"
+                    data-created-at="${run.createdAt}"
+                    data-updated-at="${run.lastModified}"
+                >
                     <input type="checkbox" ${isSelected ? 'checked' : ''} onchange="toggleRun('${run.runId}')">
                     <div class="run-color" style="background: ${color}"></div>
                     <div class="run-info">
@@ -402,7 +409,7 @@ export class MultiRunViewerPanel {
             <div class="resize-handle" id="resizeHandle"></div>
 
             <div class="sidebar-header">
-                <h3>Runs (${runs.length})</h3>
+                <h3 id="runCountHeading">Runs (${runs.length})</h3>
                 <div class="sidebar-controls">
                     <button class="btn-icon" onclick="selectAllRuns()" title="Select All">☑</button>
                     <button class="btn-icon" onclick="deselectAllRuns()" title="Deselect All">☐</button>
@@ -416,7 +423,19 @@ export class MultiRunViewerPanel {
             </div>
 
             <div class="sidebar-content active" id="runsContent">
-                ${runListHtml}
+                <div class="run-list-tools">
+                    <input type="search" id="runFilterInput" placeholder="Filter runs…" aria-label="Filter runs by name, ID, or project">
+                    <select id="runSortSelect" aria-label="Sort runs">
+                        <option value="name-asc">Name A–Z</option>
+                        <option value="name-desc">Name Z–A</option>
+                        <option value="created-desc">Created newest</option>
+                        <option value="created-asc">Created oldest</option>
+                        <option value="updated-desc">Updated newest</option>
+                        <option value="updated-asc">Updated oldest</option>
+                    </select>
+                </div>
+                <div id="runList">${runListHtml}</div>
+                <div class="run-filter-empty" id="runFilterEmpty">No runs match this filter.</div>
             </div>
 
             <div class="sidebar-content" id="metadataContent">
@@ -676,6 +695,13 @@ export class MultiRunViewerPanel {
                 ? persistedViewState.chartHeights
                 : {};
 
+            function updatePersistedViewState(changes) {
+                vscode.setState({
+                    ...(vscode.getState() || {}),
+                    ...changes
+                });
+            }
+
             // Sidebar resizing
             let isResizing = false;
             const resizeHandle = document.getElementById('resizeHandle');
@@ -715,6 +741,98 @@ export class MultiRunViewerPanel {
             // Initialize button position
             updateCollapseButtonPosition();
 
+            // Run filtering and sorting
+            const runFilterInput = document.getElementById('runFilterInput');
+            const runSortSelect = document.getElementById('runSortSelect');
+            const runList = document.getElementById('runList');
+            const runFilterEmpty = document.getElementById('runFilterEmpty');
+            const runCountHeading = document.getElementById('runCountHeading');
+
+            function applyRunListView(shouldPersist = true) {
+                if (!runFilterInput || !runSortSelect || !runList) return;
+
+                const filterText = runFilterInput.value.trim().toLocaleLowerCase();
+                const sortMode = runSortSelect.value;
+                const runItems = Array.from(runList.querySelectorAll('.run-item'));
+                const compareText = (a, b) => a.localeCompare(b, undefined, {
+                    numeric: true,
+                    sensitivity: 'base'
+                });
+                const getTimestamp = (item, field) => {
+                    const value = Number(item.dataset[field]);
+                    return Number.isFinite(value) ? value : 0;
+                };
+
+                runItems.sort((a, b) => {
+                    let result = 0;
+                    if (sortMode === 'name-desc') {
+                        result = compareText(b.dataset.runName || '', a.dataset.runName || '');
+                    } else if (sortMode === 'created-desc') {
+                        result = getTimestamp(b, 'createdAt') - getTimestamp(a, 'createdAt');
+                    } else if (sortMode === 'created-asc') {
+                        result = getTimestamp(a, 'createdAt') - getTimestamp(b, 'createdAt');
+                    } else if (sortMode === 'updated-desc') {
+                        result = getTimestamp(b, 'updatedAt') - getTimestamp(a, 'updatedAt');
+                    } else if (sortMode === 'updated-asc') {
+                        result = getTimestamp(a, 'updatedAt') - getTimestamp(b, 'updatedAt');
+                    } else {
+                        result = compareText(a.dataset.runName || '', b.dataset.runName || '');
+                    }
+
+                    return result || compareText(a.dataset.runId || '', b.dataset.runId || '');
+                });
+
+                let visibleCount = 0;
+                runItems.forEach(item => {
+                    const searchableText = [
+                        item.dataset.runName,
+                        item.dataset.runId,
+                        item.dataset.runProject
+                    ].join(' ').toLocaleLowerCase();
+                    const isVisible = !filterText || searchableText.includes(filterText);
+                    item.hidden = !isVisible;
+                    if (isVisible) {
+                        visibleCount++;
+                    }
+                    runList.appendChild(item);
+                });
+
+                if (runFilterEmpty) {
+                    runFilterEmpty.classList.toggle('visible', visibleCount === 0);
+                }
+                if (runCountHeading) {
+                    runCountHeading.textContent = visibleCount === runItems.length
+                        ? 'Runs (' + runItems.length + ')'
+                        : 'Runs (' + visibleCount + '/' + runItems.length + ')';
+                }
+                if (shouldPersist) {
+                    updatePersistedViewState({
+                        runFilter: runFilterInput.value,
+                        runSort: sortMode
+                    });
+                }
+            }
+
+            if (runFilterInput && typeof persistedViewState.runFilter === 'string') {
+                runFilterInput.value = persistedViewState.runFilter;
+            }
+            if (
+                runSortSelect &&
+                typeof persistedViewState.runSort === 'string' &&
+                Array.from(runSortSelect.options).some(option =>
+                    option.value === persistedViewState.runSort
+                )
+            ) {
+                runSortSelect.value = persistedViewState.runSort;
+            }
+            if (runFilterInput) {
+                runFilterInput.addEventListener('input', () => applyRunListView());
+            }
+            if (runSortSelect) {
+                runSortSelect.addEventListener('change', () => applyRunListView());
+            }
+            applyRunListView(false);
+
             // Per-chart height resizing
             function getChartResizeKey(container) {
                 return container.dataset.chartType + ':' + container.dataset.metricName;
@@ -747,8 +865,7 @@ export class MultiRunViewerPanel {
                 savedChartHeights[getChartResizeKey(container)] = Math.round(
                     wrapper.getBoundingClientRect().height
                 );
-                vscode.setState({
-                    ...persistedViewState,
+                updatePersistedViewState({
                     chartHeights: savedChartHeights
                 });
             }
@@ -1216,6 +1333,45 @@ export class MultiRunViewerPanel {
             .sidebar-content.active {
                 display: block;
             }
+            .run-list-tools {
+                position: sticky;
+                top: -10px;
+                z-index: 5;
+                display: grid;
+                gap: 6px;
+                margin: -2px -2px 8px;
+                padding: 2px 2px 8px;
+                background: var(--vscode-sideBar-background);
+            }
+            .run-list-tools input,
+            .run-list-tools select {
+                width: 100%;
+                min-width: 0;
+                padding: 5px 7px;
+                border: 1px solid var(--vscode-input-border, var(--vscode-panel-border));
+                border-radius: 3px;
+                outline: none;
+                color: var(--vscode-input-foreground);
+                background: var(--vscode-input-background);
+                font-family: var(--vscode-font-family);
+                font-size: 0.8em;
+            }
+            .run-list-tools input:focus,
+            .run-list-tools select:focus {
+                border-color: var(--vscode-focusBorder);
+                outline: 1px solid var(--vscode-focusBorder);
+                outline-offset: -1px;
+            }
+            .run-filter-empty {
+                display: none;
+                padding: 18px 8px;
+                text-align: center;
+                color: var(--vscode-descriptionForeground);
+                font-size: 0.8em;
+            }
+            .run-filter-empty.visible {
+                display: block;
+            }
             .run-item {
                 display: flex;
                 align-items: center;
@@ -1224,6 +1380,9 @@ export class MultiRunViewerPanel {
                 margin-bottom: 4px;
                 border-radius: 4px;
                 cursor: pointer;
+            }
+            .run-item[hidden] {
+                display: none;
             }
             .run-item:hover {
                 background: var(--vscode-list-hoverBackground);
