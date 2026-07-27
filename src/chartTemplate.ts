@@ -1,3 +1,5 @@
+import { RUN_COLORS } from './runColors';
+
 /**
  * Unified chart template for both single-run and multi-run views
  * Consolidates all Chart.js rendering logic into one clean implementation
@@ -376,10 +378,7 @@ export function getChartStyles(): string {
 export function getChartScript(): string {
     return `
         // ==================== CONSTANTS ====================
-        const CHART_COLORS = [
-            '#4dc9f6', '#f67019', '#f53794', '#537bc4', '#acc236',
-            '#166a8f', '#00a950', '#58595b', '#8549ba', '#ff6384'
-        ];
+        const CHART_COLORS = ${JSON.stringify(RUN_COLORS)};
 
         // ==================== STATE ====================
         let chartInstances = {};

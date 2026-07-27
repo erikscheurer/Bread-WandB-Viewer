@@ -1,5 +1,6 @@
 import { RunScanResult } from './MultiRunScanner';
 import { WandbRunData, WandbMetrics, parseWandbFile, MetricPoint } from './wandbParser';
+import { getStableRunColor } from './runColors';
 
 export interface MergedMetric {
     metricName: string;
@@ -18,12 +19,6 @@ export interface MultiRunState {
     colorMap: Map<string, string>;
     folderPath: string;
 }
-
-// Color palette (reuse from single-run viewer)
-const COLORS = [
-    '#4dc9f6', '#f67019', '#f53794', '#537bc4', '#acc236',
-    '#166a8f', '#00a950', '#58595b', '#8549ba', '#ff6384'
-];
 
 const MAX_CACHE_SIZE = 20;
 
@@ -52,8 +47,10 @@ export class MultiRunManager {
             this.state.selectedRunIds.add(runResult.runId);
         }
 
-        // Reassign colors for all runs to maintain consistency
-        this.reassignAllColors();
+        this.state.colorMap.set(
+            runResult.runId,
+            getStableRunColor(runResult.runId)
+        );
     }
 
     /**
@@ -249,18 +246,6 @@ export class MultiRunManager {
      */
     getTotalCount(): number {
         return this.state.runs.size;
-    }
-
-    /**
-     * Reassign colors to all runs based on sorted run IDs
-     * This ensures consistent color assignment regardless of discovery order
-     */
-    private reassignAllColors(): void {
-        const sortedRunIds = Array.from(this.state.runs.keys()).sort();
-        sortedRunIds.forEach((runId, index) => {
-            const color = COLORS[index % COLORS.length];
-            this.state.colorMap.set(runId, color);
-        });
     }
 
     /**
