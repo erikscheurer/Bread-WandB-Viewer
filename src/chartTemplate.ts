@@ -380,13 +380,6 @@ export function getChartScript(): string {
         // ==================== CONSTANTS ====================
         const CHART_COLORS = ${JSON.stringify(RUN_COLORS)};
 
-        Chart.Tooltip.positioners.cursor = function(_elements, eventPosition) {
-            return {
-                x: eventPosition.x,
-                y: eventPosition.y
-            };
-        };
-
         // ==================== STATE ====================
         let chartInstances = {};
         let modalChart = null;
@@ -518,6 +511,52 @@ export function getChartScript(): string {
             }
         };
 
+        const tooltipRunHighlightPlugin = {
+            id: 'tooltipRunHighlight',
+            afterTooltipDraw(chart, args) {
+                const tooltip = args.tooltip;
+                const hoveredRunKey = chart.$hoveredRunKey;
+                if (!tooltip || tooltip.opacity === 0 || !hoveredRunKey) return;
+
+                const hoveredIndex = tooltip.dataPoints.findIndex(context =>
+                    getDatasetRunKey(context.dataset) === hoveredRunKey
+                );
+                if (hoveredIndex < 0) return;
+
+                const tooltipOptions = tooltip.options;
+                const padding = Chart.helpers.toPadding(tooltipOptions.padding);
+                const titleFont = Chart.helpers.toFont(tooltipOptions.titleFont);
+                const bodyFont = Chart.helpers.toFont(tooltipOptions.bodyFont);
+                const titleLines = tooltip.title ? tooltip.title.length : 0;
+                const titleHeight = titleLines > 0
+                    ? titleLines * titleFont.lineHeight +
+                        (titleLines - 1) * tooltipOptions.titleSpacing +
+                        tooltipOptions.titleMarginBottom
+                    : 0;
+                const rowHeight = bodyFont.lineHeight + tooltipOptions.bodySpacing;
+                const rowTop = tooltip.y + padding.top + titleHeight +
+                    hoveredIndex * rowHeight;
+                const swatchSpace = tooltipOptions.displayColors
+                    ? bodyFont.size + 4
+                    : 0;
+                const highlightLeft = tooltip.x + padding.left + swatchSpace;
+                const highlightWidth = Math.max(
+                    0,
+                    tooltip.width - padding.right - (highlightLeft - tooltip.x)
+                );
+
+                chart.ctx.save();
+                chart.ctx.fillStyle = 'rgba(160, 160, 160, 0.2)';
+                chart.ctx.fillRect(
+                    highlightLeft - 2,
+                    rowTop,
+                    highlightWidth + 2,
+                    bodyFont.lineHeight
+                );
+                chart.ctx.restore();
+            }
+        };
+
         function getChartPointerPosition(chart, event) {
             const rect = chart.canvas.getBoundingClientRect();
             const area = chart.chartArea;
@@ -583,14 +622,9 @@ export function getChartScript(): string {
 
         function installRangeInteractions(chart) {
             const canvas = chart.canvas;
-            const originalTitle = canvas.getAttribute('title');
             let gesture = null;
 
             canvas.classList.add('range-interactive-chart');
-            canvas.setAttribute(
-                'title',
-                'Drag horizontally to zoom X and fit Y; drag a box to zoom X and Y; Shift+drag to pan both axes; double-click to reset'
-            );
 
             const finishGesture = event => {
                 if (!gesture) return;
@@ -704,11 +738,6 @@ export function getChartScript(): string {
                 canvas.removeEventListener('dblclick', onDoubleClick);
                 canvas.classList.remove('range-interactive-chart');
                 canvas.style.cursor = '';
-                if (originalTitle === null) {
-                    canvas.removeAttribute('title');
-                } else {
-                    canvas.setAttribute('title', originalTitle);
-                }
             };
         }
 
@@ -850,7 +879,10 @@ export function getChartScript(): string {
                 data: {
                     datasets
                 },
-                plugins: options.enableZoom ? [rangeSelectionPlugin] : [],
+                plugins: [
+                    ...(options.enableZoom ? [rangeSelectionPlugin] : []),
+                    tooltipRunHighlightPlugin
+                ],
                 options: {
                     parsing: {
                         xAxisKey: 'x',
@@ -973,7 +1005,9 @@ export function getChartScript(): string {
                             }
                         },
                         tooltip: {
-                            position: 'cursor',
+                            itemSort: function(first, second) {
+                                return Number(second.parsed.y) - Number(first.parsed.y);
+                            },
                             filter: function(context) {
                                 return !context.dataset._isRaw;
                             },
