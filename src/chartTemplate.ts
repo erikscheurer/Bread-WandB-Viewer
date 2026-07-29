@@ -421,6 +421,136 @@ export function getChartScript(): string {
             };
         }
 
+        function readPersistedViewState() {
+            try {
+                return vscode.getState() || {};
+            } catch {
+                return {};
+            }
+        }
+
+        function updatePersistedViewState(changes) {
+            try {
+                vscode.setState({
+                    ...readPersistedViewState(),
+                    ...changes
+                });
+            } catch {
+                // Some standalone previews do not provide the VS Code webview API.
+            }
+        }
+
+        function getChartViewStateKey(chart) {
+            const canvas = chart && chart.canvas;
+            if (!canvas || canvas.id === 'modalChart') return null;
+
+            const chartType = canvas.dataset.chartType;
+            const metricName = canvas.dataset.metricName;
+            return chartType && metricName
+                ? chartType + ':' + metricName
+                : canvas.id;
+        }
+
+        function getRunVisibility(chart) {
+            const visibility = {};
+            if (!chart || !chart.data || !chart.data.datasets) {
+                return visibility;
+            }
+
+            chart.data.datasets.forEach((dataset, datasetIndex) => {
+                const runKey = getDatasetRunKey(dataset);
+                if (runKey && dataset._isOriginal) {
+                    visibility[runKey] = chart.isDatasetVisible(datasetIndex);
+                }
+            });
+            return visibility;
+        }
+
+        function applyRunVisibility(chart, visibility) {
+            if (!chart || !visibility) return;
+
+            chart.data.datasets.forEach((dataset, datasetIndex) => {
+                const runKey = getDatasetRunKey(dataset);
+                if (
+                    runKey &&
+                    Object.prototype.hasOwnProperty.call(visibility, runKey)
+                ) {
+                    chart.setDatasetVisibility(datasetIndex, visibility[runKey]);
+                }
+            });
+        }
+
+        function copyRunVisibility(sourceChart, targetChart, update = true) {
+            if (!sourceChart || !targetChart) return;
+
+            applyRunVisibility(targetChart, getRunVisibility(sourceChart));
+            if (update) {
+                targetChart.update('none');
+            }
+        }
+
+        function captureChartViewState(chart) {
+            const key = getChartViewStateKey(chart);
+            if (!key || !chart.scales || !chart.scales.x || !chart.scales.y) {
+                return;
+            }
+
+            const state = readPersistedViewState();
+            const chartStates = {
+                ...(state.chartStates && typeof state.chartStates === 'object'
+                    ? state.chartStates
+                    : {})
+            };
+            chartStates[key] = {
+                xMin: chart.scales.x.min,
+                xMax: chart.scales.x.max,
+                yMin: chart.scales.y.min,
+                yMax: chart.scales.y.max,
+                runVisibility: getRunVisibility(chart),
+                isolatedRunKey: chart.$isolatedRunKey || null,
+                preIsolationVisibility: chart.$preIsolationVisibility || null
+            };
+            updatePersistedViewState({ chartStates });
+        }
+
+        function restoreChartViewState(chart) {
+            const key = getChartViewStateKey(chart);
+            const chartStates = readPersistedViewState().chartStates;
+            const saved = key && chartStates && chartStates[key];
+            if (!saved) return;
+
+            applyRunVisibility(chart, saved.runVisibility);
+            chart.$isolatedRunKey = saved.isolatedRunKey || null;
+            chart.$preIsolationVisibility =
+                saved.preIsolationVisibility &&
+                typeof saved.preIsolationVisibility === 'object'
+                    ? saved.preIsolationVisibility
+                    : null;
+
+            if (
+                Number.isFinite(saved.xMin) &&
+                Number.isFinite(saved.xMax) &&
+                saved.xMin < saved.xMax
+            ) {
+                chart.zoomScale(
+                    'x',
+                    { min: saved.xMin, max: saved.xMax },
+                    'none'
+                );
+            }
+            if (
+                Number.isFinite(saved.yMin) &&
+                Number.isFinite(saved.yMax) &&
+                saved.yMin < saved.yMax
+            ) {
+                chart.zoomScale(
+                    'y',
+                    { min: saved.yMin, max: saved.yMax },
+                    'none'
+                );
+            }
+        }
+
         function applyChartTheme(chart, update = false) {
             if (!chart || !chart.options) return;
 
@@ -511,8 +641,29 @@ export function getChartScript(): string {
             }
         };
 
+        function getTooltipSwatchStyle(context) {
+            const color = context.dataset.borderColor;
+            const isHovered = getDatasetRunKey(context.dataset) ===
+                context.chart.$hoveredRunKey;
+            return {
+                borderColor: color,
+                backgroundColor: isHovered
+                    ? color
+                    : withColorAlpha(color, 0.12),
+                borderWidth: isHovered ? 0 : 2
+            };
+        }
+
         const tooltipRunHighlightPlugin = {
             id: 'tooltipRunHighlight',
+            beforeTooltipDraw(_chart, args) {
+                const tooltip = args.tooltip;
+                if (!tooltip || tooltip.opacity === 0) return;
+
+                tooltip.labelColors = tooltip.dataPoints.map(context =>
+                    getTooltipSwatchStyle(context)
+                );
+            },
             afterTooltipDraw(chart, args) {
                 const tooltip = args.tooltip;
                 const hoveredRunKey = chart.$hoveredRunKey;
@@ -554,6 +705,11 @@ export function getChartScript(): string {
                     bodyFont.lineHeight
                 );
                 chart.ctx.restore();
+            },
+            afterDestroy(chart) {
+                if (chart.$hoverInteractionCleanup) {
+                    chart.$hoverInteractionCleanup();
+                }
             }
         };
 
@@ -620,6 +776,52 @@ export function getChartScript(): string {
             chart.zoomScale('y', { min: minY, max: maxY }, 'none');
         }
 
+        function zoomScaleAtPixel(chart, scaleId, pixel, rangeFactor) {
+            const scale = chart.scales[scaleId];
+            if (!scale) return;
+
+            const anchor = Number(scale.getValueForPixel(pixel));
+            const min = Number(scale.min);
+            const max = Number(scale.max);
+            if (
+                !Number.isFinite(anchor) ||
+                !Number.isFinite(min) ||
+                !Number.isFinite(max) ||
+                min >= max
+            ) {
+                return;
+            }
+
+            let nextMin;
+            let nextMax;
+            if (scale.type === 'logarithmic') {
+                if (anchor <= 0 || min <= 0 || max <= 0) return;
+
+                const logAnchor = Math.log(anchor);
+                nextMin = Math.exp(
+                    logAnchor - (logAnchor - Math.log(min)) * rangeFactor
+                );
+                nextMax = Math.exp(
+                    logAnchor + (Math.log(max) - logAnchor) * rangeFactor
+                );
+            } else {
+                nextMin = anchor - (anchor - min) * rangeFactor;
+                nextMax = anchor + (max - anchor) * rangeFactor;
+            }
+
+            if (
+                Number.isFinite(nextMin) &&
+                Number.isFinite(nextMax) &&
+                nextMin < nextMax
+            ) {
+                chart.zoomScale(
+                    scaleId,
+                    { min: nextMin, max: nextMax },
+                    'none'
+                );
+            }
+        }
+
         function installRangeInteractions(chart) {
             const canvas = chart.canvas;
             let gesture = null;
@@ -668,6 +870,7 @@ export function getChartScript(): string {
                 }
                 chart.$rangeSelection = null;
                 chart.draw();
+                captureChartViewState(chart);
 
                 if (canvas.hasPointerCapture(event.pointerId)) {
                     canvas.releasePointerCapture(event.pointerId);
@@ -721,6 +924,20 @@ export function getChartScript(): string {
 
             const onDoubleClick = event => {
                 chart.resetZoom('none');
+                captureChartViewState(chart);
+                event.preventDefault();
+            };
+
+            const onWheel = event => {
+                if (!event.ctrlKey) return;
+
+                const point = getChartPointerPosition(chart, event);
+                if (!isPointInChartArea(chart, point)) return;
+
+                const rangeFactor = event.deltaY < 0 ? 1 / 1.15 : 1.15;
+                zoomScaleAtPixel(chart, 'x', point.x, rangeFactor);
+                zoomScaleAtPixel(chart, 'y', point.y, rangeFactor);
+                captureChartViewState(chart);
                 event.preventDefault();
             };
 
@@ -729,6 +946,7 @@ export function getChartScript(): string {
             canvas.addEventListener('pointerup', finishGesture);
             canvas.addEventListener('pointercancel', finishGesture);
             canvas.addEventListener('dblclick', onDoubleClick);
+            canvas.addEventListener('wheel', onWheel, { passive: false });
 
             chart.$rangeInteractionCleanup = () => {
                 canvas.removeEventListener('pointerdown', onPointerDown);
@@ -736,6 +954,7 @@ export function getChartScript(): string {
                 canvas.removeEventListener('pointerup', finishGesture);
                 canvas.removeEventListener('pointercancel', finishGesture);
                 canvas.removeEventListener('dblclick', onDoubleClick);
+                canvas.removeEventListener('wheel', onWheel);
                 canvas.classList.remove('range-interactive-chart');
                 canvas.style.cursor = '';
             };
@@ -939,11 +1158,17 @@ export function getChartScript(): string {
                                     }
 
                                     if (chart.$isolatedRunKey === runKey) {
-                                        chart.data.datasets.forEach((_dataset, datasetIndex) => {
-                                            chart.setDatasetVisibility(datasetIndex, true);
-                                        });
+                                        applyRunVisibility(
+                                            chart,
+                                            chart.$preIsolationVisibility || {}
+                                        );
                                         chart.$isolatedRunKey = null;
+                                        chart.$preIsolationVisibility = null;
                                     } else {
+                                        if (!chart.$preIsolationVisibility) {
+                                            chart.$preIsolationVisibility =
+                                                getRunVisibility(chart);
+                                        }
                                         chart.data.datasets.forEach((dataset, datasetIndex) => {
                                             const datasetRunKey = dataset._runId || dataset._runName;
                                             chart.setDatasetVisibility(datasetIndex, datasetRunKey === runKey);
@@ -951,6 +1176,7 @@ export function getChartScript(): string {
                                         chart.$isolatedRunKey = runKey;
                                     }
                                     chart.update();
+                                    captureChartViewState(chart);
                                     return;
                                 }
 
@@ -965,8 +1191,10 @@ export function getChartScript(): string {
                                     });
                                     setRunVisibility(runKey, !runIsVisible);
                                     chart.$isolatedRunKey = null;
+                                    chart.$preIsolationVisibility = null;
                                     chart.$legendClickTimer = null;
                                     chart.update();
+                                    captureChartViewState(chart);
                                 }, 250);
                             },
                             labels: {
@@ -1013,16 +1241,7 @@ export function getChartScript(): string {
                             },
                             callbacks: {
                                 labelColor: function(context) {
-                                    const color = context.dataset.borderColor;
-                                    const isHovered = getDatasetRunKey(context.dataset) ===
-                                        context.chart.$hoveredRunKey;
-                                    return {
-                                        borderColor: color,
-                                        backgroundColor: isHovered
-                                            ? color
-                                            : withColorAlpha(color, 0.12),
-                                        borderWidth: isHovered ? 0 : 2
-                                    };
+                                    return getTooltipSwatchStyle(context);
                                 },
                                 label: function(context) {
                                     const label = context.dataset.label || '';
@@ -1052,7 +1271,9 @@ export function getChartScript(): string {
                     },
                     scales: {
                         x: {
-                            type: 'linear',
+                            type: options.isModal
+                                ? (modalLogX ? 'logarithmic' : 'linear')
+                                : (logX ? 'logarithmic' : 'linear'),
                             title: {
                                 display: true,
                                 text: 'Step',
@@ -1063,7 +1284,9 @@ export function getChartScript(): string {
                             ticks: { color: themeColors.muted, font: { size: options.isModal ? 12 : 11 } }
                         },
                         y: {
-                            type: 'linear',
+                            type: options.isModal
+                                ? (modalLogY ? 'logarithmic' : 'linear')
+                                : (logY ? 'logarithmic' : 'linear'),
                             title: {
                                 display: true,
                                 text: metricName,
@@ -1113,6 +1336,16 @@ export function getChartScript(): string {
                 installRangeInteractions(chart);
             }
 
+            const onChartMouseLeave = () => {
+                clearHoveredRun(chart);
+                chart.canvas.style.cursor = '';
+            };
+            chart.canvas.addEventListener('mouseleave', onChartMouseLeave);
+            chart.$hoverInteractionCleanup = () => {
+                chart.canvas.removeEventListener('mouseleave', onChartMouseLeave);
+            };
+
+            restoreChartViewState(chart);
             applyChartTheme(chart);
             return chart;
         }
@@ -1261,6 +1494,7 @@ export function getChartScript(): string {
             Object.values(chartInstances).forEach(chart => {
                 updateChartSmoothing(chart, value, showRaw);
             });
+            updatePersistedViewState({ smoothing: globalSmoothing });
         }
 
         function toggleShowRaw() {
@@ -1270,6 +1504,7 @@ export function getChartScript(): string {
             Object.values(chartInstances).forEach(chart => {
                 updateChartSmoothing(chart, globalSmoothing, showRaw);
             });
+            updatePersistedViewState({ showRaw });
         }
 
         function toggleLogAxis(axis) {
@@ -1284,6 +1519,7 @@ export function getChartScript(): string {
             Object.values(chartInstances).forEach(chart => {
                 updateChartAxes(chart, logX, logY);
             });
+            updatePersistedViewState({ logX, logY });
         }
 
         function filterMetrics() {
@@ -1310,6 +1546,69 @@ export function getChartScript(): string {
                 const visibleCharts = group.querySelectorAll(selector + ':not(.hidden)');
                 group.classList.toggle('hidden', visibleCharts.length === 0 && searchText);
             });
+            updatePersistedViewState({ metricFilter: searchText });
+        }
+
+        function restorePersistedChartControls() {
+            const state = readPersistedViewState();
+            const smoothingInput = document.getElementById('globalSmoothing');
+            const smoothingValue = Number(state.smoothing);
+            if (
+                smoothingInput &&
+                Number.isFinite(smoothingValue) &&
+                smoothingValue >= 0 &&
+                smoothingValue <= 0.99
+            ) {
+                globalSmoothing = smoothingValue;
+                smoothingInput.value = String(smoothingValue);
+                const smoothingLabel = document.getElementById('globalSmoothingValue');
+                if (smoothingLabel) {
+                    smoothingLabel.textContent = smoothingValue.toFixed(2);
+                }
+            }
+
+            showRaw = state.showRaw !== false;
+            logX = state.logX === true;
+            logY = state.logY === true;
+
+            const showRawButton = document.getElementById('showRawBtn');
+            if (showRawButton) {
+                showRawButton.classList.toggle('active', showRaw);
+            }
+            const showRawGroup = document.getElementById('showRawGroup');
+            if (showRawGroup) {
+                showRawGroup.style.display = globalSmoothing > 0 ? 'flex' : 'none';
+            }
+            const logXButton = document.getElementById('logXBtn');
+            const logYButton = document.getElementById('logYBtn');
+            if (logXButton) logXButton.classList.toggle('active', logX);
+            if (logYButton) logYButton.classList.toggle('active', logY);
+
+            Object.values(chartInstances).forEach(chart => {
+                updateChartSmoothing(chart, globalSmoothing, showRaw);
+                updateChartAxes(chart, logX, logY);
+            });
+
+            const searchInput = document.getElementById('searchInput');
+            if (searchInput && typeof state.metricFilter === 'string') {
+                searchInput.value = state.metricFilter;
+                filterMetrics();
+            }
+
+            if (typeof state.activeTab === 'string') {
+                const activeTab = document.querySelector(
+                    '.tab[data-tab="' + state.activeTab + '"]'
+                );
+                const activeContent = document.getElementById(state.activeTab);
+                if (activeTab && activeContent) {
+                    document.querySelectorAll('.tab')
+                        .forEach(tab => tab.classList.remove('active'));
+                    document.querySelectorAll('.tab-content')
+                        .forEach(content => content.classList.remove('active'));
+                    activeTab.classList.add('active');
+                    activeContent.classList.add('active');
+                }
+            }
         }
 
         function closeAllMenus() {
@@ -1697,8 +1996,24 @@ export function getChartScript(): string {
             document.getElementById('fullscreenModal').classList.remove('active');
             document.body.classList.remove('modal-open');
             if (modalChart) {
+                const shouldClearFullscreenState =
+                    modalChart.$persistFullscreenState === true;
+                if (modalChart.$sourceChart) {
+                    copyRunVisibility(modalChart, modalChart.$sourceChart, true);
+                    modalChart.$sourceChart.$isolatedRunKey =
+                        modalChart.$isolatedRunKey || null;
+                    modalChart.$sourceChart.$preIsolationVisibility =
+                        modalChart.$preIsolationVisibility || null;
+                    captureChartViewState(modalChart.$sourceChart);
+                }
                 modalChart.destroy();
                 modalChart = null;
+                if (shouldClearFullscreenState) {
+                    updatePersistedViewState({ fullscreenMetric: null });
+                }
+            }
+            if (typeof activeFullscreenMetric !== 'undefined') {
+                activeFullscreenMetric = null;
             }
         }
 
@@ -1717,8 +2032,11 @@ export function getChartScript(): string {
                 tab.classList.add('active');
                 const target = document.getElementById(targetId);
                 if (target) target.classList.add('active');
+                updatePersistedViewState({ activeTab: targetId });
             });
         });
+
+        queueMicrotask(restorePersistedChartControls);
     `;
 }
 
@@ -1795,7 +2113,7 @@ export function getModalHtml(leadingControlsHtml: string = ''): string {
                         <button class="toggle-btn" id="modalLogXBtn" onclick="toggleModalLogAxis('x')">Log X</button>
                         <button class="toggle-btn" id="modalLogYBtn" onclick="toggleModalLogAxis('y')">Log Y</button>
                     </div>
-                    <span class="zoom-hint">Horizontal drag: zoom X + fit Y • Box: zoom X/Y • Shift+drag: pan X/Y • Double-click: reset</span>
+                    <span class="zoom-hint">Horizontal drag: zoom X + fit Y • Box: zoom X/Y • Ctrl+scroll: zoom at cursor • Shift+drag: pan X/Y • Double-click: reset</span>
                     <button class="modal-close" onclick="closeFullscreen()">&times;</button>
                 </div>
             </div>

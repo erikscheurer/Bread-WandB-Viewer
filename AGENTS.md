@@ -21,7 +21,7 @@ from jsDelivr.
   construction, and host/webview message handling.
 - `src/chartTemplate.ts`: shared chart HTML, CSS, browser-side behavior, and dataset
   rebuilding for smoothing and capture flows.
-- `src/runColors.ts`: deterministic Matplotlib `tab20` run palette and run-ID color
+- `src/runColors.ts`: configurable run palettes and deterministic run-ID color
   assignment.
 - `src/aiContext/`: configuration comparison, metric summaries, and Markdown export.
 - `src/wandb.proto`: W&B record schema.
@@ -96,6 +96,15 @@ host.
 - For data-only refreshes, update existing webview charts through messages instead
   of replacing `webview.html`; rebuilding the document discards zoom, log-axis,
   smoothing, fullscreen, and other browser-side state.
+- Treat run-palette changes as style/data refreshes: update sidebar swatches,
+  comparison swatches, overview datasets, and fullscreen datasets through a
+  webview message without rebuilding the document.
+- Keep run-color assignment deterministic and collision-aware. Probe from each
+  run's stable palette index and do not reuse a color while an unused entry remains.
+- When a full webview rebuild is required for structural changes, preserve the
+  existing `vscode.getState()` keys for active tabs, controls, sidebar geometry,
+  per-metric zoom ranges, and run visibility. Per-chart state is keyed by chart
+  type and metric name rather than transient dataset indices.
 - Preserve VS Code disposal lifecycles. Register commands, watchers, panels, and
   listeners in the relevant `context.subscriptions` or `_disposables` collection.
 - Avoid blocking the extension host during scans and large-file processing. Retain
@@ -124,6 +133,9 @@ host.
   run identity across derived datasets, keep their visibility synchronized, expose
   one legend and tooltip concept per run, and keep equivalent overview/fullscreen
   controls behaviorally aligned.
+- Preserve run visibility when moving between overview and fullscreen charts.
+  Legend double-click isolation must restore the visibility snapshot from before
+  isolation, including runs that were already hidden.
 - Preserve the current multi-run chart interaction invariants:
   - Run datasets render as unfilled curves (`fill: false`).
   - Plot hover emphasizes the nearest run in the legend and tooltip without
@@ -148,6 +160,9 @@ host.
 1. Make the smallest coherent source change; do not edit generated `out/` files.
 2. Update `package.json`, commands, activation events, and README documentation
    together when user-facing behavior changes.
+   Keep the declared values for `wandbViewer.defaultRunSort` and
+   `wandbViewer.runColorPalette` aligned with the validation in the multi-run
+   viewer.
 3. Run `npm run compile`.
 4. For AI-context changes, also run `node test-ai-context.js` and add focused cases
    there when practical.

@@ -1,6 +1,11 @@
 import { RunScanResult } from './MultiRunScanner';
 import { WandbRunData, WandbMetrics, parseWandbFile, MetricPoint } from './wandbParser';
-import { getStableRunColor } from './runColors';
+import {
+    DEFAULT_RUN_COLOR_PALETTE,
+    getStableRunColorIndex,
+    RUN_COLOR_PALETTES,
+    RunColorPaletteName
+} from './runColors';
 
 export interface MergedMetric {
     metricName: string;
@@ -25,8 +30,13 @@ const MAX_CACHE_SIZE = 20;
 export class MultiRunManager {
     private state: MultiRunState;
     private cacheAccessOrder: string[] = []; // For LRU eviction
+    private colorPalette: RunColorPaletteName;
 
-    constructor(folderPath: string) {
+    constructor(
+        folderPath: string,
+        colorPalette: RunColorPaletteName = DEFAULT_RUN_COLOR_PALETTE
+    ) {
+        this.colorPalette = colorPalette;
         this.state = {
             runs: new Map(),
             parsedData: new Map(),
@@ -47,10 +57,12 @@ export class MultiRunManager {
             this.state.selectedRunIds.add(runResult.runId);
         }
 
-        this.state.colorMap.set(
-            runResult.runId,
-            getStableRunColor(runResult.runId)
-        );
+        if (!this.state.colorMap.has(runResult.runId)) {
+            this.state.colorMap.set(
+                runResult.runId,
+                this.assignRunColor(runResult.runId)
+            );
+        }
     }
 
     /**
@@ -124,6 +136,47 @@ export class MultiRunManager {
      */
     getRunColor(runId: string): string {
         return this.state.colorMap.get(runId) || '#888888';
+    }
+
+    /**
+     * Reassign every run color when the configured palette changes.
+     */
+    setColorPalette(colorPalette: RunColorPaletteName): void {
+        if (this.colorPalette === colorPalette) {
+            return;
+        }
+
+        this.colorPalette = colorPalette;
+        this.rebuildRunColors();
+    }
+
+    /**
+     * Start at the run's stable hash position and probe for an unused palette
+     * entry. A color is only reused once every color in the palette is occupied.
+     */
+    private assignRunColor(runId: string): string {
+        const palette = RUN_COLOR_PALETTES[this.colorPalette];
+        const usedColors = new Set(this.state.colorMap.values());
+        const startIndex = getStableRunColorIndex(runId, this.colorPalette);
+
+        for (let offset = 0; offset < palette.length; offset++) {
+            const color = palette[(startIndex + offset) % palette.length];
+            if (!usedColors.has(color)) {
+                return color;
+            }
+        }
+
+        return palette[startIndex];
+    }
+
+    private rebuildRunColors(): void {
+        this.state.colorMap.clear();
+        const runIds = Array.from(this.state.runs.keys())
+            .sort((left, right) => left.localeCompare(right));
+
+        for (const runId of runIds) {
+            this.state.colorMap.set(runId, this.assignRunColor(runId));
+        }
     }
 
     /**

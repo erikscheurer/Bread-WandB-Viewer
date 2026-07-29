@@ -28,14 +28,16 @@ version adds:
   periodically or on demand, and displayed runs can be reloaded without rebuilding
   the webview.
 - **State-preserving chart updates** — refreshes retain zoom, smoothing, log axes,
-  run visibility, and fullscreen state. Raw and smoothed traces behave as one run.
+  run visibility, active tabs, filters, sidebar size, and fullscreen state. Raw
+  and smoothed traces behave as one run.
 - **Improved chart interaction** — X-range and box zoom, two-axis panning,
-  resizable chart rows, legend double-click isolation, linked run highlighting,
-  and clearer cursor-sorted tooltips.
+  Ctrl+scroll cursor zoom, resizable chart rows, visibility-preserving legend
+  isolation, linked run highlighting, and clearer cursor-sorted tooltips.
 - **Better run comparison** — side-by-side configuration comparison with search,
-  plus run filtering and sorting by name, creation time, or latest update.
-- **Stable, theme-aware visuals** — deterministic `tab20` run colors, improved
-  light-theme contrast, and unfilled run curves.
+  independent run-row and parameter-column sorting, plus run filtering and sorting
+  by name, creation time, or latest update.
+- **Stable, theme-aware visuals** — deterministic configurable run palettes,
+  improved light-theme contrast, and unfilled run curves.
 
 ## Multi-Run Comparison in Action
 
@@ -124,6 +126,7 @@ Advanced chart controls for detailed metric analysis.
 
 - **Smoothing:** Adjustable EMA smoothing with real-time preview
 - **Zoom:** Drag horizontally to select X and fit Y to visible data, or drag a box to zoom both axes
+- **Cursor Zoom:** Hold Ctrl and scroll to zoom both axes around the pointer
 - **Pan:** Shift+drag in any direction to pan the X and Y axes
 - **Fullscreen:** Click expand icon on any chart
 - **Log Scales:** Toggle X and Y axis logarithmic scales
@@ -138,6 +141,8 @@ therefore keep updating without waiting for training to stop.
 
 - Existing charts update in place, preserving zoom, log axes, smoothing, and
   fullscreen state
+- Structural refreshes preserve the active metrics/configuration tab, metric and
+  run filters, run ordering, sidebar tab and width, per-chart zoom, and hidden runs
 - Live parsing and chart updates pause while the viewer is hidden to save CPU and
   resume with a catch-up scan when it becomes visible again
 - A modification-time check catches file updates missed by the filesystem watcher
@@ -149,6 +154,7 @@ therefore keep updating without waiting for training to stop.
 View comprehensive run information beyond just training metrics.
 
 **Run Metadata:**
+- Run creation time
 - GPU type and count
 - Python version
 - CPU count and CUDA version
@@ -189,6 +195,16 @@ On Windows PowerShell:
 
 ```powershell
 $vsix = "$env:TEMP\wandb-viewer.vsix"; Invoke-WebRequest "https://github.com/erikscheurer/Bread-WandB-Viewer/releases/latest/download/wandb-viewer.vsix" -OutFile $vsix; code --install-extension $vsix --force
+```
+
+Alternatively, if you want to install this extension on a server, install the latest release with:
+
+```bash
+CODE_SERVER="$(find "$HOME/.vscode-server/bin" -path '*/bin/code-server' -type f | head -n 1)" \
+  && test -n "$CODE_SERVER" \
+  && curl -fL https://github.com/erikscheurer/Bread-WandB-Viewer/releases/latest/download/wandb-viewer.vsix \
+    -o /tmp/wandb-viewer-$USER.vsix \
+  && "$CODE_SERVER" --install-extension /tmp/wandb-viewer-$USER.vsix --force
 ```
 
 Then run `Developer: Reload Window` in VS Code. VS Code does not automatically
@@ -232,8 +248,23 @@ or [upstream releases](https://github.com/Bread-Technologies/Bread-WandB-Viewer/
 |--------|----------|
 | Zoom X range and fit Y | Drag horizontally across chart |
 | Zoom X and Y range | Drag a box across chart |
+| Zoom around cursor | Ctrl + scroll |
 | Pan X and Y | Shift + drag |
 | Reset zoom | Double-click chart |
+
+### Settings
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `wandbViewer.defaultRunSort` | `created-desc` | Initial multi-run ordering; supports creation time, name, and latest-update order |
+| `wandbViewer.runColorPalette` | `tableau10` | Stable run colors from Tableau, Okabe–Ito, Observable, ColorBrewer, Paul Tol, Matplotlib, Plotly (24/26), or background-aware Glasbey (64) palettes; colors are not reused before the palette is exhausted |
+
+The additional categorical palettes follow the published
+[D3/ColorBrewer schemes](https://d3js.org/d3-scale-chromatic/categorical) and
+[Paul Tol qualitative line palettes](https://tol-colors.readthedocs.io/en/latest/colorsets.html).
+The longer choices use
+[Plotly qualitative sequences](https://plotly.com/python/discrete-color/) and
+[Colorcet Glasbey palettes](https://colorcet.holoviz.org/user_guide/Categorical.html).
 
 ---
 

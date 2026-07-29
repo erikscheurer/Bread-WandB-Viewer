@@ -2,7 +2,7 @@
   "name": "wandb-viewer",
   "displayName": "Bread Wandb Viewer",
   "description": "View Weights & Biases run metrics and logs directly in VS Code",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "publisher": "bread-tech",
   "icon": "media/icon.png",
   "repository": {
@@ -39,7 +39,7 @@
     "data visualization",
     "data science",
     "machine learning",
-    "ml", 
+    "ml",
     "deep learning",
     "pytorch",
     "tensorflow",
@@ -86,6 +86,67 @@
           "group": "navigation"
         }
       ]
+    },
+    "configuration": {
+      "title": "Bread Wandb Viewer",
+      "properties": {
+        "wandbViewer.defaultRunSort": {
+          "type": "string",
+          "default": "created-desc",
+          "enum": [
+            "created-desc",
+            "created-asc",
+            "name-asc",
+            "name-desc",
+            "updated-desc",
+            "updated-asc"
+          ],
+          "enumDescriptions": [
+            "Creation time, newest first",
+            "Creation time, oldest first",
+            "Run name, A–Z",
+            "Run name, Z–A",
+            "Latest update, newest first",
+            "Latest update, oldest first"
+          ],
+          "description": "Default ordering of runs in a newly opened multi-run viewer. A sort selected in the viewer is remembered for that viewer."
+        },
+        "wandbViewer.runColorPalette": {
+          "type": "string",
+          "default": "tableau10",
+          "enum": [
+            "tableau10",
+            "okabeIto",
+            "observable10",
+            "colorBrewerDark2",
+            "colorBrewerSet1",
+            "colorBrewerPaired",
+            "tolBright",
+            "tolVibrant",
+            "tab20",
+            "plotlyDark24",
+            "plotlyAlphabet26",
+            "glasbeyLightBackground64",
+            "glasbeyDarkBackground64"
+          ],
+          "enumDescriptions": [
+            "Balanced Tableau 10 colors",
+            "Color-vision-deficiency-friendly Okabe–Ito colors",
+            "Observable 10 categorical colors",
+            "ColorBrewer Dark2 qualitative colors",
+            "ColorBrewer Set1 qualitative colors",
+            "ColorBrewer Paired qualitative colors",
+            "Paul Tol Bright color-blind-safe line colors",
+            "Paul Tol Vibrant color-blind-safe line colors",
+            "Matplotlib tab20 colors",
+            "Plotly Dark24 colors (24)",
+            "Plotly Alphabet colors (26)",
+            "Glasbey colors optimized for light chart backgrounds (64)",
+            "Glasbey colors optimized for dark chart backgrounds (64)"
+          ],
+          "description": "Color palette used to assign stable colors to runs in multi-run charts. Colors are not reused until the selected palette is exhausted."
+        }
+      }
     }
   },
   "scripts": {

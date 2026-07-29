@@ -6,6 +6,29 @@ import { scanFolderForRuns, watchFolder, FileChangeEvent, RunScanResult } from '
 import { getChartStyles, getChartScript, getModalHtml, getControlsBarHtml } from './chartTemplate';
 import { generateAIContext, calculateTokenEstimate } from './aiContext/ContextGenerator';
 import { compareConfigs } from './aiContext/ConfigDiffer';
+import {
+    DEFAULT_RUN_COLOR_PALETTE,
+    isRunColorPaletteName,
+    RunColorPaletteName
+} from './runColors';
+
+const RUN_SORT_MODES = [
+    'created-desc',
+    'created-asc',
+    'name-asc',
+    'name-desc',
+    'updated-desc',
+    'updated-asc'
+] as const;
+
+type RunSortMode = typeof RUN_SORT_MODES[number];
+
+const DEFAULT_RUN_SORT: RunSortMode = 'created-desc';
+
+function isRunSortMode(value: unknown): value is RunSortMode {
+    return typeof value === 'string' &&
+        (RUN_SORT_MODES as readonly string[]).includes(value);
+}
 
 export class MultiRunViewerPanel {
     public static currentPanel: MultiRunViewerPanel | undefined;
@@ -19,6 +42,8 @@ export class MultiRunViewerPanel {
     private _processingFileChanges = false;
     private _needsVisibleCatchUp = false;
     private _disposed = false;
+    private _defaultRunSort: RunSortMode;
+    private _colorPalette: RunColorPaletteName;
 
     public static createOrShow(extensionUri: vscode.Uri, folderPath: string) {
         if (MultiRunViewerPanel.currentPanel) {
@@ -43,7 +68,16 @@ export class MultiRunViewerPanel {
         this._panel = panel;
         this._extensionUri = extensionUri;
         this._folderPath = folderPath;
-        this._manager = new MultiRunManager(folderPath);
+        const configuration = vscode.workspace.getConfiguration('wandbViewer');
+        const configuredRunSort = configuration.get<string>('defaultRunSort');
+        const configuredColorPalette = configuration.get<string>('runColorPalette');
+        this._defaultRunSort = isRunSortMode(configuredRunSort)
+            ? configuredRunSort
+            : DEFAULT_RUN_SORT;
+        this._colorPalette = isRunColorPaletteName(configuredColorPalette)
+            ? configuredColorPalette
+            : DEFAULT_RUN_COLOR_PALETTE;
+        this._manager = new MultiRunManager(folderPath, this._colorPalette);
 
         // Show loading screen immediately
         this._panel.webview.html = this._getLoadingHtml();
@@ -54,6 +88,31 @@ export class MultiRunViewerPanel {
         }, 50); // 50ms delay allows the loading screen to paint
         
         this._panel.onDidDispose(() => this.dispose(), null, this._disposables);
+
+        vscode.workspace.onDidChangeConfiguration(event => {
+            if (event.affectsConfiguration('wandbViewer.defaultRunSort')) {
+                const value = vscode.workspace
+                    .getConfiguration('wandbViewer')
+                    .get<string>('defaultRunSort');
+                this._defaultRunSort = isRunSortMode(value)
+                    ? value
+                    : DEFAULT_RUN_SORT;
+            }
+
+            if (event.affectsConfiguration('wandbViewer.runColorPalette')) {
+                const value = vscode.workspace
+                    .getConfiguration('wandbViewer')
+                    .get<string>('runColorPalette');
+                const nextPalette = isRunColorPaletteName(value)
+                    ? value
+                    : DEFAULT_RUN_COLOR_PALETTE;
+                if (nextPalette !== this._colorPalette) {
+                    this._colorPalette = nextPalette;
+                    this._manager.setColorPalette(nextPalette);
+                    void this._updateRunColorsInWebview();
+                }
+            }
+        }, null, this._disposables);
 
         this._panel.webview.onDidReceiveMessage(
             async message => {
@@ -252,6 +311,20 @@ export class MultiRunViewerPanel {
         });
     }
 
+    private async _updateRunColorsInWebview(): Promise<void> {
+        const runColors = Object.fromEntries(
+            this._manager.getRuns().map(run => [
+                run.runId,
+                this._manager.getRunColor(run.runId)
+            ])
+        );
+        await this._panel.webview.postMessage({
+            command: 'runColorsUpdated',
+            runColors,
+            mergedMetrics: this._manager.mergeMetrics()
+        });
+    }
+
     private async _rediscoverRuns(): Promise<number> {
         const knownRunIds = new Set(this._manager.getRuns().map(run => run.runId));
         await this._update(true);
@@ -276,7 +349,10 @@ export class MultiRunViewerPanel {
             const currentRuns = new Set(this._manager.getRuns().map(run => run.runId));
             const discoveredRunIds = new Set(discoveredRuns.map(run => run.runId));
 
-            for (const run of discoveredRuns) {
+            const orderedDiscoveredRuns = [...discoveredRuns]
+                .sort((left, right) => left.runId.localeCompare(right.runId));
+
+            for (const run of orderedDiscoveredRuns) {
                 if (currentRuns.has(run.runId)) {
                     this._manager.updateRun(run);
                 } else {
@@ -349,7 +425,7 @@ export class MultiRunViewerPanel {
                     data-created-at="${run.createdAt}"
                     data-updated-at="${run.lastModified}"
                 >
-                    <input type="checkbox" ${isSelected ? 'checked' : ''} onchange="toggleRun('${run.runId}')">
+                    <input type="checkbox" ${isSelected ? 'checked' : ''} onchange="toggleRun(this.closest('.run-item').dataset.runId)">
                     <div class="run-color" style="background: ${color}"></div>
                     <div class="run-info">
                         <div class="run-name">${this._escapeHtml(run.runName)}</div>
@@ -366,22 +442,27 @@ export class MultiRunViewerPanel {
             const configEntries = Object.entries(config);
 
             return `
-                <div class="metadata-section">
-                    <div class="metadata-header" onclick="toggleMetadata('${run.runId}')">
+                <div class="metadata-section" data-run-id="${this._escapeHtml(run.runId)}">
+                    <div class="metadata-header" onclick="toggleMetadata(this)">
                         <span class="metadata-run-name">${this._escapeHtml(run.runName)}</span>
                         <span class="metadata-toggle">▼</span>
                     </div>
                     <div class="metadata-content">
-                        ${configEntries.length > 0 ? `
-                            <div class="config-grid">
-                                ${configEntries.map(([key, value]) => `
-                                    <div class="config-item">
-                                        <span class="config-key">${this._escapeHtml(key)}:</span>
-                                        <span class="config-value">${this._formatConfigValue(value)}</span>
-                                    </div>
-                                `).join('')}
+                        <div class="config-grid">
+                            <div class="config-item">
+                                <span class="config-key">Created:</span>
+                                <span class="config-value">${this._escapeHtml(this._formatTimestamp(run.createdAt))}</span>
                             </div>
-                        ` : '<div class="no-config">No configuration data</div>'}
+                            ${configEntries.map(([key, value]) => `
+                                <div class="config-item">
+                                    <span class="config-key">${this._escapeHtml(key)}:</span>
+                                    <span class="config-value">${this._formatConfigValue(value)}</span>
+                                </div>
+                            `).join('')}
+                        </div>
+                        ${configEntries.length === 0 ? `
+                            <div class="no-config">No configuration data</div>
+                        ` : ''}
                     </div>
                 </div>
             `;
@@ -426,12 +507,7 @@ export class MultiRunViewerPanel {
                 <div class="run-list-tools">
                     <input type="search" id="runFilterInput" placeholder="Filter runs…" aria-label="Filter runs by name, ID, or project">
                     <select id="runSortSelect" aria-label="Sort runs">
-                        <option value="name-asc">Name A–Z</option>
-                        <option value="name-desc">Name Z–A</option>
-                        <option value="created-desc">Created newest</option>
-                        <option value="created-asc">Created oldest</option>
-                        <option value="updated-desc">Updated newest</option>
-                        <option value="updated-asc">Updated oldest</option>
+                        ${this._getRunSortOptionsHtml()}
                     </select>
                 </div>
                 <div id="runList">${runListHtml}</div>
@@ -527,7 +603,12 @@ export class MultiRunViewerPanel {
             `).join('');
 
             return `
-            <tr>
+            <tr
+                data-run-id="${this._escapeHtml(run.runId)}"
+                data-run-name="${this._escapeHtml(run.runName)}"
+                data-created-at="${run.createdAt}"
+                data-updated-at="${run.lastModified}"
+            >
                 <th scope="row" class="config-run-column">
                     <span class="config-compare-run-heading">
                         <span class="config-compare-run-color" style="background: ${runColor}"></span>
@@ -555,14 +636,27 @@ export class MultiRunViewerPanel {
                         </div>
                     </div>
                     ${parameterHeaders
-                        ? '<input type="search" id="configFilterInput" class="config-filter-input" placeholder="Filter parameters…" aria-label="Filter configuration parameters">'
+                        ? `
+                            <div class="config-compare-tools">
+                                <input type="search" id="configFilterInput" class="config-filter-input" placeholder="Filter parameters…" aria-label="Filter configuration parameters">
+                                <select id="configRunSortSelect" class="config-sort-select" aria-label="Sort configuration comparison runs">
+                                    ${this._getRunSortOptionsHtml('Runs: ')}
+                                </select>
+                                <select id="configColumnSortSelect" class="config-sort-select" aria-label="Sort configuration parameters">
+                                    <option value="differences-first">Columns: differences first</option>
+                                    <option value="common-first">Columns: common first</option>
+                                    <option value="key-asc">Columns: parameter A–Z</option>
+                                    <option value="key-desc">Columns: parameter Z–A</option>
+                                </select>
+                            </div>
+                        `
                         : ''}
                 </div>
                 ${parameterHeaders ? `
                     <div class="config-compare-table-wrapper" id="configCompareTableWrapper">
                         <table class="config-compare-table" id="configCompareTable">
                             <thead>
-                                <tr class="config-parameter-groups">
+                                <tr class="config-parameter-groups" id="configParameterGroupRow">
                                     <th scope="col" rowspan="2" class="config-run-column">Run</th>
                                     ${differenceKeys.length > 0
                                         ? `<th scope="colgroup" colspan="${differenceKeys.length}" class="config-different-group" id="configDifferentGroup">Differing parameters</th>`
@@ -570,8 +664,9 @@ export class MultiRunViewerPanel {
                                     ${commonKeys.length > 0
                                         ? `<th scope="colgroup" colspan="${commonKeys.length}" class="config-common-group config-common-start" id="configCommonGroup">Common parameters</th>`
                                         : ''}
+                                    <th scope="colgroup" colspan="${differenceKeys.length + commonKeys.length}" id="configAllGroup" hidden>Parameters</th>
                                 </tr>
-                                <tr>${parameterHeaders}</tr>
+                                <tr id="configParameterHeaderRow">${parameterHeaders}</tr>
                             </thead>
                             <tbody>${runRows}</tbody>
                         </table>
@@ -711,6 +806,28 @@ export class MultiRunViewerPanel {
             const resizeHandle = document.getElementById('resizeHandle');
             const sidebar = document.getElementById('sidebar');
             const collapseBtn = document.getElementById('collapseBtn');
+            const expandBtn = document.getElementById('expandBtn');
+
+            const savedSidebarWidth = Number(persistedViewState.sidebarWidth);
+            if (
+                Number.isFinite(savedSidebarWidth) &&
+                savedSidebarWidth >= 200 &&
+                savedSidebarWidth <= 600
+            ) {
+                sidebar.style.flex = '0 0 ' + savedSidebarWidth + 'px';
+            }
+
+            function setSidebarCollapsed(isCollapsed, shouldPersist = true) {
+                sidebar.classList.toggle('collapsed', isCollapsed);
+                collapseBtn.style.display = isCollapsed ? 'none' : 'block';
+                expandBtn.style.display = isCollapsed ? 'block' : 'none';
+                if (!isCollapsed) {
+                    updateCollapseButtonPosition();
+                }
+                if (shouldPersist) {
+                    updatePersistedViewState({ sidebarCollapsed: isCollapsed });
+                }
+            }
 
             function updateCollapseButtonPosition() {
                 const sidebarWidth = sidebar.getBoundingClientRect().width;
@@ -739,10 +856,16 @@ export class MultiRunViewerPanel {
                     isResizing = false;
                     document.body.style.cursor = '';
                     document.body.style.userSelect = '';
+                    const width = Math.round(sidebar.getBoundingClientRect().width);
+                    updatePersistedViewState({ sidebarWidth: width });
                 }
             });
 
             // Initialize button position
+            setSidebarCollapsed(
+                persistedViewState.sidebarCollapsed === true,
+                false
+            );
             updateCollapseButtonPosition();
 
             // Run filtering and sorting
@@ -839,19 +962,113 @@ export class MultiRunViewerPanel {
 
             // Configuration-column filtering
             const configFilterInput = document.getElementById('configFilterInput');
+            const configRunSortSelect = document.getElementById('configRunSortSelect');
+            const configColumnSortSelect = document.getElementById('configColumnSortSelect');
             const configCompareTable = document.getElementById('configCompareTable');
             const configCompareTableWrapper = document.getElementById('configCompareTableWrapper');
             const configFilterEmpty = document.getElementById('configFilterEmpty');
             const configDifferentGroup = document.getElementById('configDifferentGroup');
             const configCommonGroup = document.getElementById('configCommonGroup');
+            const configAllGroup = document.getElementById('configAllGroup');
+            const configParameterGroupRow = document.getElementById('configParameterGroupRow');
+            const configParameterHeaderRow = document.getElementById('configParameterHeaderRow');
 
-            function applyConfigFilter(shouldPersist = true) {
-                if (!configFilterInput || !configCompareTable) return;
+            function applyConfigColumnView(shouldPersist = true) {
+                if (
+                    !configFilterInput ||
+                    !configRunSortSelect ||
+                    !configColumnSortSelect ||
+                    !configCompareTable ||
+                    !configParameterHeaderRow
+                ) {
+                    return;
+                }
 
                 const filterText = configFilterInput.value.trim().toLocaleLowerCase();
                 const headers = Array.from(
                     configCompareTable.querySelectorAll('th[data-config-key]')
                 );
+                const columnSortMode = configColumnSortSelect.value;
+                const compareKeys = (first, second) =>
+                    (first.dataset.configKey || '').localeCompare(
+                        second.dataset.configKey || '',
+                        undefined,
+                        { numeric: true, sensitivity: 'base' }
+                    );
+                const groupRank = header => {
+                    const isCommon = header.dataset.configGroup === 'common';
+                    if (columnSortMode === 'common-first') {
+                        return isCommon ? 0 : 1;
+                    }
+                    return isCommon ? 1 : 0;
+                };
+
+                headers.sort((first, second) => {
+                    if (columnSortMode === 'key-desc') {
+                        return compareKeys(second, first);
+                    }
+                    if (columnSortMode === 'key-asc') {
+                        return compareKeys(first, second);
+                    }
+                    return groupRank(first) - groupRank(second) ||
+                        compareKeys(first, second);
+                });
+
+                headers.forEach(header => {
+                    configParameterHeaderRow.appendChild(header);
+                });
+                configCompareTable.querySelectorAll('tbody tr').forEach(row => {
+                    headers.forEach(header => {
+                        const cell = row.querySelector(
+                            '[data-config-column-index="' +
+                            header.dataset.configColumnIndex +
+                            '"]'
+                        );
+                        if (cell) {
+                            row.appendChild(cell);
+                        }
+                    });
+                });
+
+                const configRunRows = Array.from(
+                    configCompareTable.querySelectorAll('tbody tr[data-run-id]')
+                );
+                const compareRunText = (first, second, field) =>
+                    (first.dataset[field] || '').localeCompare(
+                        second.dataset[field] || '',
+                        undefined,
+                        { numeric: true, sensitivity: 'base' }
+                    );
+                const compareRunTimestamp = (first, second, field) => {
+                    const firstValue = Number(first.dataset[field]);
+                    const secondValue = Number(second.dataset[field]);
+                    return (Number.isFinite(firstValue) ? firstValue : 0) -
+                        (Number.isFinite(secondValue) ? secondValue : 0);
+                };
+                const runSortMode = configRunSortSelect.value;
+                configRunRows.sort((first, second) => {
+                    let result = 0;
+                    if (runSortMode === 'name-desc') {
+                        result = compareRunText(second, first, 'runName');
+                    } else if (runSortMode === 'name-asc') {
+                        result = compareRunText(first, second, 'runName');
+                    } else if (runSortMode === 'created-asc') {
+                        result = compareRunTimestamp(first, second, 'createdAt');
+                    } else if (runSortMode === 'updated-desc') {
+                        result = compareRunTimestamp(second, first, 'updatedAt');
+                    } else if (runSortMode === 'updated-asc') {
+                        result = compareRunTimestamp(first, second, 'updatedAt');
+                    } else {
+                        result = compareRunTimestamp(second, first, 'createdAt');
+                    }
+
+                    return result || compareRunText(first, second, 'runId');
+                });
+                const configTableBody = configCompareTable.querySelector('tbody');
+                if (configTableBody) {
+                    configRunRows.forEach(row => configTableBody.appendChild(row));
+                }
+
                 let visibleDifferent = 0;
                 let visibleCommon = 0;
 
@@ -883,12 +1100,46 @@ export class MultiRunViewerPanel {
                     configCommonGroup.hidden = visibleCommon === 0;
                 }
 
+                const groupedSort = columnSortMode === 'differences-first' ||
+                    columnSortMode === 'common-first';
+                if (configAllGroup) {
+                    configAllGroup.colSpan = Math.max(
+                        visibleDifferent + visibleCommon,
+                        1
+                    );
+                    configAllGroup.hidden = groupedSort ||
+                        visibleDifferent + visibleCommon === 0;
+                }
+                if (configParameterGroupRow) {
+                    if (groupedSort) {
+                        const groupElements = columnSortMode === 'common-first'
+                            ? [configCommonGroup, configDifferentGroup]
+                            : [configDifferentGroup, configCommonGroup];
+                        groupElements.forEach(group => {
+                            if (group) {
+                                configParameterGroupRow.appendChild(group);
+                            }
+                        });
+                        if (configAllGroup) {
+                            configParameterGroupRow.appendChild(configAllGroup);
+                        }
+                    } else {
+                        if (configDifferentGroup) configDifferentGroup.hidden = true;
+                        if (configCommonGroup) configCommonGroup.hidden = true;
+                        if (configAllGroup) {
+                            configParameterGroupRow.appendChild(configAllGroup);
+                        }
+                    }
+                }
+
                 configCompareTable
                     .querySelectorAll('[data-config-group="common"]')
                     .forEach(cell => cell.classList.remove('config-common-start'));
-                const firstVisibleCommon = headers.find(header =>
-                    !header.hidden && header.dataset.configGroup === 'common'
-                );
+                const firstVisibleCommon = groupedSort
+                    ? headers.find(header =>
+                        !header.hidden && header.dataset.configGroup === 'common'
+                    )
+                    : null;
                 if (firstVisibleCommon) {
                     const columnIndex = firstVisibleCommon.dataset.configColumnIndex;
                     configCompareTable
@@ -905,7 +1156,9 @@ export class MultiRunViewerPanel {
                 }
                 if (shouldPersist) {
                     updatePersistedViewState({
-                        configFilter: configFilterInput.value
+                        configFilter: configFilterInput.value,
+                        configRunSort: runSortMode,
+                        configSort: columnSortMode
                     });
                 }
             }
@@ -913,10 +1166,40 @@ export class MultiRunViewerPanel {
             if (configFilterInput && typeof persistedViewState.configFilter === 'string') {
                 configFilterInput.value = persistedViewState.configFilter;
             }
-            if (configFilterInput) {
-                configFilterInput.addEventListener('input', () => applyConfigFilter());
+            if (
+                configColumnSortSelect &&
+                typeof persistedViewState.configSort === 'string' &&
+                Array.from(configColumnSortSelect.options).some(option =>
+                    option.value === persistedViewState.configSort
+                )
+            ) {
+                configColumnSortSelect.value = persistedViewState.configSort;
             }
-            applyConfigFilter(false);
+            if (
+                configRunSortSelect &&
+                typeof persistedViewState.configRunSort === 'string' &&
+                Array.from(configRunSortSelect.options).some(option =>
+                    option.value === persistedViewState.configRunSort
+                )
+            ) {
+                configRunSortSelect.value = persistedViewState.configRunSort;
+            }
+            if (configFilterInput) {
+                configFilterInput.addEventListener('input', () => applyConfigColumnView());
+            }
+            if (configRunSortSelect) {
+                configRunSortSelect.addEventListener(
+                    'change',
+                    () => applyConfigColumnView()
+                );
+            }
+            if (configColumnSortSelect) {
+                configColumnSortSelect.addEventListener(
+                    'change',
+                    () => applyConfigColumnView()
+                );
+            }
+            applyConfigColumnView(false);
 
             // Per-chart height resizing
             function getChartResizeKey(container) {
@@ -1030,35 +1313,37 @@ export class MultiRunViewerPanel {
 
             // Sidebar collapse/expand
             function toggleSidebar() {
-                sidebar.classList.toggle('collapsed');
-                const collapseBtn = document.getElementById('collapseBtn');
-                const expandBtn = document.getElementById('expandBtn');
-                const isCollapsed = sidebar.classList.contains('collapsed');
-
-                if (isCollapsed) {
-                    collapseBtn.style.display = 'none';
-                    expandBtn.style.display = 'block';
-                } else {
-                    collapseBtn.style.display = 'block';
-                    expandBtn.style.display = 'none';
-                }
+                setSidebarCollapsed(!sidebar.classList.contains('collapsed'));
             }
 
             // Sidebar tab switching
-            function switchSidebarTab(tab) {
+            function switchSidebarTab(tab, shouldPersist = true) {
                 const tabs = document.querySelectorAll('.sidebar-tab');
                 const contents = document.querySelectorAll('.sidebar-content');
+                const targetTab = document.querySelector(
+                    '[data-sidebar-tab="' + tab + '"]'
+                );
+                const targetContent = document.getElementById(tab + 'Content');
+                if (!targetTab || !targetContent) return;
 
                 tabs.forEach(t => t.classList.remove('active'));
                 contents.forEach(c => c.classList.remove('active'));
 
-                document.querySelector('[data-sidebar-tab="' + tab + '"]').classList.add('active');
-                document.getElementById(tab + 'Content').classList.add('active');
+                targetTab.classList.add('active');
+                targetContent.classList.add('active');
+                if (shouldPersist) {
+                    updatePersistedViewState({ sidebarTab: tab });
+                }
+            }
+            if (
+                persistedViewState.sidebarTab === 'runs' ||
+                persistedViewState.sidebarTab === 'metadata'
+            ) {
+                switchSidebarTab(persistedViewState.sidebarTab, false);
             }
 
             // Metadata toggling
-            function toggleMetadata(runId) {
-                const header = document.querySelector("[onclick=\\"toggleMetadata('" + runId + "')\\"");
+            function toggleMetadata(header) {
                 const section = header.parentElement;
                 section.classList.toggle('collapsed');
             }
@@ -1144,6 +1429,7 @@ export class MultiRunViewerPanel {
 
             function updateChartData(chart, metric, isModal) {
                 if (!chart) return;
+                const runVisibility = getRunVisibility(chart);
 
                 if (!metric) {
                     chart.data.datasets = [];
@@ -1158,6 +1444,7 @@ export class MultiRunViewerPanel {
                 );
                 chart.options.plugins.decimation.enabled = maxPoints > 500;
                 chart.data.datasets = datasets;
+                applyRunVisibility(chart, runVisibility);
 
                 const smoothing = isModal
                     ? parseFloat(document.getElementById('modalSmoothing').value)
@@ -1165,14 +1452,57 @@ export class MultiRunViewerPanel {
                 updateChartSmoothing(chart, smoothing, isModal ? modalShowRaw : showRaw);
             }
 
-            window.addEventListener('message', event => {
-                const message = event.data;
-                if (message.command !== 'runDataUpdated' || !message.mergedMetrics) {
-                    return;
+            function ensureOverviewChart(metric, type) {
+                const canvas = Array.from(
+                    document.querySelectorAll('canvas[id^="chart-"]')
+                ).find(candidate =>
+                    candidate.dataset.chartType === type &&
+                    candidate.dataset.metricName === metric.metricName
+                );
+                if (!canvas) return null;
+
+                if (!chartInstances[canvas.id]) {
+                    chartInstances[canvas.id] = createUnifiedChart(
+                        canvas,
+                        createRunDatasets(metric, false),
+                        metric.metricName,
+                        { isModal: false, enableZoom: true }
+                    );
+                    updateChartSmoothing(
+                        chartInstances[canvas.id],
+                        globalSmoothing,
+                        showRaw
+                    );
+                    chartObserver.unobserve(canvas);
                 }
 
-                trainingMetrics = message.mergedMetrics.training || [];
-                systemMetrics = message.mergedMetrics.system || [];
+                return chartInstances[canvas.id];
+            }
+
+            function updateRunColorSwatches(runColors) {
+                if (!runColors || typeof runColors !== 'object') return;
+
+                document.querySelectorAll('.run-item[data-run-id]').forEach(item => {
+                    const color = runColors[item.dataset.runId];
+                    const swatch = item.querySelector('.run-color');
+                    if (typeof color === 'string' && swatch) {
+                        swatch.style.background = color;
+                    }
+                });
+                document.querySelectorAll(
+                    '#configCompareTable tbody tr[data-run-id]'
+                ).forEach(row => {
+                    const color = runColors[row.dataset.runId];
+                    const swatch = row.querySelector('.config-compare-run-color');
+                    if (typeof color === 'string' && swatch) {
+                        swatch.style.background = color;
+                    }
+                });
+            }
+
+            function updateMergedMetrics(mergedMetrics) {
+                trainingMetrics = mergedMetrics.training || [];
+                systemMetrics = mergedMetrics.system || [];
 
                 Object.entries(chartInstances).forEach(([canvasId, chart]) => {
                     const canvas = document.getElementById(canvasId);
@@ -1196,10 +1526,28 @@ export class MultiRunViewerPanel {
                     );
                     updateChartData(modalChart, metric, true);
                 }
+            }
+
+            window.addEventListener('message', event => {
+                const message = event.data;
+                if (
+                    (
+                        message.command !== 'runDataUpdated' &&
+                        message.command !== 'runColorsUpdated'
+                    ) ||
+                    !message.mergedMetrics
+                ) {
+                    return;
+                }
+
+                if (message.command === 'runColorsUpdated') {
+                    updateRunColorSwatches(message.runColors);
+                }
+                updateMergedMetrics(message.mergedMetrics);
             });
 
             // Fullscreen modal
-            function openFullscreen(metricIndex, type) {
+            function openFullscreen(metricIndex, type, shouldPersist = true) {
                 const metrics = type === 'training' ? trainingMetrics : systemMetrics;
                 const metric = metrics[metricIndex];
                 if (!metric) return;
@@ -1208,6 +1556,11 @@ export class MultiRunViewerPanel {
                     metricName: metric.metricName,
                     type
                 };
+                if (shouldPersist) {
+                    updatePersistedViewState({
+                        fullscreenMetric: activeFullscreenMetric
+                    });
+                }
 
                 document.getElementById('modalTitle').textContent = metric.metricName;
                 document.getElementById('fullscreenModal').classList.add('active');
@@ -1227,11 +1580,21 @@ export class MultiRunViewerPanel {
 
                 const ctx = document.getElementById('modalChart');
                 const datasets = createRunDatasets(metric, true);
+                const sourceChart = ensureOverviewChart(metric, type);
 
                 modalChart = createUnifiedChart(ctx, datasets, metric.metricName, {
                     isModal: true,
                     enableZoom: true
                 });
+                modalChart.$persistFullscreenState = true;
+                if (sourceChart) {
+                    copyRunVisibility(sourceChart, modalChart, false);
+                    modalChart.$isolatedRunKey = sourceChart.$isolatedRunKey || null;
+                    modalChart.$preIsolationVisibility =
+                        sourceChart.$preIsolationVisibility || null;
+                    modalChart.$sourceChart = sourceChart;
+                    modalChart.update('none');
+                }
                 updateChartAxes(modalChart, modalLogX, modalLogY);
             }
 
@@ -1256,17 +1619,7 @@ export class MultiRunViewerPanel {
 
                             if (!metric) return;
 
-                            // Create chart datasets
-                            const datasets = createRunDatasets(metric, false);
-
-                            // Create the chart
-                            chartInstances[canvasId] = createUnifiedChart(canvas, datasets, metric.metricName, {
-                                isModal: false,
-                                enableZoom: true
-                            });
-
-                            // Apply current global smoothing to newly created chart
-                            updateChartSmoothing(chartInstances[canvasId], globalSmoothing, showRaw);
+                            ensureOverviewChart(metric, type);
 
                             // Stop observing this chart
                             chartObserver.unobserve(canvas);
@@ -1286,6 +1639,34 @@ export class MultiRunViewerPanel {
 
                 console.log('Lazy chart rendering initialized for ' + (trainingMetrics.length + systemMetrics.length) + ' charts');
             });
+
+            const savedFullscreenMetric = persistedViewState.fullscreenMetric;
+            if (
+                savedFullscreenMetric &&
+                typeof savedFullscreenMetric.metricName === 'string' &&
+                (
+                    savedFullscreenMetric.type === 'training' ||
+                    savedFullscreenMetric.type === 'system'
+                )
+            ) {
+                queueMicrotask(() => {
+                    const metrics = savedFullscreenMetric.type === 'training'
+                        ? trainingMetrics
+                        : systemMetrics;
+                    const metricIndex = metrics.findIndex(metric =>
+                        metric.metricName === savedFullscreenMetric.metricName
+                    );
+                    if (metricIndex >= 0) {
+                        openFullscreen(
+                            metricIndex,
+                            savedFullscreenMetric.type,
+                            false
+                        );
+                    } else {
+                        updatePersistedViewState({ fullscreenMetric: null });
+                    }
+                });
+            }
 
         `;
     }
@@ -1577,9 +1958,18 @@ export class MultiRunViewerPanel {
                 color: var(--vscode-descriptionForeground);
                 font-size: 0.85em;
             }
+            .config-compare-tools {
+                display: flex;
+                align-items: center;
+                justify-content: flex-end;
+                flex-wrap: nowrap;
+                gap: 8px;
+                max-width: 100%;
+                overflow-x: auto;
+            }
             .config-filter-input {
-                flex: 0 1 320px;
-                min-width: 180px;
+                flex: 1 1 280px;
+                min-width: 160px;
                 padding: 6px 8px;
                 border: 1px solid var(--vscode-input-border, var(--vscode-panel-border));
                 border-radius: 3px;
@@ -1590,6 +1980,22 @@ export class MultiRunViewerPanel {
                 font-size: 0.85em;
             }
             .config-filter-input:focus {
+                border-color: var(--vscode-focusBorder);
+                outline: 1px solid var(--vscode-focusBorder);
+                outline-offset: -1px;
+            }
+            .config-sort-select {
+                flex: 0 0 auto;
+                padding: 6px 8px;
+                border: 1px solid var(--vscode-input-border, var(--vscode-panel-border));
+                border-radius: 3px;
+                outline: none;
+                color: var(--vscode-dropdown-foreground);
+                background: var(--vscode-dropdown-background);
+                font-family: var(--vscode-font-family);
+                font-size: 0.85em;
+            }
+            .config-sort-select:focus {
                 border-color: var(--vscode-focusBorder);
                 outline: 1px solid var(--vscode-focusBorder);
                 outline-offset: -1px;
@@ -1812,6 +2218,31 @@ export class MultiRunViewerPanel {
             };
             return entities[char] || char;
         });
+    }
+
+    private _getRunSortOptionsHtml(labelPrefix: string = ''): string {
+        const options: Array<{ value: RunSortMode; label: string }> = [
+            { value: 'created-desc', label: 'Created newest' },
+            { value: 'created-asc', label: 'Created oldest' },
+            { value: 'name-asc', label: 'Name A–Z' },
+            { value: 'name-desc', label: 'Name Z–A' },
+            { value: 'updated-desc', label: 'Updated newest' },
+            { value: 'updated-asc', label: 'Updated oldest' }
+        ];
+
+        return options.map(option => `
+            <option value="${option.value}" ${option.value === this._defaultRunSort ? 'selected' : ''}>
+                ${labelPrefix}${option.label}
+            </option>
+        `).join('');
+    }
+
+    private _formatTimestamp(timestamp: number): string {
+        if (!Number.isFinite(timestamp) || timestamp <= 0) {
+            return 'Unknown';
+        }
+
+        return new Date(timestamp).toLocaleString();
     }
 
     private _formatConfigValue(value: any): string {
