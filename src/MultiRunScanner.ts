@@ -12,7 +12,10 @@ export interface RunScanResult {
     lastModified: number;
     fileSize: number;
     isVisible: boolean;
+    syncStatus: RunSyncStatus;
 }
+
+export type RunSyncStatus = 'synced' | 'unsynced' | 'unknown';
 
 export interface FileChangeEvent {
     type: 'added' | 'modified' | 'deleted';
@@ -23,6 +26,27 @@ export interface FileChangeEvent {
 const DEBOUNCE_MS = 1500;
 const POLL_INTERVAL_MS = 5000;
 const DISCOVERY_INTERVAL_MS = 15000;
+
+/**
+ * Mirror the local marker rules used by `wandb sync`. Successful offline syncs
+ * create `<run>.wandb.synced`; normal `run-*` directories are online runs and
+ * are treated by W&B as already synced.
+ */
+export function detectRunSyncStatus(filePath: string): RunSyncStatus {
+    if (fs.existsSync(`${filePath}.synced`)) {
+        return 'synced';
+    }
+
+    const runDirectoryName = path.basename(path.dirname(filePath));
+    if (runDirectoryName.startsWith('offline-run-')) {
+        return 'unsynced';
+    }
+    if (runDirectoryName.startsWith('run-')) {
+        return 'synced';
+    }
+
+    return 'unknown';
+}
 
 /**
  * Recursively scan a folder for all .wandb files
@@ -119,7 +143,8 @@ export async function quickParseMetadata(filePath: string): Promise<RunScanResul
         createdAt,
         lastModified: stats.mtimeMs,
         fileSize: stats.size,
-        isVisible: true // Auto-select by default
+        isVisible: true, // Auto-select by default
+        syncStatus: detectRunSyncStatus(filePath)
     };
 }
 

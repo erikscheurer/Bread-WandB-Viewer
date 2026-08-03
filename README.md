@@ -7,6 +7,10 @@
 > [Bread Technologies' original Bread Wandb Viewer](https://github.com/Bread-Technologies/Bread-WandB-Viewer).
 > It is not the source repository for the `bread-tech.wandb-viewer` extension on
 > the VS Code Marketplace.
+>
+> This fork is primarily shaped around its maintainer's local experiment workflow
+> and does not aim to cover every W&B feature. Issues and pull requests are very
+> welcome when another workflow would benefit from broader support.
 
 **Compare ML training runs side-by-side in VS Code - no browser switching, no waiting**
 
@@ -29,15 +33,21 @@ version adds:
   the webview.
 - **State-preserving chart updates** — refreshes retain zoom, smoothing, log axes,
   run visibility, active tabs, filters, sidebar size, and fullscreen state. Raw
-  and smoothed traces behave as one run.
+  and smoothed traces behave as one run. Chart controls remain visible while
+  scrolling through long metric lists.
 - **Improved chart interaction** — X-range and box zoom, two-axis panning,
   Ctrl+scroll cursor zoom, resizable chart rows, visibility-preserving legend
   isolation, linked run highlighting, and clearer cursor-sorted tooltips.
 - **Better run comparison** — side-by-side configuration comparison with search,
-  independent run-row and parameter-column sorting, plus run filtering and sorting
-  by name, creation time, or latest update.
+  independent run-row and parameter-column sorting, plus glob run filtering and
+  sorting by name, creation time, or latest update.
 - **Stable, theme-aware visuals** — deterministic configurable run palettes,
   improved light-theme contrast, and unfilled run curves.
+- **Multi-folder workspaces** — open independent comparison tabs or add more run
+  folders to an existing viewer, with folder-specific tab titles and icons.
+- **Richer run navigation** — full-name and empty-run tooltips, local sync-state
+  badges, creation timestamps, a persisted **Hide empty** filter, and run-specific
+  context actions.
 
 ## Multi-Run Comparison in Action
 
@@ -59,6 +69,7 @@ version adds:
 - 🔍 **Metadata Comparison** - Side-by-side config and hyperparameter diff highlighting
 - 🎨 **Smart Grouping** - Metrics auto-organized by prefix (loss/, train/, val/, gpu.0/)
 - 🔒 **Local Run Parsing** - Direct `.wandb` parsing with protobuf, without the W&B API or CLI
+- ☁ **Optional Explicit Sync** - Upload selected local runs with an installed W&B CLI after confirmation
 - 🎛️ **Advanced Controls** - Log scales, raw data overlay toggle, adjustable smoothing
 - 📁 **Folder Scanning** - Automatically discover all runs in a directory
 
@@ -72,7 +83,8 @@ version adds:
 
 **Compare multiple runs:**
 1. Right-click any folder with W&B runs
-2. Select "Bread Wandb Viewer"
+2. Select **Open in New Wandb Viewer**, or select **Add to Open Wandb Viewer**
+   to merge the folder into an existing comparison tab
 3. Check/uncheck runs in sidebar to compare
 
 That's it! No configuration needed.
@@ -97,11 +109,36 @@ Compare training runs side-by-side to understand what hyperparameters and config
 - Overlay multiple runs on the same charts
 - Color-coded run identification
 - Interactive sidebar for toggling runs on/off
+- Multiple independent comparison tabs titled `Wandb: <foldername>`
+- Add multiple folders to one comparison tab
+- Full run-name tooltips, creation times, empty-run highlighting, and sync badges
+- Right-click actions to copy the run ID, isolate a run, or sync it
 - Resizable sidebar for better workspace management
 - Resizable chart heights with draggable dividers
 - Automatic folder scanning for all runs
 
 Ideal for hyperparameter tuning, ablation studies, and experiment analysis. No need to switch to your browser to compare metrics.
+
+Original W&B run names remain read-only because they are embedded in the `.wandb`
+binary log. The run context menu can assign a custom display name instead. These
+aliases are keyed by run ID in VS Code's extension-global storage, survive viewer
+reloads, and never modify the run file. Submit an empty custom name to restore the
+original name. The rename field starts with the run's current displayed name for
+easy partial edits.
+
+### ☁ Local Sync Status and Optional Upload
+
+The sidebar mirrors the local status rules used by `wandb sync`: a green cloud is
+synced, a crossed cloud is unsynced, and a neutral cloud means the status cannot be
+determined from the folder layout. Successful offline syncs create a
+`.wandb.synced` marker beside the run file; normal `run-*` directories are treated
+as online/synced by the W&B CLI.
+
+**Sync selected** and **Sync this run** invoke `wandb sync` from an installed local
+W&B CLI. The extension always asks for confirmation first because this action
+uploads run data to W&B. Viewing, parsing, comparison, and export do not invoke the
+CLI or contact the W&B API. See the official
+[W&B sync documentation](https://docs.wandb.ai/models/ref/cli/wandb-sync).
 
 ### 🤖 AI Context Export
 
@@ -169,11 +206,13 @@ View comprehensive run information beyond just training metrics.
 
 ### 🔒 Local & Private
 
-Your training data never leaves your machine.
+Viewing and analysis keep your training data on your machine.
 
 - Reads `.wandb` files directly using protobuf
-- No wandb CLI or API needed
+- No W&B CLI or API is needed for viewing or analysis
 - Does not collect or transmit analytics or telemetry
+- Only an explicitly confirmed **Sync** action invokes the locally installed
+  `wandb sync` command and uploads the chosen runs
 
 Run parsing and analysis are local. The chart UI currently loads Chart.js and its
 zoom plugin from jsDelivr when a webview opens, so displaying charts may require a
@@ -232,6 +271,7 @@ or [upstream releases](https://github.com/Bread-Technologies/Bread-WandB-Viewer/
 
 - VS Code 1.74.0 or higher
 - Training runs created with wandb SDK 0.15+
+- Optional: the `wandb` CLI on `PATH` for the explicit Sync actions
 
 ---
 
@@ -239,7 +279,8 @@ or [upstream releases](https://github.com/Bread-Technologies/Bread-WandB-Viewer/
 
 | Command | How to Access | Description |
 |---------|---------------|-------------|
-| **Bread Wandb Viewer** | Right-click folder in Explorer | Opens multi-run comparison view for all `.wandb` files in folder |
+| **Open in New Wandb Viewer** | Right-click folder in Explorer | Opens a new comparison tab for all `.wandb` files in the folder |
+| **Add to Open Wandb Viewer** | Right-click folder in Explorer | Adds a folder to an existing comparison tab; prompts when multiple tabs are open |
 | **Open .wandb file** | Click any `.wandb` file | Opens single run view with charts and metadata |
 
 ### Keyboard Shortcuts
@@ -270,9 +311,12 @@ The longer choices use
 
 ## Privacy
 
-The extension does not collect or transmit usage analytics, error telemetry, run
-metadata, metric values, file paths, code, hyperparameters, or configuration data.
-W&B run parsing and analysis happen locally.
+The extension does not collect or transmit usage analytics or error telemetry.
+W&B run parsing, comparison, charting, and AI-context generation happen locally.
+The sole run-data transmission path is the user-triggered Sync action: after a
+modal confirmation, it passes the selected local file paths to the installed
+`wandb sync` CLI, which uploads those runs according to the user's W&B CLI login
+and configuration.
 
 ---
 
@@ -283,7 +327,8 @@ For developers and power users interested in how this extension works.
 ### Architecture
 
 - **Binary Parsing:** Direct protobuf parsing of `.wandb` files (LevelDB-style format)
-- **No W&B Cloud Dependencies:** No W&B CLI or API is required to parse runs
+- **No Viewing-Time W&B Cloud Dependencies:** No W&B CLI or API is required to parse runs
+- **Optional Sync Integration:** Confirmed uploads spawn `wandb sync` without a shell; local status uses W&B's `.synced` marker convention
 - **Performance:** LRU cache (20 runs), LTTB decimation for large datasets, lazy chart initialization
 - **File Watching:** Throttled filesystem events backed by modification polling and periodic run discovery
 - **Chart Library:** Chart.js 4.4.0 with zoom plugin for interactive visualizations

@@ -22,6 +22,9 @@ export function getChartStyles(): string {
             gap: 15px;
             align-items: center;
             flex-wrap: wrap;
+            position: sticky;
+            top: 0;
+            z-index: 100;
         }
 
         .control-group {
@@ -1995,9 +1998,10 @@ export function getChartScript(): string {
         function closeFullscreen() {
             document.getElementById('fullscreenModal').classList.remove('active');
             document.body.classList.remove('modal-open');
+            if (typeof fullscreenRenderToken !== 'undefined') {
+                fullscreenRenderToken++;
+            }
             if (modalChart) {
-                const shouldClearFullscreenState =
-                    modalChart.$persistFullscreenState === true;
                 if (modalChart.$sourceChart) {
                     copyRunVisibility(modalChart, modalChart.$sourceChart, true);
                     modalChart.$sourceChart.$isolatedRunKey =
@@ -2008,9 +2012,18 @@ export function getChartScript(): string {
                 }
                 modalChart.destroy();
                 modalChart = null;
-                if (shouldClearFullscreenState) {
-                    updatePersistedViewState({ fullscreenMetric: null });
-                }
+            }
+            updatePersistedViewState({
+                fullscreenMetric: null,
+                fullscreenOpen: false
+            });
+            try {
+                vscode.postMessage({
+                    command: 'fullscreenStateChanged',
+                    open: false
+                });
+            } catch {
+                // Standalone previews may not provide the VS Code webview API.
             }
             if (typeof activeFullscreenMetric !== 'undefined') {
                 activeFullscreenMetric = null;

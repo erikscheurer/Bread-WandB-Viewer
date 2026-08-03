@@ -25,12 +25,15 @@ export interface MultiRunState {
     folderPath: string;
 }
 
+export type RunContentStatus = 'unknown' | 'empty' | 'has-data';
+
 const MAX_CACHE_SIZE = 20;
 
 export class MultiRunManager {
     private state: MultiRunState;
     private cacheAccessOrder: string[] = []; // For LRU eviction
     private colorPalette: RunColorPaletteName;
+    private runContentStatuses = new Map<string, RunContentStatus>();
 
     constructor(
         folderPath: string,
@@ -73,6 +76,7 @@ export class MultiRunManager {
         this.state.selectedRunIds.delete(runId);
         this.state.parsedData.delete(runId);
         this.state.colorMap.delete(runId);
+        this.runContentStatuses.delete(runId);
 
         // Remove from cache access order
         const index = this.cacheAccessOrder.indexOf(runId);
@@ -111,6 +115,19 @@ export class MultiRunManager {
     }
 
     /**
+     * Select one run and hide every other run.
+     */
+    selectOnly(runId: string): boolean {
+        if (!this.state.runs.has(runId)) {
+            return false;
+        }
+
+        this.state.selectedRunIds.clear();
+        this.state.selectedRunIds.add(runId);
+        return true;
+    }
+
+    /**
      * Get all runs
      */
     getRuns(): RunScanResult[] {
@@ -136,6 +153,10 @@ export class MultiRunManager {
      */
     getRunColor(runId: string): string {
         return this.state.colorMap.get(runId) || '#888888';
+    }
+
+    getRunContentStatus(runId: string): RunContentStatus {
+        return this.runContentStatuses.get(runId) || 'unknown';
     }
 
     /**
@@ -195,9 +216,14 @@ export class MultiRunManager {
                         const parseTime = Date.now() - parseStart;
                         console.log(`  - Parsed run ${run.runName}: ${parseTime}ms (${Object.keys(parsed.metrics).length} metrics, ${Object.values(parsed.metrics).reduce((sum, m) => sum + m.length, 0)} data points)`);
                         this.state.parsedData.set(runId, parsed);
+                        this.runContentStatuses.set(
+                            runId,
+                            this.hasMetricData(parsed) ? 'has-data' : 'empty'
+                        );
                         this.updateCacheAccess(runId);
                         this.evictIfNeeded();
                     } catch (error) {
+                        this.runContentStatuses.set(runId, 'unknown');
                         console.error(`Failed to parse run ${runId}:`, error);
                     }
                 }
@@ -214,6 +240,7 @@ export class MultiRunManager {
     invalidateSelectedRuns(): void {
         for (const runId of this.state.selectedRunIds) {
             this.state.parsedData.delete(runId);
+            this.runContentStatuses.set(runId, 'unknown');
 
             const index = this.cacheAccessOrder.indexOf(runId);
             if (index > -1) {
@@ -227,6 +254,12 @@ export class MultiRunManager {
      */
     getParsedData(runId: string): WandbRunData | undefined {
         return this.state.parsedData.get(runId);
+    }
+
+    private hasMetricData(runData: WandbRunData): boolean {
+        return [runData.metrics, runData.systemMetrics].some(metrics =>
+            Object.values(metrics).some(points => points.length > 0)
+        );
     }
 
     /**
@@ -342,6 +375,7 @@ export class MultiRunManager {
                 existingRun.fileSize !== runResult.fileSize
             ) {
                 this.state.parsedData.delete(runResult.runId);
+                this.runContentStatuses.set(runResult.runId, 'unknown');
             }
         }
     }

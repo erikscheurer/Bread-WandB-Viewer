@@ -7,7 +7,8 @@ Biases `.wandb` files and comparing multiple training runs. It parses W&B data
 locally without the W&B API or CLI, renders Chart.js-based webviews, can export run
 data as AI-oriented Markdown, and does not collect or transmit telemetry. Run
 parsing is offline, but the webviews currently load Chart.js and its zoom plugin
-from jsDelivr.
+from jsDelivr. The only run-data upload path is an explicitly confirmed Sync
+action that invokes the user's locally installed `wandb sync` CLI.
 
 ## Repository map
 
@@ -15,7 +16,8 @@ from jsDelivr.
   and initial/fullscreen datasets for that editor.
 - `src/wandbParser.ts`: `.wandb`/protobuf parsing and core run-data types.
 - `src/webviewPanel.ts`: single-run webview.
-- `src/MultiRunScanner.ts`: recursive run discovery, metadata reads, and file watching.
+- `src/MultiRunScanner.ts`: recursive run discovery, metadata and local sync-status
+  reads, and file watching.
 - `src/MultiRunManager.ts`: multi-run selection, caching, colors, and merged metrics.
 - `src/MultiRunViewerPanel.ts`: multi-run webview, initial/fullscreen dataset
   construction, and host/webview message handling.
@@ -105,6 +107,13 @@ host.
   existing `vscode.getState()` keys for active tabs, controls, sidebar geometry,
   per-metric zoom ranges, and run visibility. Per-chart state is keyed by chart
   type and metric name rather than transient dataset indices.
+- Treat fullscreen restoration as explicit modal state. Persist both the metric
+  identity and whether the modal is open, clear both even when no Chart.js instance
+  exists, and invalidate deferred modal renders when fullscreen closes.
+- Multi-run comparisons are not a singleton. Each independent panel owns its own
+  manager, folder set, watcher set, webview state, title, and disposal lifecycle.
+  Adding a folder to a panel must rescan all roots so runs from earlier roots are
+  not mistaken for deletions.
 - Preserve VS Code disposal lifecycles. Register commands, watchers, panels, and
   listeners in the relevant `context.subscriptions` or `_disposables` collection.
 - Avoid blocking the extension host during scans and large-file processing. Retain
@@ -120,7 +129,34 @@ host.
   malformed records when safe, and provide useful errors instead of crashing the
   extension host.
 - Keep parsing offline. Do not introduce a W&B API or CLI dependency unless the
-  product requirement explicitly changes.
+  product requirement explicitly changes. The optional Sync UI is the sole
+  exception: validate requested run IDs, require modal confirmation, spawn
+  `wandb sync` with an argument array and `shell: false`, and never expose command
+  output or local paths in logs or error messages.
+- Mirror W&B's local sync markers without network access: `<run>.wandb.synced` is
+  synced, `offline-run-*` is unsynced without that marker, and normal `run-*`
+  directories are treated as synced. Keep unknown layouts explicitly unknown.
+- Keep original run names read-only. Custom display names belong in VS Code
+  extension-global storage keyed by run ID; apply them consistently to the sidebar,
+  metadata, charts, config comparison, single-run header, and AI-context export.
+  Initialize the rename input with the current displayed name; an empty alias
+  restores the original name. Never rewrite `.wandb` protobuf logs.
+- Cache whether parsed runs contain metric data independently from the bounded
+  parsed-data LRU, so confirmed empty runs stay grayed after cache eviction and
+  return to unknown when their files change.
+- Keep the sidebar's empty-run filter content-aware: it hides only runs confirmed
+  empty, never unknown/unparsed runs, persists in webview state, and reapplies when
+  a data-only status update arrives.
+- Keep the sidebar text filter glob-based and case-insensitive. `*` matches any
+  sequence, `?` matches one character, and regex metacharacters are treated
+  literally. Preserve substring matching when a pattern has no surrounding `*`.
+- Keep the overview chart controls sticky within the actual scrolling container.
+  The multi-run wrapper and the shared single-run controls have different parent
+  layouts, so audit both when changing toolbar positioning.
+- Treat fullscreen state as host-verified before rebuilding a multi-run webview.
+  Modal open/close events update the host, and run-selection messages carry the
+  current modal state so stale `vscode.getState()` data cannot reopen a closed
+  fullscreen chart.
 - When changing protobuf handling, keep `src/wandb.proto` and the programmatically
   constructed record types in `wandbParser.ts`/`MultiRunScanner.ts` consistent.
 - Reuse the shared chart helpers in `chartTemplate.ts` for behavior common to the
@@ -149,7 +185,8 @@ host.
 ## Privacy and security
 
 - Do not add analytics or telemetry without an explicit product requirement and
-  corresponding privacy documentation.
+  corresponding privacy documentation. Viewing and analysis must not upload run
+  data; only the confirmed Sync action may hand selected runs to the W&B CLI.
 - Do not log secrets or raw training data. Error messages must not leak local paths
   or file content.
 - Escape or safely serialize all run-derived values inserted into webview HTML or

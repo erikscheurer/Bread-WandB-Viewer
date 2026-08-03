@@ -11,6 +11,7 @@ import {
 import { WandbViewerPanel } from './webviewPanel';
 import { MultiRunViewerPanel } from './MultiRunViewerPanel';
 import { getChartStyles, getChartScript, getControlsBarHtml, getModalHtml } from './chartTemplate';
+import { getCustomRunName } from './customRunNames';
 
 export function activate(context: vscode.ExtensionContext) {
     console.log('W&B Viewer extension activated');
@@ -120,7 +121,8 @@ export function activate(context: vscode.ExtensionContext) {
                     async () => {
                         await MultiRunViewerPanel.createOrShow(
                             context.extensionUri,
-                            folderPath
+                            folderPath,
+                            context.globalState
                         );
                     }
                 );
@@ -133,6 +135,51 @@ export function activate(context: vscode.ExtensionContext) {
     );
 
     context.subscriptions.push(compareRunsCommand);
+
+    const addRunsToViewerCommand = vscode.commands.registerCommand(
+        'wandb-viewer.addRunsToViewer',
+        async (uri: vscode.Uri) => {
+            let folderPath: string;
+
+            if (uri) {
+                folderPath = uri.fsPath;
+            } else {
+                const selected = await vscode.window.showOpenDialog({
+                    canSelectFiles: false,
+                    canSelectFolders: true,
+                    canSelectMany: false,
+                    title: 'Select Folder with W&B Runs'
+                });
+                if (!selected || selected.length === 0) {
+                    return;
+                }
+                folderPath = selected[0].fsPath;
+            }
+
+            try {
+                await vscode.window.withProgress(
+                    {
+                        location: vscode.ProgressLocation.Notification,
+                        title: 'Adding W&B runs to viewer...',
+                        cancellable: false
+                    },
+                    async () => {
+                        await MultiRunViewerPanel.addFolderToExisting(
+                            context.extensionUri,
+                            folderPath,
+                            context.globalState
+                        );
+                    }
+                );
+            } catch (error) {
+                vscode.window.showErrorMessage(
+                    `Failed to add runs: ${error instanceof Error ? error.message : String(error)}`
+                );
+            }
+        }
+    );
+
+    context.subscriptions.push(addRunsToViewerCommand);
 }
 
 /**
@@ -178,49 +225,19 @@ class WandbEditorProvider implements vscode.CustomReadonlyEditorProvider {
         let debounceTimer: NodeJS.Timeout | null = null;
         const DEBOUNCE_MS = 1000; // Wait 1 second after last change before updating
 
-        // Find the logo - first check extension's media folder
-        let logoBase64 = '';
-        const extensionMediaPath = path.join(this.context.extensionPath, 'media', 'bread_alpha.png');
-        if (fs.existsSync(extensionMediaPath)) {
-            const logoData = fs.readFileSync(extensionMediaPath);
-            logoBase64 = logoData.toString('base64');
-        }
-
-        // Fallback: check workspace folders
-        if (!logoBase64) {
-            const workspaceFolders = vscode.workspace.workspaceFolders;
-            if (workspaceFolders) {
-                for (const folder of workspaceFolders) {
-                    const logoPath = path.join(folder.uri.fsPath, 'bread_alpha.png');
-                    if (fs.existsSync(logoPath)) {
-                        const logoData = fs.readFileSync(logoPath);
-                        logoBase64 = logoData.toString('base64');
-                        break;
-                    }
-                }
-            }
-        }
-
-        // Fallback: check parent directories of the wandb file
-        if (!logoBase64) {
-            let searchDir = runDir;
-            for (let i = 0; i < 5; i++) {
-                const logoPath = path.join(searchDir, 'bread_alpha.png');
-                if (fs.existsSync(logoPath)) {
-                    const logoData = fs.readFileSync(logoPath);
-                    logoBase64 = logoData.toString('base64');
-                    break;
-                }
-                searchDir = path.dirname(searchDir);
-            }
-        }
-
         webviewPanel.webview.options = {
             enableScripts: true
         };
 
         try {
             const runData = parseWandbFile(wandbFilePath);
+            const customRunName = getCustomRunName(
+                this.context.globalState,
+                runData.runId
+            );
+            const displayRunData = customRunName
+                ? { ...runData, runName: customRunName }
+                : runData;
             const runFiles = getRunFiles(runDir);
             const logMetrics = runFiles.outputLog
                 ? parseOutputLog(runFiles.outputLog)
@@ -228,11 +245,10 @@ class WandbEditorProvider implements vscode.CustomReadonlyEditorProvider {
 
             webviewPanel.webview.html = this.getHtmlContent(
                 webviewPanel.webview,
-                runData,
+                displayRunData,
                 logMetrics,
                 runDir,
-                runFiles.outputLog,
-                logoBase64
+                runFiles.outputLog
             );
 
             webviewPanel.webview.onDidReceiveMessage(async message => {
@@ -319,11 +335,11 @@ class WandbEditorProvider implements vscode.CustomReadonlyEditorProvider {
         }
     }
 
-    private generateHeaderHtml(logoBase64: string, projectName: string, runName: string, runId: string, outputLogPath: string | null): string {
+    private generateHeaderHtml(projectName: string, runName: string, runId: string, outputLogPath: string | null): string {
         return `
             <div class="header">
                 <div class="header-left">
-                    ${logoBase64 ? `<img src="data:image/png;base64,${logoBase64}" alt="Logo" class="logo">` : ''}
+                    <span class="logo" role="img" aria-label="Sparkles">✨</span>
                     <div class="title-section">
                         <div class="project-name">${projectName}</div>
                         <h1>${runName}</h1>
@@ -372,7 +388,7 @@ class WandbEditorProvider implements vscode.CustomReadonlyEditorProvider {
                 gap: 15px;
             }
             .header-left { display: flex; align-items: center; gap: 15px; }
-            .logo { width: 32px; height: 32px; object-fit: contain; opacity: 0.85; }
+            .logo { width: 32px; height: 32px; display: inline-flex; align-items: center; justify-content: center; font-size: 28px; line-height: 1; }
             .title-section { display: flex; flex-direction: column; gap: 4px; }
             .project-name { font-size: 0.85em; color: var(--vscode-descriptionForeground, #888); line-height: 1.4; }
             h1 { margin: 0; font-size: 1.4em; color: var(--vscode-foreground, #fff); line-height: 1.3; }
@@ -508,8 +524,7 @@ class WandbEditorProvider implements vscode.CustomReadonlyEditorProvider {
         runData: any,
         logMetrics: any,
         runDir: string,
-        outputLogPath: string | null,
-        logoBase64: string
+        outputLogPath: string | null
     ): string {
         const pathModule = require('path');
 
@@ -551,7 +566,7 @@ class WandbEditorProvider implements vscode.CustomReadonlyEditorProvider {
     </style>
 </head>
 <body>
-    ${this.generateHeaderHtml(logoBase64, projectName, runName, runData.runId, outputLogPath)}
+    ${this.generateHeaderHtml(projectName, runName, runData.runId, outputLogPath)}
     ${this.generateMetadataHtml(metadata)}
     ${getControlsBarHtml()}
 

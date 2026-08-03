@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as path from 'path';
+import { spawn } from 'child_process';
 import { MultiRunManager, MergedMetric } from './MultiRunManager';
 import { scanFolderForRuns, watchFolder, FileChangeEvent, RunScanResult } from './MultiRunScanner';
 import { getChartStyles, getChartScript, getModalHtml, getControlsBarHtml } from './chartTemplate';
@@ -11,6 +12,11 @@ import {
     isRunColorPaletteName,
     RunColorPaletteName
 } from './runColors';
+import {
+    getCustomRunNames,
+    setCustomRunName,
+    validateCustomRunName
+} from './customRunNames';
 
 const RUN_SORT_MODES = [
     'created-desc',
@@ -31,43 +37,109 @@ function isRunSortMode(value: unknown): value is RunSortMode {
 }
 
 export class MultiRunViewerPanel {
-    public static currentPanel: MultiRunViewerPanel | undefined;
+    private static readonly panels = new Set<MultiRunViewerPanel>();
     private readonly _panel: vscode.WebviewPanel;
     private readonly _extensionUri: vscode.Uri;
     private _disposables: vscode.Disposable[] = [];
     private _manager: MultiRunManager;
-    private _folderWatcher: vscode.Disposable | null = null;
+    private _folderWatchers = new Map<string, vscode.Disposable>();
     private _folderPath: string;
+    private _folderPaths = new Set<string>();
     private _pendingFileChanges = new Map<string, FileChangeEvent>();
     private _processingFileChanges = false;
     private _needsVisibleCatchUp = false;
     private _disposed = false;
+    private _initialUpdateTimer: NodeJS.Timeout | null = null;
     private _defaultRunSort: RunSortMode;
     private _colorPalette: RunColorPaletteName;
+    private readonly _nameStorage: vscode.Memento;
+    private _customRunNames: Record<string, string>;
+    private _isFullscreenOpen = false;
 
-    public static createOrShow(extensionUri: vscode.Uri, folderPath: string) {
-        if (MultiRunViewerPanel.currentPanel) {
-            MultiRunViewerPanel.currentPanel._panel.reveal(vscode.ViewColumn.One);
-            return;
-        }
-
+    public static createOrShow(
+        extensionUri: vscode.Uri,
+        folderPath: string,
+        nameStorage: vscode.Memento
+    ): MultiRunViewerPanel {
         const panel = vscode.window.createWebviewPanel(
             'wandbMultiRunViewer',
-            'Bread Wandb Viewer',
+            MultiRunViewerPanel.getPanelTitle([folderPath]),
             vscode.ViewColumn.One,
             {
                 enableScripts: true,
                 retainContextWhenHidden: true,
             }
         );
+        panel.iconPath = vscode.Uri.joinPath(extensionUri, 'media', 'icon.png');
 
-        MultiRunViewerPanel.currentPanel = new MultiRunViewerPanel(panel, extensionUri, folderPath);
+        const viewer = new MultiRunViewerPanel(
+            panel,
+            extensionUri,
+            folderPath,
+            nameStorage
+        );
+        MultiRunViewerPanel.panels.add(viewer);
+        return viewer;
     }
 
-    private constructor(panel: vscode.WebviewPanel, extensionUri: vscode.Uri, folderPath: string) {
+    public static async addFolderToExisting(
+        extensionUri: vscode.Uri,
+        folderPath: string,
+        nameStorage: vscode.Memento
+    ): Promise<MultiRunViewerPanel> {
+        const openPanels = Array.from(MultiRunViewerPanel.panels)
+            .filter(panel => !panel._disposed);
+        if (openPanels.length === 0) {
+            return MultiRunViewerPanel.createOrShow(
+                extensionUri,
+                folderPath,
+                nameStorage
+            );
+        }
+
+        let targetPanel = openPanels[0];
+        if (openPanels.length > 1) {
+            const selection = await vscode.window.showQuickPick(
+                openPanels.map(panel => ({
+                    label: panel._panel.title,
+                    description: Array.from(panel._folderPaths).join(' • '),
+                    panel
+                })),
+                { placeHolder: 'Choose the Wandb Viewer to add runs to' }
+            );
+            if (!selection) {
+                return targetPanel;
+            }
+            targetPanel = selection.panel;
+        }
+
+        await targetPanel.addFolder(folderPath);
+        targetPanel._panel.reveal(vscode.ViewColumn.One);
+        return targetPanel;
+    }
+
+    private static getPanelTitle(folderPaths: Iterable<string>): string {
+        const folderNames = Array.from(folderPaths, folderPath =>
+            path.basename(path.resolve(folderPath)) || folderPath
+        );
+        if (folderNames.length <= 1) {
+            return `Wandb: ${folderNames[0] || 'Runs'}`;
+        }
+        return `Wandb: ${folderNames[0]} +${folderNames.length - 1}`;
+    }
+
+    private constructor(
+        panel: vscode.WebviewPanel,
+        extensionUri: vscode.Uri,
+        folderPath: string,
+        nameStorage: vscode.Memento
+    ) {
         this._panel = panel;
         this._extensionUri = extensionUri;
-        this._folderPath = folderPath;
+        this._folderPath = path.resolve(folderPath);
+        this._folderPaths.add(this._folderPath);
+        this._nameStorage = nameStorage;
+        this._customRunNames = getCustomRunNames(nameStorage);
         const configuration = vscode.workspace.getConfiguration('wandbViewer');
         const configuredRunSort = configuration.get<string>('defaultRunSort');
         const configuredColorPalette = configuration.get<string>('runColorPalette');
@@ -83,8 +155,11 @@ export class MultiRunViewerPanel {
         this._panel.webview.html = this._getLoadingHtml();
         
         // Defer the actual work so loading spinner can render
-        setTimeout(() => {
-            this._update();
+        this._initialUpdateTimer = setTimeout(() => {
+            this._initialUpdateTimer = null;
+            if (!this._disposed) {
+                void this._update();
+            }
         }, 50); // 50ms delay allows the loading screen to paint
         
         this._panel.onDidDispose(() => this.dispose(), null, this._disposables);
@@ -118,14 +193,68 @@ export class MultiRunViewerPanel {
             async message => {
                 switch (message.command) {
                     case 'toggleRun':
-                        this._manager.toggleRun(message.runId);
-                        await this._update(false);
+                        if (typeof message.runId === 'string') {
+                            if (typeof message.fullscreenOpen === 'boolean') {
+                                this._isFullscreenOpen = message.fullscreenOpen;
+                            }
+                            this._manager.toggleRun(message.runId);
+                            await this._update(false);
+                        }
+                        break;
+                    case 'copyRunId':
+                        if (
+                            typeof message.runId === 'string' &&
+                            this._manager.getState().runs.has(message.runId)
+                        ) {
+                            await vscode.env.clipboard.writeText(message.runId);
+                            vscode.window.showInformationMessage('Run ID copied.');
+                        }
+                        break;
+                    case 'showOnlyRun':
+                        if (
+                            typeof message.runId === 'string' &&
+                            this._manager.selectOnly(message.runId)
+                        ) {
+                            if (typeof message.fullscreenOpen === 'boolean') {
+                                this._isFullscreenOpen = message.fullscreenOpen;
+                            }
+                            await this._update(false);
+                        }
+                        break;
+                    case 'renameRun':
+                        if (typeof message.runId === 'string') {
+                            await this._renameRun(message.runId);
+                        }
+                        break;
+                    case 'fullscreenStateChanged':
+                        this._isFullscreenOpen = message.open === true;
+                        break;
+                    case 'syncRuns':
+                        try {
+                            const runIds = Array.isArray(message.runIds)
+                                ? message.runIds.filter((runId: unknown): runId is string =>
+                                    typeof runId === 'string'
+                                )
+                                : this._manager.getSelectedRunIds();
+                            await this._handleSyncRuns(runIds);
+                        } finally {
+                            await this._panel.webview.postMessage({
+                                command: 'syncRunsComplete',
+                                canSync: this._manager.getSelectedCount() > 0
+                            });
+                        }
                         break;
                     case 'selectAll':
+                        if (typeof message.fullscreenOpen === 'boolean') {
+                            this._isFullscreenOpen = message.fullscreenOpen;
+                        }
                         this._manager.selectAll();
                         await this._update(false);
                         break;
                     case 'deselectAll':
+                        if (typeof message.fullscreenOpen === 'boolean') {
+                            this._isFullscreenOpen = message.fullscreenOpen;
+                        }
                         this._manager.deselectAll();
                         await this._update(false);
                         break;
@@ -192,11 +321,46 @@ export class MultiRunViewerPanel {
 
         // Watch for file changes only while the panel is visible. When it becomes
         // visible again, a metadata scan catches up on changes made while hidden.
-        this._folderWatcher = watchFolder(
+        this._watchFolder(this._folderPath);
+    }
+
+    private async addFolder(folderPath: string): Promise<void> {
+        const resolvedFolderPath = path.resolve(folderPath);
+        if (this._folderPaths.has(resolvedFolderPath)) {
+            vscode.window.showInformationMessage('That folder is already open in this Wandb Viewer.');
+            return;
+        }
+
+        this._folderPaths.add(resolvedFolderPath);
+        this._watchFolder(resolvedFolderPath);
+        this._panel.title = MultiRunViewerPanel.getPanelTitle(this._folderPaths);
+        await this._update(true);
+    }
+
+    private _watchFolder(folderPath: string): void {
+        if (this._folderWatchers.has(folderPath)) {
+            return;
+        }
+
+        const watcher = watchFolder(
             folderPath,
             event => this._queueFileChange(event),
             () => this._panel.visible && !this._disposed
         );
+        this._folderWatchers.set(folderPath, watcher);
+    }
+
+    private async _scanFolders(): Promise<RunScanResult[]> {
+        const scans = await Promise.all(
+            Array.from(this._folderPaths, folderPath => scanFolderForRuns(folderPath))
+        );
+        const runsByFilePath = new Map<string, RunScanResult>();
+        for (const runs of scans) {
+            for (const run of runs) {
+                runsByFilePath.set(path.resolve(run.filePath), run);
+            }
+        }
+        return Array.from(runsByFilePath.values());
     }
 
     private async _reloadSelectedRuns(): Promise<void> {
@@ -216,7 +380,7 @@ export class MultiRunViewerPanel {
 
     private async _queueVisibleCatchUp(): Promise<void> {
         try {
-            const discoveredRuns = await scanFolderForRuns(this._folderPath);
+            const discoveredRuns = await this._scanFolders();
             const existingRuns = new Map(
                 this._manager.getRuns().map(run => [run.runId, run])
             );
@@ -307,7 +471,180 @@ export class MultiRunViewerPanel {
         await this._manager.parseSelectedRuns();
         await this._panel.webview.postMessage({
             command: 'runDataUpdated',
-            mergedMetrics: this._manager.mergeMetrics()
+            mergedMetrics: this._getMergedMetrics(),
+            runContentStatuses: this._getRunContentStatuses()
+        });
+    }
+
+    private _getRunContentStatuses(): Record<string, string> {
+        return Object.fromEntries(
+            this._manager.getRuns().map(run => [
+                run.runId,
+                this._manager.getRunContentStatus(run.runId)
+            ])
+        );
+    }
+
+    private _getDisplayRunName(run: RunScanResult): string {
+        return this._customRunNames[run.runId] || run.runName;
+    }
+
+    private _withDisplayRunName(run: RunScanResult): RunScanResult {
+        return {
+            ...run,
+            runName: this._getDisplayRunName(run)
+        };
+    }
+
+    private _getMergedMetrics(): { training: MergedMetric[], system: MergedMetric[] } {
+        const mergedMetrics = this._manager.mergeMetrics();
+        for (const metric of [...mergedMetrics.training, ...mergedMetrics.system]) {
+            for (const dataset of metric.datasets) {
+                dataset.runName = this._customRunNames[dataset.runId] || dataset.runName;
+            }
+        }
+        return mergedMetrics;
+    }
+
+    private async _renameRun(runId: string): Promise<void> {
+        const run = this._manager.getState().runs.get(runId);
+        if (!run) {
+            return;
+        }
+
+        const customName = await vscode.window.showInputBox({
+            title: 'Set Custom Run Name',
+            prompt: 'Stored by this VS Code extension. Leave empty to restore the original W&B name.',
+            value: this._customRunNames[runId] || run.runName,
+            placeHolder: run.runName,
+            validateInput: validateCustomRunName
+        });
+        if (customName === undefined) {
+            return;
+        }
+
+        const updatedNames = await setCustomRunName(
+            this._nameStorage,
+            runId,
+            customName
+        );
+        const refreshes: Promise<void>[] = [];
+        for (const panel of MultiRunViewerPanel.panels) {
+            if (panel._disposed) {
+                continue;
+            }
+            panel._customRunNames = updatedNames;
+            refreshes.push(panel._update(false));
+        }
+        await Promise.all(refreshes);
+    }
+
+    private async _handleSyncRuns(runIds: string[]): Promise<void> {
+        const uniqueRunIds = Array.from(new Set(runIds));
+        const runs = uniqueRunIds
+            .map(runId => this._manager.getState().runs.get(runId))
+            .filter((run): run is RunScanResult => Boolean(run));
+        if (runs.length === 0) {
+            vscode.window.showInformationMessage('Select at least one run to sync.');
+            return;
+        }
+
+        const confirmation = await vscode.window.showWarningMessage(
+            `Sync ${runs.length} run${runs.length === 1 ? '' : 's'} to the W&B cloud using the local wandb CLI? This uploads run data.`,
+            { modal: true },
+            'Sync'
+        );
+        if (confirmation !== 'Sync') {
+            return;
+        }
+
+        let syncedCount = 0;
+        let failedCount = 0;
+        let cliUnavailable = false;
+        await vscode.window.withProgress(
+            {
+                location: vscode.ProgressLocation.Notification,
+                title: 'Syncing W&B runs...',
+                cancellable: true
+            },
+            async (progress, cancellationToken) => {
+                for (let index = 0; index < runs.length; index++) {
+                    if (cancellationToken.isCancellationRequested) {
+                        break;
+                    }
+                    progress.report({
+                        message: `${index + 1}/${runs.length}`,
+                        increment: 100 / runs.length
+                    });
+                    try {
+                        await this._runWandbSync(runs[index].filePath, cancellationToken);
+                        syncedCount++;
+                    } catch (error) {
+                        failedCount++;
+                        if (
+                            error instanceof Error &&
+                            error.message === 'wandb-cli-unavailable'
+                        ) {
+                            cliUnavailable = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        );
+
+        await this._update(true);
+        if (cliUnavailable) {
+            vscode.window.showErrorMessage(
+                'The wandb CLI is not installed or is not available on PATH.'
+            );
+        } else if (failedCount > 0) {
+            vscode.window.showWarningMessage(
+                `${syncedCount} run${syncedCount === 1 ? '' : 's'} synced; ${failedCount} failed. Check your W&B login and network connection.`
+            );
+        } else if (syncedCount > 0) {
+            vscode.window.showInformationMessage(
+                `${syncedCount} run${syncedCount === 1 ? '' : 's'} synced to W&B.`
+            );
+        }
+    }
+
+    private _runWandbSync(
+        filePath: string,
+        cancellationToken: vscode.CancellationToken
+    ): Promise<void> {
+        return new Promise((resolve, reject) => {
+            const childProcess = spawn('wandb', ['sync', filePath], {
+                cwd: path.dirname(filePath),
+                shell: false,
+                stdio: 'ignore',
+                windowsHide: true
+            });
+            let settled = false;
+            const cancellation = cancellationToken.onCancellationRequested(() => {
+                childProcess.kill();
+            });
+            const finish = (error?: Error): void => {
+                if (settled) {
+                    return;
+                }
+                settled = true;
+                cancellation.dispose();
+                if (error) {
+                    reject(error);
+                } else {
+                    resolve();
+                }
+            };
+
+            childProcess.on('error', error => {
+                finish(new Error((error as NodeJS.ErrnoException).code === 'ENOENT'
+                    ? 'wandb-cli-unavailable'
+                    : 'wandb-sync-failed'));
+            });
+            childProcess.on('close', code => {
+                finish(code === 0 ? undefined : new Error('wandb-sync-failed'));
+            });
         });
     }
 
@@ -321,7 +658,7 @@ export class MultiRunViewerPanel {
         await this._panel.webview.postMessage({
             command: 'runColorsUpdated',
             runColors,
-            mergedMetrics: this._manager.mergeMetrics()
+            mergedMetrics: this._getMergedMetrics()
         });
     }
 
@@ -340,7 +677,7 @@ export class MultiRunViewerPanel {
 
         if (scanForRuns) {
             const t1 = Date.now();
-            const discoveredRuns = await scanFolderForRuns(this._folderPath);
+            const discoveredRuns = await this._scanFolders();
             const scanTime = Date.now() - t1;
             console.log(`[1] Folder scan: ${scanTime}ms (found ${discoveredRuns.length} runs)`);
 
@@ -379,20 +716,16 @@ export class MultiRunViewerPanel {
 
         const t4 = Date.now();
         const selectedRunIds = this._manager.getSelectedRunIds();
-        const mergedMetrics = this._manager.mergeMetrics();
+        const mergedMetrics = this._getMergedMetrics();
         console.log(`[4] Merge metrics: ${Date.now() - t4}ms (${mergedMetrics.training.length} training, ${mergedMetrics.system.length} system)`);
 
-        // Load logo
-        const t5 = Date.now();
-        const logoPath = path.join(this._extensionUri.fsPath, 'media', 'bread_alpha.png');
-        let logoBase64 = '';
-        if (fs.existsSync(logoPath)) {
-            logoBase64 = fs.readFileSync(logoPath).toString('base64');
-        }
-        console.log(`[5] Load logo: ${Date.now() - t5}ms`);
-
         const t6 = Date.now();
-        const htmlContent = this._getHtmlContent(runs, selectedRunIds, mergedMetrics, logoBase64);
+        const displayRuns = runs.map(run => this._withDisplayRunName(run));
+        const htmlContent = this._getHtmlContent(
+            displayRuns,
+            selectedRunIds,
+            mergedMetrics
+        );
         console.log(`[6] Generate HTML: ${Date.now() - t6}ms (${Math.round(htmlContent.length / 1024)}KB)`);
 
         const t7 = Date.now();
@@ -405,8 +738,7 @@ export class MultiRunViewerPanel {
     private _getHtmlContent(
         runs: RunScanResult[],
         selectedRunIds: string[],
-        mergedMetrics: { training: MergedMetric[], system: MergedMetric[] },
-        logoBase64: string
+        mergedMetrics: { training: MergedMetric[], system: MergedMetric[] }
     ): string {
         const selectedSet = new Set(selectedRunIds);
         const selectedRuns = runs.filter(run => selectedSet.has(run.runId));
@@ -416,20 +748,36 @@ export class MultiRunViewerPanel {
         const runListHtml = runs.map(run => {
             const isSelected = selectedSet.has(run.runId);
             const color = this._manager.getRunColor(run.runId);
+            const contentStatus = this._manager.getRunContentStatus(run.runId);
+            const isEmpty = contentStatus === 'empty';
+            const tooltip = isEmpty
+                ? `${run.runName}\nThis run is empty (no metric data).`
+                : run.runName;
+            const syncTitle = run.syncStatus === 'synced'
+                ? 'Synced to W&B'
+                : run.syncStatus === 'unsynced'
+                    ? 'Not synced to W&B'
+                    : 'Sync status unknown';
             return `
                 <div
-                    class="run-item"
+                    class="run-item${isEmpty ? ' empty-run' : ''}"
                     data-run-name="${this._escapeHtml(run.runName)}"
                     data-run-id="${this._escapeHtml(run.runId)}"
                     data-run-project="${this._escapeHtml(run.project || '')}"
                     data-created-at="${run.createdAt}"
                     data-updated-at="${run.lastModified}"
+                    data-content-status="${contentStatus}"
+                    oncontextmenu="openRunContextMenu(event, this)"
                 >
                     <input type="checkbox" ${isSelected ? 'checked' : ''} onchange="toggleRun(this.closest('.run-item').dataset.runId)">
                     <div class="run-color" style="background: ${color}"></div>
                     <div class="run-info">
-                        <div class="run-name">${this._escapeHtml(run.runName)}</div>
-                        <div class="run-meta">ID: ${this._escapeHtml(run.runId)}</div>
+                        <div class="run-name" title="${this._escapeHtml(tooltip)}">${this._escapeHtml(run.runName)}</div>
+                        <div class="run-meta">
+                            <span class="sync-status ${run.syncStatus}" title="${syncTitle}" aria-label="${syncTitle}">☁</span>
+                            <span>ID: ${this._escapeHtml(run.runId)}</span>
+                            <span class="run-created" title="${this._escapeHtml(this._formatTimestamp(run.createdAt))}">· ${this._escapeHtml(this._formatShortTimestamp(run.createdAt))}</span>
+                        </div>
                     </div>
                 </div>
             `;
@@ -505,10 +853,17 @@ export class MultiRunViewerPanel {
 
             <div class="sidebar-content active" id="runsContent">
                 <div class="run-list-tools">
-                    <input type="search" id="runFilterInput" placeholder="Filter runs…" aria-label="Filter runs by name, ID, or project">
+                    <input type="search" id="runFilterInput" placeholder="Filter runs (glob)…" aria-label="Filter runs by glob pattern over name, ID, or project">
                     <select id="runSortSelect" aria-label="Sort runs">
                         ${this._getRunSortOptionsHtml()}
                     </select>
+                    <button
+                        type="button"
+                        class="run-empty-filter"
+                        id="hideEmptyRunsBtn"
+                        aria-pressed="false"
+                        title="Hide runs confirmed to have no metric data"
+                    >Hide empty</button>
                 </div>
                 <div id="runList">${runListHtml}</div>
                 <div class="run-filter-empty" id="runFilterEmpty">No runs match this filter.</div>
@@ -521,10 +876,11 @@ export class MultiRunViewerPanel {
 
         <div class="main-content">
             <div class="controls-bar-wrapper">
-                ${logoBase64 ? `<img src="data:image/png;base64,${logoBase64}" alt="Bread Logo" class="logo">` : ''}
+                <span class="logo" role="img" aria-label="Sparkles">✨</span>
                 ${getControlsBarHtml(`
                     <div class="control-group">
                         <button class="toggle-btn reload-runs-btn" id="reloadRunsBtn" onclick="reloadSelectedRuns('reloadRunsBtn')" title="Reload data for selected runs" ${selectedRunIds.length === 0 ? 'disabled' : ''}>⟳ Reload runs</button>
+                        <button class="toggle-btn sync-runs-btn" id="syncRunsBtn" onclick="syncSelectedRuns()" title="Upload selected runs using the local wandb CLI" ${selectedRunIds.length === 0 ? 'disabled' : ''}>☁ Sync selected</button>
                     </div>
                 `)}
             </div>
@@ -549,8 +905,16 @@ export class MultiRunViewerPanel {
         </div>
     </div>
 
+    <div class="run-context-menu" id="runContextMenu" role="menu" aria-hidden="true">
+        <button type="button" role="menuitem" onclick="runContextAction('copy')">Copy run ID</button>
+        <button type="button" role="menuitem" onclick="runContextAction('isolate')">Show only this run</button>
+        <button type="button" role="menuitem" onclick="runContextAction('rename')">Set custom run name…</button>
+        <button type="button" role="menuitem" onclick="runContextAction('sync')">Sync this run</button>
+    </div>
+
     ${getModalHtml(`
         <button class="toggle-btn reload-runs-btn" id="modalReloadRunsBtn" onclick="reloadSelectedRuns('modalReloadRunsBtn')" title="Reload data for selected runs" ${selectedRunIds.length === 0 ? 'disabled' : ''}>⟳ Reload runs</button>
+        <button class="toggle-btn sync-runs-btn" id="modalSyncRunsBtn" onclick="syncSelectedRuns()" title="Upload selected runs using the local wandb CLI" ${selectedRunIds.length === 0 ? 'disabled' : ''}>☁ Sync selected</button>
     `)}
 
     <script>
@@ -785,6 +1149,7 @@ export class MultiRunViewerPanel {
             let trainingMetrics = ${JSON.stringify(mergedMetrics.training)};
             let systemMetrics = ${JSON.stringify(mergedMetrics.system)};
             let activeFullscreenMetric = null;
+            let fullscreenRenderToken = 0;
             const MIN_CHART_HEIGHT = 160;
             const MAX_CHART_HEIGHT = 1200;
             const DEFAULT_CHART_HEIGHT = 200;
@@ -871,15 +1236,31 @@ export class MultiRunViewerPanel {
             // Run filtering and sorting
             const runFilterInput = document.getElementById('runFilterInput');
             const runSortSelect = document.getElementById('runSortSelect');
+            const hideEmptyRunsBtn = document.getElementById('hideEmptyRunsBtn');
             const runList = document.getElementById('runList');
             const runFilterEmpty = document.getElementById('runFilterEmpty');
             const runCountHeading = document.getElementById('runCountHeading');
 
+            function globToRegExp(globPattern) {
+                const regexPattern = Array.from(globPattern).map(character => {
+                    if (character === '*') return '.*';
+                    if (character === '?') return '.';
+                    const isRegexSpecial = '^$+.()|{}[]'.includes(character) ||
+                        character.charCodeAt(0) === 92;
+                    return isRegexSpecial
+                        ? String.fromCharCode(92) + character
+                        : character;
+                }).join('');
+                return new RegExp(regexPattern, 'i');
+            }
+
             function applyRunListView(shouldPersist = true) {
                 if (!runFilterInput || !runSortSelect || !runList) return;
 
-                const filterText = runFilterInput.value.trim().toLocaleLowerCase();
+                const filterText = runFilterInput.value.trim();
+                const filterPattern = globToRegExp(filterText);
                 const sortMode = runSortSelect.value;
+                const hideEmptyRuns = hideEmptyRunsBtn?.getAttribute('aria-pressed') === 'true';
                 const runItems = Array.from(runList.querySelectorAll('.run-item'));
                 const compareText = (a, b) => a.localeCompare(b, undefined, {
                     numeric: true,
@@ -910,19 +1291,35 @@ export class MultiRunViewerPanel {
                 });
 
                 let visibleCount = 0;
+                let emptyCount = 0;
                 runItems.forEach(item => {
+                    const isEmpty = item.dataset.contentStatus === 'empty';
+                    if (isEmpty) {
+                        emptyCount++;
+                    }
                     const searchableText = [
                         item.dataset.runName,
                         item.dataset.runId,
                         item.dataset.runProject
-                    ].join(' ').toLocaleLowerCase();
-                    const isVisible = !filterText || searchableText.includes(filterText);
+                    ].join(' ');
+                    const matchesText = !filterText || filterPattern.test(searchableText);
+                    const isVisible = matchesText && (!hideEmptyRuns || !isEmpty);
                     item.hidden = !isVisible;
                     if (isVisible) {
                         visibleCount++;
                     }
                     runList.appendChild(item);
                 });
+
+                if (hideEmptyRunsBtn) {
+                    hideEmptyRunsBtn.disabled = emptyCount === 0;
+                    hideEmptyRunsBtn.classList.toggle('active', hideEmptyRuns);
+                    hideEmptyRunsBtn.title = emptyCount === 0
+                        ? 'No runs are currently confirmed empty'
+                        : hideEmptyRuns
+                            ? 'Show runs confirmed to have no metric data'
+                            : 'Hide runs confirmed to have no metric data';
+                }
 
                 if (runFilterEmpty) {
                     runFilterEmpty.classList.toggle('visible', visibleCount === 0);
@@ -935,7 +1332,8 @@ export class MultiRunViewerPanel {
                 if (shouldPersist) {
                     updatePersistedViewState({
                         runFilter: runFilterInput.value,
-                        runSort: sortMode
+                        runSort: sortMode,
+                        hideEmptyRuns
                     });
                 }
             }
@@ -952,11 +1350,24 @@ export class MultiRunViewerPanel {
             ) {
                 runSortSelect.value = persistedViewState.runSort;
             }
+            if (hideEmptyRunsBtn) {
+                hideEmptyRunsBtn.setAttribute(
+                    'aria-pressed',
+                    persistedViewState.hideEmptyRuns === true ? 'true' : 'false'
+                );
+            }
             if (runFilterInput) {
                 runFilterInput.addEventListener('input', () => applyRunListView());
             }
             if (runSortSelect) {
                 runSortSelect.addEventListener('change', () => applyRunListView());
+            }
+            if (hideEmptyRunsBtn) {
+                hideEmptyRunsBtn.addEventListener('click', () => {
+                    const isActive = hideEmptyRunsBtn.getAttribute('aria-pressed') === 'true';
+                    hideEmptyRunsBtn.setAttribute('aria-pressed', isActive ? 'false' : 'true');
+                    applyRunListView();
+                });
             }
             applyRunListView(false);
 
@@ -1349,16 +1760,99 @@ export class MultiRunViewerPanel {
             }
 
             // Run selection
+            function isFullscreenCurrentlyOpen() {
+                return document.getElementById('fullscreenModal')?.classList.contains('active') === true;
+            }
+
             function toggleRun(runId) {
-                vscode.postMessage({ command: 'toggleRun', runId });
+                vscode.postMessage({
+                    command: 'toggleRun',
+                    runId,
+                    fullscreenOpen: isFullscreenCurrentlyOpen()
+                });
             }
 
             function selectAllRuns() {
-                vscode.postMessage({ command: 'selectAll' });
+                vscode.postMessage({
+                    command: 'selectAll',
+                    fullscreenOpen: isFullscreenCurrentlyOpen()
+                });
             }
 
             function deselectAllRuns() {
-                vscode.postMessage({ command: 'deselectAll' });
+                vscode.postMessage({
+                    command: 'deselectAll',
+                    fullscreenOpen: isFullscreenCurrentlyOpen()
+                });
+            }
+
+            const runContextMenu = document.getElementById('runContextMenu');
+            let contextRunId = null;
+
+            function hideRunContextMenu() {
+                if (!runContextMenu) return;
+                runContextMenu.classList.remove('visible');
+                runContextMenu.setAttribute('aria-hidden', 'true');
+                contextRunId = null;
+            }
+
+            function openRunContextMenu(event, runItem) {
+                if (!runContextMenu || !runItem || !runItem.dataset.runId) return;
+                event.preventDefault();
+                event.stopPropagation();
+                contextRunId = runItem.dataset.runId;
+                runContextMenu.classList.add('visible');
+                runContextMenu.setAttribute('aria-hidden', 'false');
+
+                const menuRect = runContextMenu.getBoundingClientRect();
+                const left = Math.min(event.clientX, window.innerWidth - menuRect.width - 8);
+                const top = Math.min(event.clientY, window.innerHeight - menuRect.height - 8);
+                runContextMenu.style.left = Math.max(8, left) + 'px';
+                runContextMenu.style.top = Math.max(8, top) + 'px';
+            }
+
+            function runContextAction(action) {
+                const runId = contextRunId;
+                hideRunContextMenu();
+                if (!runId) return;
+
+                if (action === 'copy') {
+                    vscode.postMessage({ command: 'copyRunId', runId });
+                } else if (action === 'isolate') {
+                    vscode.postMessage({
+                        command: 'showOnlyRun',
+                        runId,
+                        fullscreenOpen: isFullscreenCurrentlyOpen()
+                    });
+                } else if (action === 'rename') {
+                    vscode.postMessage({ command: 'renameRun', runId });
+                } else if (action === 'sync') {
+                    setSyncButtonsBusy(true);
+                    vscode.postMessage({ command: 'syncRuns', runIds: [runId] });
+                }
+            }
+
+            document.addEventListener('click', event => {
+                if (runContextMenu && !runContextMenu.contains(event.target)) {
+                    hideRunContextMenu();
+                }
+            });
+            document.addEventListener('scroll', hideRunContextMenu, true);
+            window.addEventListener('blur', hideRunContextMenu);
+
+            function setSyncButtonsBusy(isBusy, canSync = true) {
+                ['syncRunsBtn', 'modalSyncRunsBtn'].forEach(buttonId => {
+                    const button = document.getElementById(buttonId);
+                    if (!button) return;
+                    button.textContent = isBusy ? '☁ Syncing…' : '☁ Sync selected';
+                    button.disabled = isBusy || !canSync;
+                    button.toggleAttribute('aria-busy', isBusy);
+                });
+            }
+
+            function syncSelectedRuns() {
+                setSyncButtonsBusy(true);
+                vscode.postMessage({ command: 'syncRuns' });
             }
 
             function reloadSelectedRuns(buttonId) {
@@ -1373,6 +1867,10 @@ export class MultiRunViewerPanel {
 
             window.addEventListener('message', event => {
                 const message = event.data;
+                if (message.command === 'syncRunsComplete') {
+                    setSyncButtonsBusy(false, message.canSync);
+                    return;
+                }
                 if (message.command !== 'reloadSelectedRunsComplete') return;
 
                 ['reloadRunsBtn', 'modalReloadRunsBtn'].forEach(buttonId => {
@@ -1500,6 +1998,26 @@ export class MultiRunViewerPanel {
                 });
             }
 
+            function updateRunContentStatuses(runContentStatuses) {
+                if (!runContentStatuses || typeof runContentStatuses !== 'object') return;
+
+                document.querySelectorAll('.run-item[data-run-id]').forEach(item => {
+                    const status = runContentStatuses[item.dataset.runId];
+                    if (typeof status !== 'string') return;
+                    item.dataset.contentStatus = status;
+                    item.classList.toggle('empty-run', status === 'empty');
+
+                    const runName = item.dataset.runName || '';
+                    const nameElement = item.querySelector('.run-name');
+                    if (nameElement) {
+                        nameElement.title = status === 'empty'
+                            ? runName + '\\nThis run is empty (no metric data).'
+                            : runName;
+                    }
+                });
+                applyRunListView(false);
+            }
+
             function updateMergedMetrics(mergedMetrics) {
                 trainingMetrics = mergedMetrics.training || [];
                 systemMetrics = mergedMetrics.system || [];
@@ -1530,6 +2048,9 @@ export class MultiRunViewerPanel {
 
             window.addEventListener('message', event => {
                 const message = event.data;
+                if (message.runContentStatuses) {
+                    updateRunContentStatuses(message.runContentStatuses);
+                }
                 if (
                     (
                         message.command !== 'runDataUpdated' &&
@@ -1556,9 +2077,14 @@ export class MultiRunViewerPanel {
                     metricName: metric.metricName,
                     type
                 };
+                vscode.postMessage({
+                    command: 'fullscreenStateChanged',
+                    open: true
+                });
                 if (shouldPersist) {
                     updatePersistedViewState({
-                        fullscreenMetric: activeFullscreenMetric
+                        fullscreenMetric: activeFullscreenMetric,
+                        fullscreenOpen: true
                     });
                 }
 
@@ -1576,26 +2102,53 @@ export class MultiRunViewerPanel {
                 document.getElementById('modalLogXBtn').classList.toggle('active', modalLogX);
                 document.getElementById('modalLogYBtn').classList.toggle('active', modalLogY);
 
-                if (modalChart) modalChart.destroy();
-
-                const ctx = document.getElementById('modalChart');
-                const datasets = createRunDatasets(metric, true);
-                const sourceChart = ensureOverviewChart(metric, type);
-
-                modalChart = createUnifiedChart(ctx, datasets, metric.metricName, {
-                    isModal: true,
-                    enableZoom: true
-                });
-                modalChart.$persistFullscreenState = true;
-                if (sourceChart) {
-                    copyRunVisibility(sourceChart, modalChart, false);
-                    modalChart.$isolatedRunKey = sourceChart.$isolatedRunKey || null;
-                    modalChart.$preIsolationVisibility =
-                        sourceChart.$preIsolationVisibility || null;
-                    modalChart.$sourceChart = sourceChart;
-                    modalChart.update('none');
+                const renderToken = ++fullscreenRenderToken;
+                if (modalChart) {
+                    modalChart.destroy();
+                    modalChart = null;
                 }
-                updateChartAxes(modalChart, modalLogX, modalLogY);
+
+                requestAnimationFrame(() => {
+                    const modal = document.getElementById('fullscreenModal');
+                    if (
+                        renderToken !== fullscreenRenderToken ||
+                        !modal ||
+                        !modal.classList.contains('active')
+                    ) {
+                        return;
+                    }
+
+                    const currentMetrics = type === 'training'
+                        ? trainingMetrics
+                        : systemMetrics;
+                    const currentMetric = currentMetrics.find(candidate =>
+                        candidate.metricName === metric.metricName
+                    );
+                    if (!currentMetric) {
+                        closeFullscreen();
+                        return;
+                    }
+
+                    const ctx = document.getElementById('modalChart');
+                    const datasets = createRunDatasets(currentMetric, true);
+                    const sourceChart = ensureOverviewChart(currentMetric, type);
+                    modalChart = createUnifiedChart(
+                        ctx,
+                        datasets,
+                        currentMetric.metricName,
+                        { isModal: true, enableZoom: true }
+                    );
+                    modalChart.$persistFullscreenState = true;
+                    if (sourceChart) {
+                        copyRunVisibility(sourceChart, modalChart, false);
+                        modalChart.$isolatedRunKey = sourceChart.$isolatedRunKey || null;
+                        modalChart.$preIsolationVisibility =
+                            sourceChart.$preIsolationVisibility || null;
+                        modalChart.$sourceChart = sourceChart;
+                        modalChart.update('none');
+                    }
+                    updateChartAxes(modalChart, modalLogX, modalLogY);
+                });
             }
 
             // Lazy chart initialization using IntersectionObserver
@@ -1642,6 +2195,8 @@ export class MultiRunViewerPanel {
 
             const savedFullscreenMetric = persistedViewState.fullscreenMetric;
             if (
+                ${this._isFullscreenOpen ? 'true' : 'false'} &&
+                persistedViewState.fullscreenOpen === true &&
                 savedFullscreenMetric &&
                 typeof savedFullscreenMetric.metricName === 'string' &&
                 (
@@ -1663,7 +2218,10 @@ export class MultiRunViewerPanel {
                             false
                         );
                     } else {
-                        updatePersistedViewState({ fullscreenMetric: null });
+                        updatePersistedViewState({
+                            fullscreenMetric: null,
+                            fullscreenOpen: false
+                        });
                     }
                 });
             }
@@ -1731,12 +2289,20 @@ export class MultiRunViewerPanel {
                 align-items: center;
                 gap: 8px;
                 padding-left: 15px;
+                position: sticky;
+                top: 0;
+                z-index: 100;
+                background: var(--vscode-editor-background);
             }
             .controls-bar-wrapper .logo {
                 width: 28px;
                 height: 28px;
-                object-fit: contain;
                 flex-shrink: 0;
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                font-size: 24px;
+                line-height: 1;
             }
             .sidebar-controls {
                 display: flex;
@@ -1804,6 +2370,8 @@ export class MultiRunViewerPanel {
                 top: -10px;
                 z-index: 5;
                 display: grid;
+                grid-template-columns: minmax(72px, 1fr) minmax(92px, 0.9fr) auto;
+                align-items: center;
                 gap: 6px;
                 margin: -2px -2px 8px;
                 padding: 2px 2px 8px;
@@ -1821,6 +2389,30 @@ export class MultiRunViewerPanel {
                 background: var(--vscode-input-background);
                 font-family: var(--vscode-font-family);
                 font-size: 0.8em;
+            }
+            .run-empty-filter {
+                min-width: 0;
+                padding: 5px 7px;
+                border: 1px solid var(--vscode-button-border, var(--vscode-panel-border));
+                border-radius: 3px;
+                color: var(--vscode-foreground);
+                background: transparent;
+                font-family: var(--vscode-font-family);
+                font-size: 0.8em;
+                white-space: nowrap;
+                cursor: pointer;
+            }
+            .run-empty-filter:hover:not(:disabled) {
+                background: var(--vscode-toolbar-hoverBackground, var(--vscode-list-hoverBackground));
+            }
+            .run-empty-filter.active {
+                color: var(--vscode-button-foreground);
+                background: var(--vscode-button-background);
+                border-color: var(--vscode-button-background);
+            }
+            .run-empty-filter:disabled {
+                cursor: default;
+                opacity: 0.45;
             }
             .run-list-tools input:focus,
             .run-list-tools select:focus {
@@ -1853,6 +2445,11 @@ export class MultiRunViewerPanel {
             .run-item:hover {
                 background: var(--vscode-list-hoverBackground);
             }
+            .run-item.empty-run .run-info,
+            .run-item.empty-run .run-color {
+                opacity: 0.48;
+                filter: grayscale(1);
+            }
             .run-item input[type="checkbox"] {
                 width: 16px;
                 height: 16px;
@@ -1878,6 +2475,69 @@ export class MultiRunViewerPanel {
             .run-meta {
                 font-size: 0.7em;
                 color: var(--vscode-descriptionForeground);
+                display: flex;
+                align-items: center;
+                gap: 4px;
+                min-width: 0;
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+            }
+            .run-created {
+                overflow: hidden;
+                text-overflow: ellipsis;
+            }
+            .sync-status {
+                position: relative;
+                display: inline-flex;
+                width: 14px;
+                flex: 0 0 14px;
+                justify-content: center;
+                color: var(--vscode-descriptionForeground);
+            }
+            .sync-status.synced {
+                color: var(--vscode-testing-iconPassed, #73c991);
+            }
+            .sync-status.unsynced::after {
+                content: '';
+                position: absolute;
+                left: 1px;
+                top: 6px;
+                width: 13px;
+                height: 1px;
+                background: var(--vscode-testing-iconFailed, #f14c4c);
+                transform: rotate(-42deg);
+                transform-origin: center;
+            }
+            .run-context-menu {
+                position: fixed;
+                z-index: 2000;
+                display: none;
+                min-width: 210px;
+                padding: 4px;
+                border: 1px solid var(--vscode-menu-border, var(--vscode-panel-border));
+                border-radius: 4px;
+                background: var(--vscode-menu-background, var(--vscode-editorWidget-background));
+                box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35);
+            }
+            .run-context-menu.visible {
+                display: block;
+            }
+            .run-context-menu button {
+                display: block;
+                width: 100%;
+                padding: 6px 10px;
+                border: 0;
+                border-radius: 2px;
+                color: var(--vscode-menu-foreground, var(--vscode-foreground));
+                background: transparent;
+                text-align: left;
+                font: inherit;
+                cursor: pointer;
+            }
+            .run-context-menu button:hover {
+                color: var(--vscode-menu-selectionForeground, var(--vscode-list-activeSelectionForeground));
+                background: var(--vscode-menu-selectionBackground, var(--vscode-list-activeSelectionBackground));
             }
             .metadata-section {
                 margin-bottom: 8px;
@@ -2245,6 +2905,20 @@ export class MultiRunViewerPanel {
         return new Date(timestamp).toLocaleString();
     }
 
+    private _formatShortTimestamp(timestamp: number): string {
+        if (!Number.isFinite(timestamp) || timestamp <= 0) {
+            return 'Unknown';
+        }
+
+        return new Date(timestamp).toLocaleString(undefined, {
+            year: 'numeric',
+            month: 'short',
+            day: 'numeric',
+            hour: '2-digit',
+            minute: '2-digit'
+        });
+    }
+
     private _formatConfigValue(value: any): string {
         if (value === null || value === undefined) {
             return '<span style="color: var(--vscode-descriptionForeground);">null</span>';
@@ -2281,7 +2955,8 @@ export class MultiRunViewerPanel {
     private async _handleGenerateAIContext(action: string) {
         // Get selected runs
         const selectedRuns = this._manager.getRuns()
-            .filter(r => this._manager.isRunSelected(r.runId));
+            .filter(r => this._manager.isRunSelected(r.runId))
+            .map(run => this._withDisplayRunName(run));
 
         if (selectedRuns.length === 0) {
             vscode.window.showWarningMessage('Please select at least one run to generate AI context.');
@@ -2427,11 +3102,16 @@ export class MultiRunViewerPanel {
 
     public dispose() {
         this._disposed = true;
-        MultiRunViewerPanel.currentPanel = undefined;
-        this._panel.dispose();
-        if (this._folderWatcher) {
-            this._folderWatcher.dispose();
+        MultiRunViewerPanel.panels.delete(this);
+        if (this._initialUpdateTimer) {
+            clearTimeout(this._initialUpdateTimer);
+            this._initialUpdateTimer = null;
         }
+        this._panel.dispose();
+        for (const watcher of this._folderWatchers.values()) {
+            watcher.dispose();
+        }
+        this._folderWatchers.clear();
         while (this._disposables.length) {
             const disposable = this._disposables.pop();
             if (disposable) {
