@@ -985,6 +985,14 @@ export function getChartScript(): string {
             return dataset && (dataset._runId || dataset._runName);
         }
 
+        function chartHasRunKey(chart, runKey) {
+            return Boolean(
+                chart &&
+                runKey &&
+                chart.data.datasets.some(dataset => getDatasetRunKey(dataset) === runKey)
+            );
+        }
+
         function withColorAlpha(color, alpha) {
             if (typeof color !== 'string') return color;
 
@@ -1007,6 +1015,8 @@ export function getChartScript(): string {
 
                 dataset.borderColor = baseStyle.borderColor;
                 dataset.backgroundColor = baseStyle.backgroundColor;
+                dataset.pointBackgroundColor = baseStyle.pointBackgroundColor;
+                dataset.pointBorderColor = baseStyle.pointBorderColor;
                 dataset.borderWidth = baseStyle.borderWidth;
                 delete dataset.$hoverBaseStyle;
             });
@@ -1016,6 +1026,16 @@ export function getChartScript(): string {
             if (!chart) return;
             if (!runKey) {
                 clearHoveredRun(chart);
+                return;
+            }
+            if (!chartHasRunKey(chart, runKey)) {
+                const hadHighlightedRun = Boolean(chart.$hoveredRunKey);
+                restoreHoveredRunStyles(chart);
+                chart.$hoveredRunKey = null;
+                chart.$hoverHighlightsLine = false;
+                if (hadHighlightedRun) {
+                    chart.update('none');
+                }
                 return;
             }
             if (
@@ -1031,6 +1051,8 @@ export function getChartScript(): string {
                     dataset.$hoverBaseStyle = {
                         borderColor: dataset.borderColor,
                         backgroundColor: dataset.backgroundColor,
+                        pointBackgroundColor: dataset.pointBackgroundColor,
+                        pointBorderColor: dataset.pointBorderColor,
                         borderWidth: dataset.borderWidth
                     };
 
@@ -1042,6 +1064,18 @@ export function getChartScript(): string {
                     dataset.backgroundColor = !isHoveredRun
                         ? withColorAlpha(baseStyle.backgroundColor, 0.08)
                         : baseStyle.backgroundColor;
+                    dataset.pointBackgroundColor = !isHoveredRun
+                        ? withColorAlpha(
+                            baseStyle.pointBackgroundColor || baseStyle.borderColor,
+                            0.08
+                        )
+                        : baseStyle.pointBackgroundColor;
+                    dataset.pointBorderColor = !isHoveredRun
+                        ? withColorAlpha(
+                            baseStyle.pointBorderColor || baseStyle.borderColor,
+                            0.18
+                        )
+                        : baseStyle.pointBorderColor;
                     dataset.borderWidth = isHoveredRun
                         ? Math.max(Number(baseStyle.borderWidth) || 2, 2) + 2
                         : baseStyle.borderWidth;
@@ -1053,14 +1087,33 @@ export function getChartScript(): string {
             chart.update('none');
         }
 
-        function clearHoveredRun(chart, update = true) {
+        function clearHoveredRun(chart, update = true, restoreFocus = true) {
             if (!chart || !chart.$hoveredRunKey) return;
 
             restoreHoveredRunStyles(chart);
             chart.$hoveredRunKey = null;
             chart.$hoverHighlightsLine = false;
+            if (restoreFocus && chart.$focusedRunKey) {
+                if (chartHasRunKey(chart, chart.$focusedRunKey)) {
+                    setHoveredRun(chart, chart.$focusedRunKey, true);
+                } else if (update) {
+                    chart.update('none');
+                }
+                return;
+            }
             if (update) {
                 chart.update('none');
+            }
+        }
+
+        function setFocusedRun(chart, runKey) {
+            if (!chart) return;
+
+            chart.$focusedRunKey = runKey || null;
+            if (chart.$focusedRunKey) {
+                setHoveredRun(chart, chart.$focusedRunKey, true);
+            } else {
+                clearHoveredRun(chart);
             }
         }
 
@@ -1359,7 +1412,9 @@ export function getChartScript(): string {
         function updateChartSmoothing(chart, smoothing, showRawData = true) {
             if (!chart || !chart.data.datasets) return;
 
-            clearHoveredRun(chart, false);
+            const focusedRunKey = chart.$focusedRunKey || null;
+            chart.$focusedRunKey = null;
+            clearHoveredRun(chart, false, false);
             const originals = chart.data.datasets.filter(d => d._isOriginal);
             if (originals.length === 0) return;
             const originalVisibility = originals.map(d => {
@@ -1379,6 +1434,8 @@ export function getChartScript(): string {
                         tension: 0.1,
                         pointRadius: d._originalData.length > 100 ? 0 : 2,
                         pointHoverRadius: 4,
+                        pointBackgroundColor: d._originalColor + '59',
+                        pointBorderColor: d._originalColor + '99',
                         borderWidth: 2,
                         _originalData: d._originalData,
                         _originalColor: d._originalColor,
@@ -1404,6 +1461,8 @@ export function getChartScript(): string {
                             tension: 0.1,
                             pointRadius: 0,
                             pointHoverRadius: 3,
+                            pointBackgroundColor: 'transparent',
+                            pointBorderColor: 'transparent',
                             borderWidth: 1,
                             _originalData: d._originalData,
                             _originalColor: d._originalColor,
@@ -1424,6 +1483,8 @@ export function getChartScript(): string {
                         tension: 0.1,
                         pointRadius: d._originalData.length > 100 ? 0 : 2,
                         pointHoverRadius: 4,
+                        pointBackgroundColor: d._originalColor + '59',
+                        pointBorderColor: d._originalColor + '99',
                         borderWidth: 2,
                         _originalData: d._originalData,
                         _originalColor: d._originalColor,
@@ -1440,7 +1501,12 @@ export function getChartScript(): string {
                 chart.setDatasetVisibility(datasetIndex, dataset._runVisible);
                 delete dataset._runVisible;
             });
-            chart.update('none');
+            chart.$focusedRunKey = focusedRunKey;
+            if (focusedRunKey) {
+                setHoveredRun(chart, focusedRunKey, true);
+            } else {
+                chart.update('none');
+            }
         }
 
         /**
@@ -1703,6 +1769,8 @@ export function getChartScript(): string {
                     tension: 0.1,
                     pointRadius: dataset.data.length > 50 ? 0 : 2,
                     pointHoverRadius: 4,
+                    pointBackgroundColor: dataset.color + '59',
+                    pointBorderColor: dataset.color + '99',
                     borderWidth: 2,
                     _originalData: dataset.data.map(d => ({ x: d.step, y: d.value })),
                     _originalColor: dataset.color,
@@ -1814,6 +1882,8 @@ export function getChartScript(): string {
                                 tension: 0.1,
                                 pointRadius: dataset.data.length > 50 ? 0 : 2,
                                 pointHoverRadius: 4,
+                                pointBackgroundColor: dataset.color + '59',
+                                pointBorderColor: dataset.color + '99',
                                 borderWidth: 2,
                                 _originalData: dataset.data.map(d => ({ x: d.step, y: d.value })),
                                 _originalColor: dataset.color,

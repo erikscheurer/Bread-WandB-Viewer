@@ -17,6 +17,13 @@ import {
     setCustomRunName,
     validateCustomRunName
 } from './customRunNames';
+import {
+    loadRunComparisonGroups,
+    RunComparisonGroup,
+    RUN_COMPARISON_GROUPS_FILE,
+    saveRunComparisonGroups,
+    validateRunComparisonGroupName
+} from './runComparisonGroups';
 
 const RUN_SORT_MODES = [
     'created-desc',
@@ -30,6 +37,7 @@ const RUN_SORT_MODES = [
 type RunSortMode = typeof RUN_SORT_MODES[number];
 
 const DEFAULT_RUN_SORT: RunSortMode = 'created-desc';
+const RUN_ACTIVITY_WINDOW_MS = 2 * 60 * 1000;
 
 function isRunSortMode(value: unknown): value is RunSortMode {
     return typeof value === 'string' &&
@@ -55,6 +63,11 @@ export class MultiRunViewerPanel {
     private readonly _nameStorage: vscode.Memento;
     private _customRunNames: Record<string, string>;
     private _isFullscreenOpen = false;
+    private _selectionRefreshTimer: NodeJS.Timeout | null = null;
+    private _selectionRefreshInProgress = false;
+    private _selectionRefreshPending = false;
+    private _comparisonGroups: RunComparisonGroup[] = [];
+    private _comparisonGroupsLoadErrorShown = false;
 
     public static createOrShow(
         extensionUri: vscode.Uri,
@@ -193,12 +206,26 @@ export class MultiRunViewerPanel {
             async message => {
                 switch (message.command) {
                     case 'toggleRun':
-                        if (typeof message.runId === 'string') {
+                        if (
+                            typeof message.runId === 'string' &&
+                            typeof message.selected === 'boolean'
+                        ) {
                             if (typeof message.fullscreenOpen === 'boolean') {
                                 this._isFullscreenOpen = message.fullscreenOpen;
                             }
-                            this._manager.toggleRun(message.runId);
-                            await this._update(false);
+                            const accepted = this._manager.setRunSelected(
+                                message.runId,
+                                message.selected
+                            );
+                            await this._panel.webview.postMessage({
+                                command: 'runSelectionAcknowledged',
+                                runId: message.runId,
+                                selected: this._manager.isRunSelected(message.runId),
+                                accepted
+                            });
+                            if (accepted) {
+                                this._scheduleSelectionRefresh();
+                            }
                         }
                         break;
                     case 'copyRunId':
@@ -210,6 +237,38 @@ export class MultiRunViewerPanel {
                             vscode.window.showInformationMessage('Run ID copied.');
                         }
                         break;
+                    case 'toggleComparisonGroup':
+                        if (
+                            typeof message.groupId === 'string' &&
+                            typeof message.selected === 'boolean'
+                        ) {
+                            if (typeof message.fullscreenOpen === 'boolean') {
+                                this._isFullscreenOpen = message.fullscreenOpen;
+                            }
+                            await this._setComparisonGroupSelected(
+                                message.groupId,
+                                message.selected
+                            );
+                        }
+                        break;
+                    case 'createComparisonGroup':
+                        await this._editComparisonGroup();
+                        break;
+                    case 'editComparisonGroup':
+                        if (typeof message.groupId === 'string') {
+                            await this._editComparisonGroup(message.groupId);
+                        }
+                        break;
+                    case 'deleteComparisonGroup':
+                        if (typeof message.groupId === 'string') {
+                            await this._deleteComparisonGroup(message.groupId);
+                        }
+                        break;
+                    case 'addRunToComparisonGroup':
+                        if (typeof message.runId === 'string') {
+                            await this._addRunToComparisonGroup(message.runId);
+                        }
+                        break;
                     case 'showOnlyRun':
                         if (
                             typeof message.runId === 'string' &&
@@ -218,7 +277,11 @@ export class MultiRunViewerPanel {
                             if (typeof message.fullscreenOpen === 'boolean') {
                                 this._isFullscreenOpen = message.fullscreenOpen;
                             }
-                            await this._update(false);
+                            await this._panel.webview.postMessage({
+                                command: 'bulkRunSelectionAcknowledged',
+                                selectedRunIds: this._manager.getSelectedRunIds()
+                            });
+                            this._scheduleSelectionRefresh();
                         }
                         break;
                     case 'renameRun':
@@ -249,14 +312,22 @@ export class MultiRunViewerPanel {
                             this._isFullscreenOpen = message.fullscreenOpen;
                         }
                         this._manager.selectAll();
-                        await this._update(false);
+                        await this._panel.webview.postMessage({
+                            command: 'bulkRunSelectionAcknowledged',
+                            selectedRunIds: this._manager.getSelectedRunIds()
+                        });
+                        this._scheduleSelectionRefresh();
                         break;
                     case 'deselectAll':
                         if (typeof message.fullscreenOpen === 'boolean') {
                             this._isFullscreenOpen = message.fullscreenOpen;
                         }
                         this._manager.deselectAll();
-                        await this._update(false);
+                        await this._panel.webview.postMessage({
+                            command: 'bulkRunSelectionAcknowledged',
+                            selectedRunIds: []
+                        });
+                        this._scheduleSelectionRefresh();
                         break;
                     case 'reloadSelectedRuns':
                         try {
@@ -335,6 +406,51 @@ export class MultiRunViewerPanel {
         this._watchFolder(resolvedFolderPath);
         this._panel.title = MultiRunViewerPanel.getPanelTitle(this._folderPaths);
         await this._update(true);
+    }
+
+    private _scheduleSelectionRefresh(): void {
+        this._selectionRefreshPending = true;
+        if (this._selectionRefreshTimer) {
+            clearTimeout(this._selectionRefreshTimer);
+            this._selectionRefreshTimer = null;
+        }
+        if (this._selectionRefreshInProgress || this._disposed) {
+            return;
+        }
+
+        this._selectionRefreshTimer = setTimeout(() => {
+            this._selectionRefreshTimer = null;
+            void this._flushSelectionRefresh();
+        }, 250);
+    }
+
+    private async _flushSelectionRefresh(): Promise<void> {
+        if (
+            this._selectionRefreshInProgress ||
+            !this._selectionRefreshPending ||
+            this._disposed
+        ) {
+            return;
+        }
+
+        this._selectionRefreshInProgress = true;
+        this._selectionRefreshPending = false;
+        try {
+            await this._update(false);
+        } catch (error) {
+            console.error('Failed to refresh selected runs:', error);
+            vscode.window.showErrorMessage('Failed to refresh the selected runs.');
+        } finally {
+            this._selectionRefreshInProgress = false;
+            if (!this._disposed) {
+                await this._panel.webview.postMessage({
+                    command: 'runSelectionRefreshComplete'
+                });
+            }
+            if (this._selectionRefreshPending) {
+                this._scheduleSelectionRefresh();
+            }
+        }
     }
 
     private _watchFolder(folderPath: string): void {
@@ -458,6 +574,8 @@ export class MultiRunViewerPanel {
 
                 if (selectedRunChanged) {
                     await this._refreshRunDataInWebview();
+                } else {
+                    await this._updateRunActivityInWebview();
                 }
             }
         } catch (error) {
@@ -472,8 +590,22 @@ export class MultiRunViewerPanel {
         await this._panel.webview.postMessage({
             command: 'runDataUpdated',
             mergedMetrics: this._getMergedMetrics(),
-            runContentStatuses: this._getRunContentStatuses()
+            runContentStatuses: this._getRunContentStatuses(),
+            runLastModified: this._getRunLastModified()
         });
+    }
+
+    private async _updateRunActivityInWebview(): Promise<void> {
+        await this._panel.webview.postMessage({
+            command: 'runActivityUpdated',
+            runLastModified: this._getRunLastModified()
+        });
+    }
+
+    private _getRunLastModified(): Record<string, number> {
+        return Object.fromEntries(
+            this._manager.getRuns().map(run => [run.runId, run.lastModified])
+        );
     }
 
     private _getRunContentStatuses(): Record<string, string> {
@@ -537,6 +669,231 @@ export class MultiRunViewerPanel {
             refreshes.push(panel._update(false));
         }
         await Promise.all(refreshes);
+    }
+
+    private async _loadComparisonGroups(): Promise<void> {
+        try {
+            this._comparisonGroups = await loadRunComparisonGroups(this._folderPath);
+            this._comparisonGroupsLoadErrorShown = false;
+        } catch {
+            if (!this._comparisonGroupsLoadErrorShown) {
+                this._comparisonGroupsLoadErrorShown = true;
+                vscode.window.showWarningMessage(
+                    `Could not read ${RUN_COMPARISON_GROUPS_FILE}; existing comparison groups were left unchanged.`
+                );
+            }
+        }
+    }
+
+    private async _saveComparisonGroups(): Promise<boolean> {
+        try {
+            await saveRunComparisonGroups(this._folderPath, this._comparisonGroups);
+            return true;
+        } catch {
+            vscode.window.showErrorMessage('Could not save comparison groups.');
+            return false;
+        }
+    }
+
+    private _getComparisonGroup(groupId: string): RunComparisonGroup | undefined {
+        return this._comparisonGroups.find(group => group.id === groupId);
+    }
+
+    private _createComparisonGroupId(): string {
+        const baseId = `group-${Date.now().toString(36)}`;
+        let groupId = baseId;
+        let suffix = 2;
+        while (this._getComparisonGroup(groupId)) {
+            groupId = `${baseId}-${suffix}`;
+            suffix += 1;
+        }
+        return groupId;
+    }
+
+    private async _editComparisonGroup(
+        groupId?: string,
+        requiredRunId?: string
+    ): Promise<void> {
+        const existingGroup = groupId ? this._getComparisonGroup(groupId) : undefined;
+        if (groupId && !existingGroup) {
+            return;
+        }
+        if (requiredRunId && !this._manager.getState().runs.has(requiredRunId)) {
+            return;
+        }
+
+        const name = await vscode.window.showInputBox({
+            title: existingGroup ? 'Edit Comparison Group' : 'Create Comparison Group',
+            prompt: 'Name this reusable run selection',
+            value: existingGroup?.name || '',
+            ignoreFocusOut: true,
+            validateInput: value => {
+                const validationError = validateRunComparisonGroupName(value);
+                if (validationError) {
+                    return validationError;
+                }
+                const normalizedName = value.trim().toLocaleLowerCase();
+                const duplicate = this._comparisonGroups.some(group =>
+                    group.id !== existingGroup?.id &&
+                    group.name.toLocaleLowerCase() === normalizedName
+                );
+                return duplicate
+                    ? 'A comparison group with this name already exists.'
+                    : undefined;
+            }
+        });
+        if (name === undefined) {
+            return;
+        }
+
+        const currentRunIds = new Set(existingGroup?.runIds || []);
+        if (requiredRunId) {
+            currentRunIds.add(requiredRunId);
+        }
+        const knownRuns = this._manager.getRuns();
+        const knownRunIds = new Set(knownRuns.map(run => run.runId));
+        const runItems: Array<vscode.QuickPickItem & { runId: string }> =
+            knownRuns.map(run => ({
+                label: this._getDisplayRunName(run),
+                description: run.runId,
+                runId: run.runId,
+                picked: currentRunIds.has(run.runId)
+            }));
+        for (const unknownRunId of currentRunIds) {
+            if (!knownRunIds.has(unknownRunId)) {
+                runItems.push({
+                    label: unknownRunId,
+                    description: 'Run is not currently open',
+                    runId: unknownRunId,
+                    picked: true
+                });
+            }
+        }
+
+        const selectedRuns = await vscode.window.showQuickPick(runItems, {
+            title: 'Choose Runs for Comparison Group',
+            placeHolder: 'Select one or more runs',
+            canPickMany: true,
+            ignoreFocusOut: true
+        });
+        if (!selectedRuns) {
+            return;
+        }
+        if (selectedRuns.length === 0) {
+            vscode.window.showWarningMessage(
+                'A comparison group must contain at least one run.'
+            );
+            return;
+        }
+
+        const nextGroup: RunComparisonGroup = {
+            id: existingGroup?.id || this._createComparisonGroupId(),
+            name: name.trim(),
+            runIds: selectedRuns.map(item => item.runId)
+        };
+        const previousGroups = this._comparisonGroups;
+        this._comparisonGroups = existingGroup
+            ? previousGroups.map(group =>
+                group.id === existingGroup.id ? nextGroup : group
+            )
+            : [...previousGroups, nextGroup];
+        if (!await this._saveComparisonGroups()) {
+            this._comparisonGroups = previousGroups;
+            return;
+        }
+        await this._update(false);
+    }
+
+    private async _addRunToComparisonGroup(runId: string): Promise<void> {
+        if (!this._manager.getState().runs.has(runId)) {
+            return;
+        }
+
+        const choices: Array<vscode.QuickPickItem & { groupId?: string }> = [
+            { label: '$(add) Create a new comparison group…' },
+            ...this._comparisonGroups.map(group => ({
+                label: group.name,
+                description: `${group.runIds.length} run${group.runIds.length === 1 ? '' : 's'}`,
+                groupId: group.id
+            }))
+        ];
+        const selected = await vscode.window.showQuickPick(choices, {
+            title: 'Add Run to Comparison Group',
+            placeHolder: 'Choose a group',
+            ignoreFocusOut: true
+        });
+        if (!selected) {
+            return;
+        }
+        if (!selected.groupId) {
+            await this._editComparisonGroup(undefined, runId);
+            return;
+        }
+
+        const group = this._getComparisonGroup(selected.groupId);
+        if (!group || group.runIds.includes(runId)) {
+            if (group) {
+                vscode.window.showInformationMessage(
+                    `This run is already in “${group.name}”.`
+                );
+            }
+            return;
+        }
+
+        const previousGroups = this._comparisonGroups;
+        this._comparisonGroups = previousGroups.map(candidate =>
+            candidate.id === group.id
+                ? { ...candidate, runIds: [...candidate.runIds, runId] }
+                : candidate
+        );
+        if (!await this._saveComparisonGroups()) {
+            this._comparisonGroups = previousGroups;
+            return;
+        }
+        await this._update(false);
+    }
+
+    private async _deleteComparisonGroup(groupId: string): Promise<void> {
+        const group = this._getComparisonGroup(groupId);
+        if (!group) {
+            return;
+        }
+        const confirmation = await vscode.window.showWarningMessage(
+            `Delete the comparison group “${group.name}”?`,
+            { modal: true },
+            'Delete'
+        );
+        if (confirmation !== 'Delete') {
+            return;
+        }
+
+        const previousGroups = this._comparisonGroups;
+        this._comparisonGroups = previousGroups.filter(
+            candidate => candidate.id !== groupId
+        );
+        if (!await this._saveComparisonGroups()) {
+            this._comparisonGroups = previousGroups;
+            return;
+        }
+        await this._update(false);
+    }
+
+    private async _setComparisonGroupSelected(
+        groupId: string,
+        selected: boolean
+    ): Promise<void> {
+        const group = this._getComparisonGroup(groupId);
+        if (!group) {
+            return;
+        }
+        for (const runId of group.runIds) {
+            this._manager.setRunSelected(runId, selected);
+        }
+        await this._panel.webview.postMessage({
+            command: 'bulkRunSelectionAcknowledged',
+            selectedRunIds: this._manager.getSelectedRunIds()
+        });
+        this._scheduleSelectionRefresh();
     }
 
     private async _handleSyncRuns(runIds: string[]): Promise<void> {
@@ -676,6 +1033,7 @@ export class MultiRunViewerPanel {
         console.log('=== Multi-Run View Update Started ===');
 
         if (scanForRuns) {
+            await this._loadComparisonGroups();
             const t1 = Date.now();
             const discoveredRuns = await this._scanFolders();
             const scanTime = Date.now() - t1;
@@ -743,6 +1101,10 @@ export class MultiRunViewerPanel {
         const selectedSet = new Set(selectedRunIds);
         const selectedRuns = runs.filter(run => selectedSet.has(run.runId));
         const configComparisonHtml = this._generateConfigComparisonHtml(selectedRuns);
+        const comparisonGroupsHtml = this._generateComparisonGroupsHtml(
+            runs,
+            selectedSet
+        );
 
         // Generate sidebar run list
         const runListHtml = runs.map(run => {
@@ -750,8 +1112,10 @@ export class MultiRunViewerPanel {
             const color = this._manager.getRunColor(run.runId);
             const contentStatus = this._manager.getRunContentStatus(run.runId);
             const isEmpty = contentStatus === 'empty';
+            const isLikelyRunning = run.fileSize > 7 &&
+                Date.now() - run.lastModified <= RUN_ACTIVITY_WINDOW_MS;
             const tooltip = isEmpty
-                ? `${run.runName}\nThis run is empty (no metric data).`
+                ? `${run.runName}\nThis run is empty (no run metrics have values; system metrics do not count).`
                 : run.runName;
             const syncTitle = run.syncStatus === 'synced'
                 ? 'Synced to W&B'
@@ -760,19 +1124,23 @@ export class MultiRunViewerPanel {
                     : 'Sync status unknown';
             return `
                 <div
-                    class="run-item${isEmpty ? ' empty-run' : ''}"
+                    class="run-item${isEmpty ? ' empty-run' : ''}${isLikelyRunning ? ' running-run' : ''}"
                     data-run-name="${this._escapeHtml(run.runName)}"
                     data-run-id="${this._escapeHtml(run.runId)}"
                     data-run-project="${this._escapeHtml(run.project || '')}"
                     data-created-at="${run.createdAt}"
                     data-updated-at="${run.lastModified}"
+                    data-file-size="${run.fileSize}"
                     data-content-status="${contentStatus}"
                     oncontextmenu="openRunContextMenu(event, this)"
                 >
-                    <input type="checkbox" ${isSelected ? 'checked' : ''} onchange="toggleRun(this.closest('.run-item').dataset.runId)">
+                    <input type="checkbox" ${isSelected ? 'checked' : ''} onchange="toggleRun(this.closest('.run-item').dataset.runId, this.checked)">
                     <div class="run-color" style="background: ${color}"></div>
                     <div class="run-info">
-                        <div class="run-name" title="${this._escapeHtml(tooltip)}">${this._escapeHtml(run.runName)}</div>
+                        <div class="run-name-row">
+                            <span class="run-activity" title="Recently updated; likely still running" aria-label="Likely running">●</span>
+                            <div class="run-name" title="${this._escapeHtml(tooltip)}" onclick="focusRunFromSidebar(event, this.closest('.run-item').dataset.runId)">${this._escapeHtml(run.runName)}</div>
+                        </div>
                         <div class="run-meta">
                             <span class="sync-status ${run.syncStatus}" title="${syncTitle}" aria-label="${syncTitle}">☁</span>
                             <span>ID: ${this._escapeHtml(run.runId)}</span>
@@ -862,11 +1230,23 @@ export class MultiRunViewerPanel {
                         class="run-empty-filter"
                         id="hideEmptyRunsBtn"
                         aria-pressed="false"
-                        title="Hide runs confirmed to have no metric data"
+                        title="Hide runs confirmed to have no run metric values"
                     >Hide empty</button>
                 </div>
                 <div id="runList">${runListHtml}</div>
                 <div class="run-filter-empty" id="runFilterEmpty">No runs match this filter.</div>
+                <section class="comparison-groups-section" aria-label="Comparison groups">
+                    <div class="comparison-groups-header">
+                        <div>
+                            <h4>Comparison groups</h4>
+                            <span>Saved in ${this._escapeHtml(RUN_COMPARISON_GROUPS_FILE)}</span>
+                        </div>
+                        <button type="button" class="btn-icon" onclick="createComparisonGroup()" title="Create comparison group" aria-label="Create comparison group">＋</button>
+                    </div>
+                    <div id="comparisonGroupList">
+                        ${comparisonGroupsHtml || '<div class="comparison-groups-empty">No groups yet.</div>'}
+                    </div>
+                </section>
             </div>
 
             <div class="sidebar-content" id="metadataContent">
@@ -908,11 +1288,12 @@ export class MultiRunViewerPanel {
     <div class="run-context-menu" id="runContextMenu" role="menu" aria-hidden="true">
         <button type="button" role="menuitem" onclick="runContextAction('copy')">Copy run ID</button>
         <button type="button" role="menuitem" onclick="runContextAction('isolate')">Show only this run</button>
+        <button type="button" role="menuitem" onclick="runContextAction('addToGroup')">Add to comparison group…</button>
         <button type="button" role="menuitem" onclick="runContextAction('rename')">Set custom run name…</button>
         <button type="button" role="menuitem" onclick="runContextAction('sync')">Sync this run</button>
     </div>
 
-    ${getModalHtml(`
+        ${getModalHtml(`
         <button class="toggle-btn reload-runs-btn" id="modalReloadRunsBtn" onclick="reloadSelectedRuns('modalReloadRunsBtn')" title="Reload data for selected runs" ${selectedRunIds.length === 0 ? 'disabled' : ''}>⟳ Reload runs</button>
         <button class="toggle-btn sync-runs-btn" id="modalSyncRunsBtn" onclick="syncSelectedRuns()" title="Upload selected runs using the local wandb CLI" ${selectedRunIds.length === 0 ? 'disabled' : ''}>☁ Sync selected</button>
     `)}
@@ -923,6 +1304,53 @@ export class MultiRunViewerPanel {
     </script>
 </body>
 </html>`;
+    }
+
+    private _generateComparisonGroupsHtml(
+        runs: RunScanResult[],
+        selectedRunIds: Set<string>
+    ): string {
+        const runsById = new Map(runs.map(run => [run.runId, run]));
+        return this._comparisonGroups.map(group => {
+            const knownRunIds = group.runIds.filter(runId => runsById.has(runId));
+            const allKnownRunsSelected = knownRunIds.length > 0 &&
+                knownRunIds.every(runId => selectedRunIds.has(runId));
+            const memberNames = group.runIds.slice(0, 20).map(runId => {
+                const run = runsById.get(runId);
+                return run ? run.runName : runId;
+            });
+            if (group.runIds.length > memberNames.length) {
+                memberNames.push(`…and ${group.runIds.length - memberNames.length} more`);
+            }
+            const unavailableCount = group.runIds.length - knownRunIds.length;
+            const countLabel = unavailableCount > 0
+                ? `${knownRunIds.length}/${group.runIds.length} open`
+                : `${group.runIds.length} run${group.runIds.length === 1 ? '' : 's'}`;
+
+            return `
+                <div
+                    class="comparison-group-item"
+                    data-group-id="${this._escapeHtml(group.id)}"
+                    data-run-ids="${this._escapeHtml(JSON.stringify(knownRunIds))}"
+                    title="${this._escapeHtml(memberNames.join('\n'))}"
+                >
+                    <input
+                        type="checkbox"
+                        class="comparison-group-toggle"
+                        ${allKnownRunsSelected ? 'checked' : ''}
+                        ${knownRunIds.length === 0 ? 'disabled' : ''}
+                        onchange="toggleComparisonGroup(this.closest('.comparison-group-item'), this.checked)"
+                        aria-label="Toggle ${this._escapeHtml(group.name)}"
+                    >
+                    <div class="comparison-group-info">
+                        <div class="comparison-group-name">${this._escapeHtml(group.name)}</div>
+                        <div class="comparison-group-count">${countLabel}</div>
+                    </div>
+                    <button type="button" class="comparison-group-action" onclick="editComparisonGroup(this.closest('.comparison-group-item'))" title="Edit group" aria-label="Edit ${this._escapeHtml(group.name)}">✎</button>
+                    <button type="button" class="comparison-group-action danger" onclick="deleteComparisonGroup(this.closest('.comparison-group-item'))" title="Delete group" aria-label="Delete ${this._escapeHtml(group.name)}">×</button>
+                </div>
+            `;
+        }).join('');
     }
 
     private _generateConfigComparisonHtml(selectedRuns: RunScanResult[]): string {
@@ -1154,6 +1582,9 @@ export class MultiRunViewerPanel {
             const MAX_CHART_HEIGHT = 1200;
             const DEFAULT_CHART_HEIGHT = 200;
             const persistedViewState = vscode.getState() || {};
+            let focusedRunId = typeof persistedViewState.focusedRunId === 'string'
+                ? persistedViewState.focusedRunId
+                : null;
             const savedChartHeights = persistedViewState.chartHeights &&
                 typeof persistedViewState.chartHeights === 'object'
                 ? persistedViewState.chartHeights
@@ -1240,6 +1671,22 @@ export class MultiRunViewerPanel {
             const runList = document.getElementById('runList');
             const runFilterEmpty = document.getElementById('runFilterEmpty');
             const runCountHeading = document.getElementById('runCountHeading');
+            const RUN_ACTIVITY_WINDOW_MS = ${RUN_ACTIVITY_WINDOW_MS};
+
+            function updateRunActivityIndicators(lastModifiedByRunId) {
+                document.querySelectorAll('.run-item[data-run-id]').forEach(item => {
+                    const updatedAt = lastModifiedByRunId?.[item.dataset.runId];
+                    if (Number.isFinite(Number(updatedAt))) {
+                        item.dataset.updatedAt = String(updatedAt);
+                    }
+                    const lastModified = Number(item.dataset.updatedAt);
+                    const fileSize = Number(item.dataset.fileSize);
+                    const isLikelyRunning = Number.isFinite(lastModified) &&
+                        fileSize > 7 &&
+                        Date.now() - lastModified <= RUN_ACTIVITY_WINDOW_MS;
+                    item.classList.toggle('running-run', isLikelyRunning);
+                });
+            }
 
             function globToRegExp(globPattern) {
                 const regexPattern = Array.from(globPattern).map(character => {
@@ -1317,8 +1764,8 @@ export class MultiRunViewerPanel {
                     hideEmptyRunsBtn.title = emptyCount === 0
                         ? 'No runs are currently confirmed empty'
                         : hideEmptyRuns
-                            ? 'Show runs confirmed to have no metric data'
-                            : 'Hide runs confirmed to have no metric data';
+                            ? 'Show runs confirmed to have no run metric values'
+                            : 'Hide runs confirmed to have no run metric values';
                 }
 
                 if (runFilterEmpty) {
@@ -1370,6 +1817,18 @@ export class MultiRunViewerPanel {
                 });
             }
             applyRunListView(false);
+            updateRunActivityIndicators();
+            setInterval(updateRunActivityIndicators, 15000);
+            if (
+                focusedRunId &&
+                !Array.from(document.querySelectorAll('.run-item[data-run-id]'))
+                    .some(item => item.dataset.runId === focusedRunId)
+            ) {
+                focusedRunId = null;
+                updatePersistedViewState({ focusedRunId: null });
+            }
+            applyFocusedRun(focusedRunId, false);
+            updateComparisonGroupCheckboxes();
 
             // Configuration-column filtering
             const configFilterInput = document.getElementById('configFilterInput');
@@ -1764,15 +2223,136 @@ export class MultiRunViewerPanel {
                 return document.getElementById('fullscreenModal')?.classList.contains('active') === true;
             }
 
-            function toggleRun(runId) {
+            function setOptimisticRunSelection(runId, selected) {
+                const runItem = Array.from(
+                    document.querySelectorAll('.run-item[data-run-id]')
+                ).find(item => item.dataset.runId === runId);
+                if (!runItem) return;
+
+                const checkbox = runItem.querySelector('input[type="checkbox"]');
+                if (checkbox) {
+                    checkbox.checked = selected;
+                }
+                runItem.classList.add('selection-loading');
+                updateComparisonGroupCheckboxes();
+            }
+
+            function setOptimisticBulkSelection(selectedRunIds) {
+                const selectedSet = new Set(selectedRunIds);
+                document.querySelectorAll('.run-item[data-run-id]').forEach(item => {
+                    const checkbox = item.querySelector('input[type="checkbox"]');
+                    if (checkbox) {
+                        checkbox.checked = selectedSet.has(item.dataset.runId);
+                    }
+                    item.classList.add('selection-loading');
+                });
+                updateComparisonGroupCheckboxes();
+            }
+
+            function getComparisonGroupRunIds(groupItem) {
+                if (!groupItem) return [];
+                try {
+                    const runIds = JSON.parse(groupItem.dataset.runIds || '[]');
+                    return Array.isArray(runIds)
+                        ? runIds.filter(runId => typeof runId === 'string')
+                        : [];
+                } catch {
+                    return [];
+                }
+            }
+
+            function updateComparisonGroupCheckboxes() {
+                const selectedRunIds = new Set(
+                    Array.from(
+                        document.querySelectorAll('.run-item[data-run-id]'),
+                        item => {
+                            const checkbox = item.querySelector('input[type="checkbox"]');
+                            return checkbox?.checked ? item.dataset.runId : null;
+                        }
+                    ).filter(Boolean)
+                );
+                document.querySelectorAll('.comparison-group-item').forEach(groupItem => {
+                    const runIds = getComparisonGroupRunIds(groupItem);
+                    const checkbox = groupItem.querySelector('.comparison-group-toggle');
+                    if (!checkbox) return;
+                    const selectedCount = runIds.filter(runId => selectedRunIds.has(runId)).length;
+                    checkbox.checked = runIds.length > 0 && selectedCount === runIds.length;
+                    checkbox.indeterminate = selectedCount > 0 && selectedCount < runIds.length;
+                    checkbox.disabled = runIds.length === 0;
+                });
+            }
+
+            function toggleComparisonGroup(groupItem, selected) {
+                const runIds = getComparisonGroupRunIds(groupItem);
+                runIds.forEach(runId => setOptimisticRunSelection(runId, selected));
+                updateComparisonGroupCheckboxes();
+                vscode.postMessage({
+                    command: 'toggleComparisonGroup',
+                    groupId: groupItem.dataset.groupId,
+                    selected,
+                    fullscreenOpen: isFullscreenCurrentlyOpen()
+                });
+            }
+
+            function createComparisonGroup() {
+                vscode.postMessage({ command: 'createComparisonGroup' });
+            }
+
+            function editComparisonGroup(groupItem) {
+                vscode.postMessage({
+                    command: 'editComparisonGroup',
+                    groupId: groupItem.dataset.groupId
+                });
+            }
+
+            function deleteComparisonGroup(groupItem) {
+                vscode.postMessage({
+                    command: 'deleteComparisonGroup',
+                    groupId: groupItem.dataset.groupId
+                });
+            }
+
+            function applyFocusedRun(runId, shouldPersist = true) {
+                focusedRunId = typeof runId === 'string' && runId ? runId : null;
+                document.querySelectorAll('.run-item[data-run-id]').forEach(item => {
+                    item.classList.toggle(
+                        'focused-run',
+                        focusedRunId !== null && item.dataset.runId === focusedRunId
+                    );
+                });
+                Object.values(chartInstances).forEach(chart => {
+                    setFocusedRun(chart, focusedRunId);
+                });
+                if (modalChart) {
+                    setFocusedRun(modalChart, focusedRunId);
+                }
+                if (shouldPersist) {
+                    updatePersistedViewState({ focusedRunId });
+                }
+            }
+
+            function focusRunFromSidebar(event, runId) {
+                event.preventDefault();
+                event.stopPropagation();
+                applyFocusedRun(focusedRunId === runId ? null : runId);
+            }
+
+            function toggleRun(runId, selected) {
+                setOptimisticRunSelection(runId, selected);
                 vscode.postMessage({
                     command: 'toggleRun',
                     runId,
+                    selected,
                     fullscreenOpen: isFullscreenCurrentlyOpen()
                 });
             }
 
             function selectAllRuns() {
+                const runIds = Array.from(
+                    document.querySelectorAll('.run-item[data-run-id]'),
+                    item => item.dataset.runId
+                );
+                setOptimisticBulkSelection(runIds);
                 vscode.postMessage({
                     command: 'selectAll',
                     fullscreenOpen: isFullscreenCurrentlyOpen()
@@ -1780,6 +2360,7 @@ export class MultiRunViewerPanel {
             }
 
             function deselectAllRuns() {
+                setOptimisticBulkSelection([]);
                 vscode.postMessage({
                     command: 'deselectAll',
                     fullscreenOpen: isFullscreenCurrentlyOpen()
@@ -1819,10 +2400,16 @@ export class MultiRunViewerPanel {
                 if (action === 'copy') {
                     vscode.postMessage({ command: 'copyRunId', runId });
                 } else if (action === 'isolate') {
+                    setOptimisticBulkSelection([runId]);
                     vscode.postMessage({
                         command: 'showOnlyRun',
                         runId,
                         fullscreenOpen: isFullscreenCurrentlyOpen()
+                    });
+                } else if (action === 'addToGroup') {
+                    vscode.postMessage({
+                        command: 'addRunToComparisonGroup',
+                        runId
                     });
                 } else if (action === 'rename') {
                     vscode.postMessage({ command: 'renameRun', runId });
@@ -1916,6 +2503,8 @@ export class MultiRunViewerPanel {
                     tension: 0.1,
                     pointRadius: dataset.data.length > (isModal ? 100 : 50) ? 0 : (isModal ? 3 : 2),
                     pointHoverRadius: isModal ? 5 : 4,
+                    pointBackgroundColor: dataset.color + '59',
+                    pointBorderColor: dataset.color + '99',
                     borderWidth: 2,
                     _originalData: dataset.data.map(d => ({ x: d.step, y: d.value })),
                     _originalColor: dataset.color,
@@ -1971,6 +2560,9 @@ export class MultiRunViewerPanel {
                         globalSmoothing,
                         showRaw
                     );
+                    if (focusedRunId) {
+                        setFocusedRun(chartInstances[canvas.id], focusedRunId);
+                    }
                     chartObserver.unobserve(canvas);
                 }
 
@@ -2011,7 +2603,7 @@ export class MultiRunViewerPanel {
                     const nameElement = item.querySelector('.run-name');
                     if (nameElement) {
                         nameElement.title = status === 'empty'
-                            ? runName + '\\nThis run is empty (no metric data).'
+                            ? runName + '\\nThis run is empty (no run metrics have values; system metrics do not count).'
                             : runName;
                     }
                 });
@@ -2048,6 +2640,26 @@ export class MultiRunViewerPanel {
 
             window.addEventListener('message', event => {
                 const message = event.data;
+                if (message.runLastModified) {
+                    updateRunActivityIndicators(message.runLastModified);
+                }
+                if (message.command === 'runSelectionAcknowledged') {
+                    setOptimisticRunSelection(message.runId, message.selected === true);
+                    if (message.accepted !== true) {
+                        document.querySelectorAll('.run-item.selection-loading')
+                            .forEach(item => item.classList.remove('selection-loading'));
+                    }
+                }
+                if (
+                    message.command === 'bulkRunSelectionAcknowledged' &&
+                    Array.isArray(message.selectedRunIds)
+                ) {
+                    setOptimisticBulkSelection(message.selectedRunIds);
+                }
+                if (message.command === 'runSelectionRefreshComplete') {
+                    document.querySelectorAll('.run-item.selection-loading')
+                        .forEach(item => item.classList.remove('selection-loading'));
+                }
                 if (message.runContentStatuses) {
                     updateRunContentStatuses(message.runContentStatuses);
                 }
@@ -2146,6 +2758,9 @@ export class MultiRunViewerPanel {
                             sourceChart.$preIsolationVisibility || null;
                         modalChart.$sourceChart = sourceChart;
                         modalChart.update('none');
+                    }
+                    if (focusedRunId) {
+                        setFocusedRun(modalChart, focusedRunId);
                     }
                     updateChartAxes(modalChart, modalLogX, modalLogY);
                 });
@@ -2365,6 +2980,16 @@ export class MultiRunViewerPanel {
             .sidebar-content.active {
                 display: block;
             }
+            #runsContent.active {
+                display: flex;
+                flex-direction: column;
+                overflow: hidden;
+            }
+            #runList {
+                flex: 1 1 auto;
+                min-height: 72px;
+                overflow-y: auto;
+            }
             .run-list-tools {
                 position: sticky;
                 top: -10px;
@@ -2430,6 +3055,84 @@ export class MultiRunViewerPanel {
             .run-filter-empty.visible {
                 display: block;
             }
+            .comparison-groups-section {
+                flex: 0 0 auto;
+                max-height: 38%;
+                margin: 10px -2px -2px;
+                padding: 10px 2px 2px;
+                border-top: 1px solid var(--vscode-panel-border);
+                overflow-y: auto;
+            }
+            .comparison-groups-header {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                gap: 8px;
+                margin-bottom: 7px;
+            }
+            .comparison-groups-header h4 {
+                margin: 0;
+                font-size: 0.85em;
+                font-weight: 600;
+            }
+            .comparison-groups-header span,
+            .comparison-group-count,
+            .comparison-groups-empty {
+                color: var(--vscode-descriptionForeground);
+                font-size: 0.7em;
+            }
+            .comparison-group-item {
+                display: flex;
+                align-items: center;
+                gap: 7px;
+                min-width: 0;
+                padding: 6px 5px;
+                border-radius: 4px;
+            }
+            .comparison-group-item:hover {
+                background: var(--vscode-list-hoverBackground);
+            }
+            .comparison-group-toggle {
+                width: 16px;
+                height: 16px;
+                flex: 0 0 16px;
+                cursor: pointer;
+                accent-color: var(--vscode-focusBorder, var(--vscode-button-background));
+            }
+            .comparison-group-toggle:disabled {
+                cursor: default;
+                opacity: 0.45;
+            }
+            .comparison-group-info {
+                flex: 1;
+                min-width: 0;
+            }
+            .comparison-group-name {
+                overflow: hidden;
+                font-size: 0.82em;
+                font-weight: 500;
+                text-overflow: ellipsis;
+                white-space: nowrap;
+            }
+            .comparison-group-action {
+                width: 22px;
+                height: 22px;
+                flex: 0 0 22px;
+                border: 0;
+                border-radius: 3px;
+                color: var(--vscode-foreground);
+                background: transparent;
+                cursor: pointer;
+            }
+            .comparison-group-action:hover {
+                background: var(--vscode-toolbar-hoverBackground, var(--vscode-list-hoverBackground));
+            }
+            .comparison-group-action.danger:hover {
+                color: var(--vscode-errorForeground);
+            }
+            .comparison-groups-empty {
+                padding: 6px 5px 8px;
+            }
             .run-item {
                 display: flex;
                 align-items: center;
@@ -2445,10 +3148,18 @@ export class MultiRunViewerPanel {
             .run-item:hover {
                 background: var(--vscode-list-hoverBackground);
             }
+            .run-item.focused-run {
+                background: var(--vscode-list-activeSelectionBackground);
+                color: var(--vscode-list-activeSelectionForeground);
+            }
             .run-item.empty-run .run-info,
             .run-item.empty-run .run-color {
                 opacity: 0.48;
                 filter: grayscale(1);
+            }
+            .run-item.selection-loading .run-name::after {
+                content: ' …';
+                color: var(--vscode-descriptionForeground);
             }
             .run-item input[type="checkbox"] {
                 width: 16px;
@@ -2465,12 +3176,46 @@ export class MultiRunViewerPanel {
                 flex: 1;
                 min-width: 0;
             }
+            .run-name-row {
+                display: flex;
+                align-items: center;
+                gap: 5px;
+                min-width: 0;
+            }
+            .run-activity {
+                width: 9px;
+                flex: 0 0 9px;
+                visibility: hidden;
+                color: var(--vscode-testing-iconPassed, #73c991);
+                font-size: 9px;
+                line-height: 1;
+            }
+            .run-item.running-run .run-activity {
+                visibility: visible;
+                animation: run-activity-pulse 1.8s ease-in-out infinite;
+            }
+            @keyframes run-activity-pulse {
+                0%, 100% { opacity: 0.45; }
+                50% { opacity: 1; }
+            }
+            @media (prefers-reduced-motion: reduce) {
+                .run-item.running-run .run-activity {
+                    animation: none;
+                    opacity: 0.85;
+                }
+            }
             .run-name {
+                flex: 1;
+                min-width: 0;
                 font-size: 0.85em;
                 font-weight: 500;
                 white-space: nowrap;
                 overflow: hidden;
                 text-overflow: ellipsis;
+                cursor: pointer;
+            }
+            .run-name:hover {
+                text-decoration: underline;
             }
             .run-meta {
                 font-size: 0.7em;
@@ -3107,6 +3852,11 @@ export class MultiRunViewerPanel {
             clearTimeout(this._initialUpdateTimer);
             this._initialUpdateTimer = null;
         }
+        if (this._selectionRefreshTimer) {
+            clearTimeout(this._selectionRefreshTimer);
+            this._selectionRefreshTimer = null;
+        }
+        this._selectionRefreshPending = false;
         this._panel.dispose();
         for (const watcher of this._folderWatchers.values()) {
             watcher.dispose();

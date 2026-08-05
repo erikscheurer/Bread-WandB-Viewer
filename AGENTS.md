@@ -95,6 +95,10 @@ host.
 - Give webview actions with transient UI state an explicit host response, preferably
   sent from a `finally` block. Do not rely on assigning `webview.html` to reset a
   button or spinner because unchanged HTML may leave the existing DOM in place.
+- Apply run selection optimistically in the webview, acknowledge the explicit
+  selected state from the host, and coalesce rapid changes before parsing. Serialize
+  selection refreshes and schedule a follow-up when selection changes during a
+  parse; never make each checkbox await a full webview rebuild.
 - For data-only refreshes, update existing webview charts through messages instead
   of replacing `webview.html`; rebuilding the document discards zoom, log-axis,
   smoothing, fullscreen, and other browser-side state.
@@ -143,7 +147,11 @@ host.
   restores the original name. Never rewrite `.wandb` protobuf logs.
 - Cache whether parsed runs contain metric data independently from the bounded
   parsed-data LRU, so confirmed empty runs stay grayed after cache eviction and
-  return to unknown when their files change.
+  return to unknown when their files change. Only `WandbRunData.metrics` determines
+  this status; a run with system metrics but no run/training metric values is empty.
+- Treat the running badge as a lightweight activity heuristic, not authoritative
+  process state. Base it on recent `.wandb` modification time, update it from file
+  watcher metadata, and age it out in the webview without reparsing run files.
 - Keep the sidebar's empty-run filter content-aware: it hides only runs confirmed
   empty, never unknown/unparsed runs, persists in webview state, and reapplies when
   a data-only status update arrives.
@@ -172,10 +180,16 @@ host.
 - Preserve run visibility when moving between overview and fullscreen charts.
   Legend double-click isolation must restore the visibility snapshot from before
   isolation, including runs that were already hidden.
+- Clicking a sidebar run name focuses that run without changing selection. Persist
+  the focused run ID, apply it to every initialized overview/fullscreen chart, apply
+  it when lazy charts are created or datasets are rebuilt, and let transient chart
+  hover return to the focused styling when the pointer leaves.
 - Preserve the current multi-run chart interaction invariants:
   - Run datasets render as unfilled curves (`fill: false`).
   - Plot hover emphasizes the nearest run in the legend and tooltip without
     changing line styling; legend hover may highlight the corresponding line.
+    When other runs are dimmed, their point backgrounds and borders must dim with
+    their lines. Keep ordinary point markers visually quieter than the curves.
   - Tooltips keep all visible runs, sort entries from highest to lowest Y value,
     and give only the pointer-nearest run a solid swatch and highlighted row.
 - Do not conflate lazy chart rendering with lazy run parsing. Charts are already

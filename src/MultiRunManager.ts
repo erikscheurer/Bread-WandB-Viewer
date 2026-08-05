@@ -99,6 +99,22 @@ export class MultiRunManager {
     }
 
     /**
+     * Set run visibility explicitly. Returns false when the run is unknown.
+     */
+    setRunSelected(runId: string, selected: boolean): boolean {
+        if (!this.state.runs.has(runId)) {
+            return false;
+        }
+
+        if (selected) {
+            this.state.selectedRunIds.add(runId);
+        } else {
+            this.state.selectedRunIds.delete(runId);
+        }
+        return true;
+    }
+
+    /**
      * Select all runs
      */
     selectAll(): void {
@@ -218,7 +234,7 @@ export class MultiRunManager {
                         this.state.parsedData.set(runId, parsed);
                         this.runContentStatuses.set(
                             runId,
-                            this.hasMetricData(parsed) ? 'has-data' : 'empty'
+                            this.hasRunMetricData(parsed) ? 'has-data' : 'empty'
                         );
                         this.updateCacheAccess(runId);
                         this.evictIfNeeded();
@@ -256,10 +272,9 @@ export class MultiRunManager {
         return this.state.parsedData.get(runId);
     }
 
-    private hasMetricData(runData: WandbRunData): boolean {
-        return [runData.metrics, runData.systemMetrics].some(metrics =>
-            Object.values(metrics).some(points => points.length > 0)
-        );
+    private hasRunMetricData(runData: WandbRunData): boolean {
+        return Object.values(runData.metrics)
+            .some(points => points.length > 0);
     }
 
     /**

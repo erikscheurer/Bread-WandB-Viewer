@@ -31,13 +31,16 @@ version adds:
 - **Run discovery and manual refresh** — newly created runs are found
   periodically or on demand, and displayed runs can be reloaded without rebuilding
   the webview.
+- **Responsive run selection** — sidebar checkboxes update immediately while rapid
+  changes are coalesced before run parsing and chart rebuilding begin.
 - **State-preserving chart updates** — refreshes retain zoom, smoothing, log axes,
   run visibility, active tabs, filters, sidebar size, and fullscreen state. Raw
   and smoothed traces behave as one run. Chart controls remain visible while
   scrolling through long metric lists.
 - **Improved chart interaction** — X-range and box zoom, two-axis panning,
   Ctrl+scroll cursor zoom, resizable chart rows, visibility-preserving legend
-  isolation, linked run highlighting, and clearer cursor-sorted tooltips.
+  isolation, linked run highlighting across lines and point markers, and clearer
+  cursor-sorted tooltips.
 - **Better run comparison** — side-by-side configuration comparison with search,
   independent run-row and parameter-column sorting, plus glob run filtering and
   sorting by name, creation time, or latest update.
@@ -45,9 +48,14 @@ version adds:
   improved light-theme contrast, and unfilled run curves.
 - **Multi-folder workspaces** — open independent comparison tabs or add more run
   folders to an existing viewer, with folder-specific tab titles and icons.
+- **Shared comparison groups** — save named run sets such as baselines, toggle the
+  whole set at once, and continue adjusting member runs individually.
 - **Richer run navigation** — full-name and empty-run tooltips, local sync-state
-  badges, creation timestamps, a persisted **Hide empty** filter, and run-specific
-  context actions.
+  badges, creation timestamps, likely-running indicators, click-to-highlight run
+  names, a persisted **Hide empty** filter, and run-specific context actions.
+
+A run is considered empty when none of its run/training metrics contain values.
+System telemetry by itself does not make a run non-empty.
 
 ## Multi-Run Comparison in Action
 
@@ -112,6 +120,13 @@ Compare training runs side-by-side to understand what hyperparameters and config
 - Multiple independent comparison tabs titled `Wandb: <foldername>`
 - Add multiple folders to one comparison tab
 - Full run-name tooltips, creation times, empty-run highlighting, and sync badges
+- A pulsing green dot for runs with recent file activity, indicating they are
+  likely still running
+- Click a run name to persistently emphasize it across overview and fullscreen
+  charts without changing checkbox selection; click it again to clear the focus
+- Create, edit, delete, and toggle named comparison groups from the bottom of the
+  sidebar; a partially selected group displays an indeterminate checkbox
+- Add a run to an existing or new comparison group from its right-click menu
 - Right-click actions to copy the run ID, isolate a run, or sync it
 - Resizable sidebar for better workspace management
 - Resizable chart heights with draggable dividers
@@ -125,6 +140,13 @@ aliases are keyed by run ID in VS Code's extension-global storage, survive viewe
 reloads, and never modify the run file. Submit an empty custom name to restore the
 original name. The rename field starts with the run's current displayed name for
 easy partial edits.
+
+Comparison groups are saved as names and run IDs in
+`.wandb-viewer-groups.json` in the first folder opened by the comparison panel.
+This makes the selections shareable with collaborators without storing local paths
+or run data. In a multi-folder panel, the group file still belongs to that first
+folder, while a group may reference runs from any folder currently added to the
+panel.
 
 ### ☁ Local Sync Status and Optional Upload
 
