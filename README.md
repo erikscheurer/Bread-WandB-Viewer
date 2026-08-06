@@ -264,7 +264,7 @@ $vsix = "$env:TEMP\wandb-viewer.vsix"; Invoke-WebRequest "https://github.com/eri
 Alternatively, if you want to install this extension on a server, install the latest release with:
 
 ```bash
-CODE_SERVER="$(find "$HOME/.vscode-server/bin" -path '*/bin/code-server' -type f | head -n 1)" \
+CODE_SERVER="$(find "$HOME/.vscode-server/" -path '*/code-server' -type f | head -n 1)" \
   && test -n "$CODE_SERVER" \
   && curl -fL https://github.com/erikscheurer/Bread-WandB-Viewer/releases/latest/download/wandb-viewer.vsix \
     -o /tmp/wandb-viewer-$USER.vsix \
