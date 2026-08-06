@@ -2,7 +2,7 @@
   "name": "wandb-viewer",
   "displayName": "Bread Wandb Viewer",
   "description": "View Weights & Biases run metrics and logs directly in VS Code",
-  "version": "0.3.3",
+  "version": "0.3.4",
   "publisher": "bread-tech",
   "icon": "media/icon.png",
   "repository": {
@@ -156,6 +156,23 @@
             "Glasbey colors optimized for dark chart backgrounds (64)"
           ],
           "description": "Color palette used to assign stable colors to runs in multi-run charts. Colors are not reused until the selected palette is exhausted."
+        },
+        "wandbViewer.chartColumns": {
+          "type": "number",
+          "default": 1,
+          "enum": [
+            1,
+            2,
+            3,
+            4
+          ],
+          "enumDescriptions": [
+            "One chart per row",
+            "Two charts per row",
+            "Three charts per row",
+            "Four charts per row"
+          ],
+          "description": "Number of chart columns in the multi-run viewer. This replaces viewport-dependent automatic chart wrapping."
         }
       }
     }

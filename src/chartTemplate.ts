@@ -246,7 +246,10 @@ export function getChartStyles(): string {
 
         .charts-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
+            grid-template-columns: repeat(
+                var(--wandb-viewer-chart-columns, 1),
+                minmax(0, 1fr)
+            );
             gap: 20px;
         }
 
@@ -397,6 +400,15 @@ export function getChartScript(): string {
         let chartImageMenuOpen = false;
 
         // ==================== CORE FUNCTIONS ====================
+
+        function destroyChartSafely(chart) {
+            if (!chart) return;
+            try {
+                chart.destroy();
+            } catch (error) {
+                console.error('Failed to clean up chart instance.', error);
+            }
+        }
 
         function readThemeColor(variableName, fallback) {
             const value = getComputedStyle(document.body)
@@ -1392,13 +1404,17 @@ export function getChartScript(): string {
                 installRangeInteractions(chart);
             }
 
+            const hoverCanvas = chart.canvas;
             const onChartMouseLeave = () => {
                 clearHoveredRun(chart);
-                chart.canvas.style.cursor = '';
+                hoverCanvas.style.cursor = '';
             };
-            chart.canvas.addEventListener('mouseleave', onChartMouseLeave);
+            hoverCanvas.addEventListener('mouseleave', onChartMouseLeave);
             chart.$hoverInteractionCleanup = () => {
-                chart.canvas.removeEventListener('mouseleave', onChartMouseLeave);
+                // Chart.js clears chart.canvas before running afterDestroy hooks.
+                // Keep the original canvas reference so cleanup remains safe.
+                hoverCanvas.removeEventListener('mouseleave', onChartMouseLeave);
+                chart.$hoverInteractionCleanup = null;
             };
 
             restoreChartViewState(chart);
@@ -2072,16 +2088,20 @@ export function getChartScript(): string {
                 fullscreenRenderToken++;
             }
             if (modalChart) {
-                if (modalChart.$sourceChart) {
-                    copyRunVisibility(modalChart, modalChart.$sourceChart, true);
-                    modalChart.$sourceChart.$isolatedRunKey =
-                        modalChart.$isolatedRunKey || null;
-                    modalChart.$sourceChart.$preIsolationVisibility =
-                        modalChart.$preIsolationVisibility || null;
-                    captureChartViewState(modalChart.$sourceChart);
-                }
-                modalChart.destroy();
+                const chartToDestroy = modalChart;
                 modalChart = null;
+                if (
+                    chartToDestroy.$sourceChart &&
+                    chartToDestroy.$sourceVisibilitySynchronized === true
+                ) {
+                    copyRunVisibility(chartToDestroy, chartToDestroy.$sourceChart, true);
+                    chartToDestroy.$sourceChart.$isolatedRunKey =
+                        chartToDestroy.$isolatedRunKey || null;
+                    chartToDestroy.$sourceChart.$preIsolationVisibility =
+                        chartToDestroy.$preIsolationVisibility || null;
+                    captureChartViewState(chartToDestroy.$sourceChart);
+                }
+                destroyChartSafely(chartToDestroy);
             }
             updatePersistedViewState({
                 fullscreenMetric: null,
@@ -2184,6 +2204,8 @@ export function getModalHtml(leadingControlsHtml: string = ''): string {
                 <div class="modal-title" id="modalTitle"></div>
                 <div class="modal-controls">
                     ${leadingControlsHtml}
+                    <button class="toggle-btn" id="modalReloadPlotBtn" onclick="reloadFullscreenChart()" title="Rebuild this chart">⟳ Reload plot</button>
+                    <button class="toggle-btn" id="modalCopyChartBtn" onclick="copyFullscreenChart()" title="Copy chart to clipboard">📋 Copy chart</button>
                     <div class="smoothing-control">
                         <label for="modalSmoothing">Smoothing:</label>
                         <input type="range" id="modalSmoothing" min="0" max="0.99" step="0.01" value="0" oninput="updateModalSmoothing()">

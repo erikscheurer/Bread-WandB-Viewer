@@ -34,7 +34,9 @@ version adds:
 - **Responsive run selection** — sidebar checkboxes update immediately while rapid
   changes are coalesced before run parsing and chart rebuilding begin.
 - **State-preserving chart updates** — refreshes retain zoom, smoothing, log axes,
-  run visibility, active tabs, filters, sidebar size, and fullscreen state. Raw
+  run visibility, active tabs, filters, sidebar size, and fullscreen state.
+  Fullscreen charts reopen reliably while keeping legend visibility synchronized
+  with the overview. Raw
   and smoothed traces behave as one run. Chart controls remain visible while
   scrolling through long metric lists.
 - **Improved chart interaction** — X-range and box zoom, two-axis panning,
@@ -71,7 +73,7 @@ System telemetry by itself does not make a run non-empty.
 
 - 🔄 **Multi-Run Comparison** - Overlay multiple runs on the same charts with color coding and interactive toggles
 - 🤖 **AI Context Export** - One-click markdown export for Claude Code, Cursor, and Codex with token counting
-- 🎯 **Interactive Charts** - Zoom, pan, fullscreen, and smooth with EMA (exponential moving average)
+- 🎯 **Interactive Charts** - Zoom, pan, fullscreen, smoothing, plot reload, and chart copy
 - 📂 **Automatic File Watching** - Extension detects new .wandb files and refreshes automatically
 - 📊 **System Metrics** - GPU utilization, memory, CPU, disk I/O tracking
 - 🔍 **Metadata Comparison** - Side-by-side config and hyperparameter diff highlighting
@@ -188,6 +190,7 @@ Advanced chart controls for detailed metric analysis.
 - **Cursor Zoom:** Hold Ctrl and scroll to zoom both axes around the pointer
 - **Pan:** Shift+drag in any direction to pan the X and Y axes
 - **Fullscreen:** Click expand icon on any chart
+- **Reload and copy:** Rebuild an overview or fullscreen plot with the reload button; copy a fullscreen chart directly to the clipboard
 - **Log Scales:** Toggle X and Y axis logarithmic scales
 - **Raw Data Overlay:** Show the raw trace behind its smoothed run in overview and fullscreen charts, with both values combined in one tooltip
 - **Auto-decimation:** Large datasets (500+ points) automatically downsampled for performance
@@ -321,6 +324,7 @@ or [upstream releases](https://github.com/Bread-Technologies/Bread-WandB-Viewer/
 |---------|---------|-------------|
 | `wandbViewer.defaultRunSort` | `created-desc` | Initial multi-run ordering; supports creation time, name, and latest-update order |
 | `wandbViewer.runColorPalette` | `tableau10` | Stable run colors from Tableau, Okabe–Ito, Observable, ColorBrewer, Paul Tol, Matplotlib, Plotly (24/26), or background-aware Glasbey (64) palettes; colors are not reused before the palette is exhausted |
+| `wandbViewer.chartColumns` | `1` | Number of chart columns in the multi-run viewer; choose 1–4 to make the layout consistent across machines |
 
 The additional categorical palettes follow the published
 [D3/ColorBrewer schemes](https://d3js.org/d3-scale-chromatic/categorical) and

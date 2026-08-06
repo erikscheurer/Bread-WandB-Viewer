@@ -38,10 +38,18 @@ type RunSortMode = typeof RUN_SORT_MODES[number];
 
 const DEFAULT_RUN_SORT: RunSortMode = 'created-desc';
 const RUN_ACTIVITY_WINDOW_MS = 2 * 60 * 1000;
+const CHART_COLUMNS = [1, 2, 3, 4] as const;
+type ChartColumns = typeof CHART_COLUMNS[number];
+const DEFAULT_CHART_COLUMNS: ChartColumns = 1;
 
 function isRunSortMode(value: unknown): value is RunSortMode {
     return typeof value === 'string' &&
         (RUN_SORT_MODES as readonly string[]).includes(value);
+}
+
+function isChartColumns(value: unknown): value is ChartColumns {
+    return typeof value === 'number' &&
+        (CHART_COLUMNS as readonly number[]).includes(value);
 }
 
 export class MultiRunViewerPanel {
@@ -68,6 +76,7 @@ export class MultiRunViewerPanel {
     private _selectionRefreshPending = false;
     private _comparisonGroups: RunComparisonGroup[] = [];
     private _comparisonGroupsLoadErrorShown = false;
+    private _chartColumns: ChartColumns;
 
     public static createOrShow(
         extensionUri: vscode.Uri,
@@ -156,12 +165,16 @@ export class MultiRunViewerPanel {
         const configuration = vscode.workspace.getConfiguration('wandbViewer');
         const configuredRunSort = configuration.get<string>('defaultRunSort');
         const configuredColorPalette = configuration.get<string>('runColorPalette');
+        const configuredChartColumns = configuration.get<number>('chartColumns');
         this._defaultRunSort = isRunSortMode(configuredRunSort)
             ? configuredRunSort
             : DEFAULT_RUN_SORT;
         this._colorPalette = isRunColorPaletteName(configuredColorPalette)
             ? configuredColorPalette
             : DEFAULT_RUN_COLOR_PALETTE;
+        this._chartColumns = isChartColumns(configuredChartColumns)
+            ? configuredChartColumns
+            : DEFAULT_CHART_COLUMNS;
         this._manager = new MultiRunManager(folderPath, this._colorPalette);
 
         // Show loading screen immediately
@@ -198,6 +211,22 @@ export class MultiRunViewerPanel {
                     this._colorPalette = nextPalette;
                     this._manager.setColorPalette(nextPalette);
                     void this._updateRunColorsInWebview();
+                }
+            }
+
+            if (event.affectsConfiguration('wandbViewer.chartColumns')) {
+                const value = vscode.workspace
+                    .getConfiguration('wandbViewer')
+                    .get<number>('chartColumns');
+                const nextColumns = isChartColumns(value)
+                    ? value
+                    : DEFAULT_CHART_COLUMNS;
+                if (nextColumns !== this._chartColumns) {
+                    this._chartColumns = nextColumns;
+                    void this._panel.webview.postMessage({
+                        command: 'chartColumnsUpdated',
+                        columns: nextColumns
+                    });
                 }
             }
         }, null, this._disposables);
@@ -1197,7 +1226,7 @@ export class MultiRunViewerPanel {
         ${getChartStyles()}
     </style>
 </head>
-<body>
+<body style="--wandb-viewer-chart-columns: ${this._chartColumns};">
     <div class="container">
         <button class="expand-btn" id="expandBtn" onclick="toggleSidebar()">▶</button>
         <button class="collapse-btn" id="collapseBtn" onclick="toggleSidebar()">◀</button>
@@ -1487,6 +1516,7 @@ export class MultiRunViewerPanel {
                                 <div class="chart-title">${this._escapeHtml(metric.metricName)}</div>
                                 <div class="chart-actions">
                                     <button class="btn-small btn-copy-chart" onclick="copySingleChart('${type}', ${metric.index})" title="Copy chart to clipboard">📋</button>
+                                    <button class="btn-small" onclick="reloadOverviewChart('${type}', ${metric.index}, this)" title="Refresh this chart">⟳</button>
                                     <button class="btn-small" onclick="openFullscreen(${metric.index}, '${type}')">⛶</button>
                                 </div>
                             </div>
@@ -2493,6 +2523,18 @@ export class MultiRunViewerPanel {
                 button.removeAttribute('aria-busy');
             });
 
+            function updateChartColumnLayout(columns) {
+                const normalizedColumns = Number(columns);
+                if (!Number.isInteger(normalizedColumns) ||
+                    normalizedColumns < 1 || normalizedColumns > 4) {
+                    return;
+                }
+                document.body.style.setProperty(
+                    '--wandb-viewer-chart-columns',
+                    String(normalizedColumns)
+                );
+            }
+
             function createRunDatasets(metric, isModal) {
                 return metric.datasets.map(dataset => ({
                     label: dataset.runName,
@@ -2569,6 +2611,90 @@ export class MultiRunViewerPanel {
                 return chartInstances[canvas.id];
             }
 
+            function showChartActionFeedback(button, label, duration = 1500) {
+                if (!button) return;
+                const originalLabel = button.textContent;
+                button.textContent = label;
+                button.disabled = true;
+                setTimeout(() => {
+                    button.textContent = originalLabel;
+                    button.disabled = false;
+                }, duration);
+            }
+
+            function reloadOverviewChart(type, metricIndex, button) {
+                const metrics = type === 'training' ? trainingMetrics : systemMetrics;
+                const metric = metrics[metricIndex];
+                if (!metric) return;
+
+                const canvas = Array.from(
+                    document.querySelectorAll('canvas[id^="chart-"]')
+                ).find(candidate =>
+                    candidate.dataset.chartType === type &&
+                    candidate.dataset.metricName === metric.metricName
+                );
+                if (!canvas) return;
+
+                const chart = ensureOverviewChart(metric, type);
+                if (!chart) return;
+
+                updateChartData(chart, metric, false);
+                if (focusedRunId) {
+                    setFocusedRun(chart, focusedRunId);
+                }
+                chart.resize();
+                chart.update('none');
+                showChartActionFeedback(button, '✓');
+            }
+
+            function getFullscreenMetric() {
+                if (!activeFullscreenMetric) return null;
+                const metrics = activeFullscreenMetric.type === 'training'
+                    ? trainingMetrics
+                    : systemMetrics;
+                return metrics.find(metric =>
+                    metric.metricName === activeFullscreenMetric.metricName
+                ) || null;
+            }
+
+            function reloadFullscreenChart() {
+                const metric = getFullscreenMetric();
+                if (!metric || !modalChart) return;
+
+                updateChartData(modalChart, metric, true);
+                if (focusedRunId) {
+                    setFocusedRun(modalChart, focusedRunId);
+                }
+                updateChartAxes(modalChart, modalLogX, modalLogY);
+                modalChart.resize();
+                modalChart.update('none');
+                showChartActionFeedback(
+                    document.getElementById('modalReloadPlotBtn'),
+                    '✓ Reloaded'
+                );
+            }
+
+            async function copyFullscreenChart() {
+                if (!modalChart) return;
+
+                const button = document.getElementById('modalCopyChartBtn');
+                try {
+                    await copyImageToClipboard(modalChart.toBase64Image('image/png'));
+                    if (button) {
+                        const originalLabel = button.textContent;
+                        button.textContent = '✓ Copied';
+                        setTimeout(() => { button.textContent = originalLabel; }, 1500);
+                    }
+                } catch {
+                    // The shared helper has already sent its temporary-file fallback.
+                    if (button) {
+                        const originalLabel = button.textContent;
+                        button.textContent = 'Saved temporarily';
+                        setTimeout(() => { button.textContent = originalLabel; }, 2000);
+                    }
+                }
+            }
+
             function updateRunColorSwatches(runColors) {
                 if (!runColors || typeof runColors !== 'object') return;
 
@@ -2634,12 +2760,21 @@ export class MultiRunViewerPanel {
                     const metric = metrics.find(
                         candidate => candidate.metricName === activeFullscreenMetric.metricName
                     );
-                    updateChartData(modalChart, metric, true);
+                    // A rapid sidebar selection change can temporarily remove the
+                    // metric that opened this modal. Keep the current fullscreen
+                    // data until a matching metric arrives instead of blanking it.
+                    if (metric) {
+                        updateChartData(modalChart, metric, true);
+                    }
                 }
             }
 
             window.addEventListener('message', event => {
                 const message = event.data;
+                if (message.command === 'chartColumnsUpdated') {
+                    updateChartColumnLayout(message.columns);
+                    return;
+                }
                 if (message.runLastModified) {
                     updateRunActivityIndicators(message.runLastModified);
                 }
@@ -2716,8 +2851,9 @@ export class MultiRunViewerPanel {
 
                 const renderToken = ++fullscreenRenderToken;
                 if (modalChart) {
-                    modalChart.destroy();
+                    const chartToDestroy = modalChart;
                     modalChart = null;
+                    destroyChartSafely(chartToDestroy);
                 }
 
                 requestAnimationFrame(() => {
@@ -2735,11 +2871,7 @@ export class MultiRunViewerPanel {
                         : systemMetrics;
                     const currentMetric = currentMetrics.find(candidate =>
                         candidate.metricName === metric.metricName
-                    );
-                    if (!currentMetric) {
-                        closeFullscreen();
-                        return;
-                    }
+                    ) || metric;
 
                     const ctx = document.getElementById('modalChart');
                     const datasets = createRunDatasets(currentMetric, true);
@@ -2757,6 +2889,7 @@ export class MultiRunViewerPanel {
                         modalChart.$preIsolationVisibility =
                             sourceChart.$preIsolationVisibility || null;
                         modalChart.$sourceChart = sourceChart;
+                        modalChart.$sourceVisibilitySynchronized = true;
                         modalChart.update('none');
                     }
                     if (focusedRunId) {
