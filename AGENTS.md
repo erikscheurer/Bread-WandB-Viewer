@@ -25,6 +25,8 @@ action that invokes the user's locally installed `wandb sync` CLI.
   rebuilding for smoothing and capture flows.
 - `src/runColors.ts`: configurable run palettes and deterministic run-ID color
   assignment.
+- `src/runComparisonGroups.ts`: validation and persistence for shared named run
+  selections in `.wandb-viewer-groups.json`.
 - `src/aiContext/`: configuration comparison, metric summaries, and Markdown export.
 - `src/wandb.proto`: W&B record schema.
 - `media/`: extension artwork and README assets.
@@ -83,6 +85,14 @@ checklist. After installation, tell the user to run `Developer: Reload Window`;
 installing a VSIX does not replace code already loaded by the current extension
 host.
 
+For a Remote SSH workspace, the local `code` CLI and the remote extension host are
+separate installations. Copy the validated VSIX to a specific remote `/tmp` path,
+use the `code-server` binary for the active VS Code Server commit under the remote
+user's `.vscode-server/bin`, install with `--force`, and verify the extension ID and
+version with `--list-extensions --show-versions`. Do not assume that a successful
+local installation updated the remote server; the remote window also needs
+`Developer: Reload Window`.
+
 ## Implementation conventions
 
 - Keep TypeScript compatible with the strict settings in `tsconfig.json` and with
@@ -102,6 +112,10 @@ host.
 - For data-only refreshes, update existing webview charts through messages instead
   of replacing `webview.html`; rebuilding the document discards zoom, log-axis,
   smoothing, fullscreen, and other browser-side state.
+- Reload Plot is a browser-side chart refresh, not a run reparse. Refresh the
+  existing Chart.js instance and its datasets in place, preserve visibility and
+  view state, and provide visible completion feedback; do not destroy and recreate
+  the canvas merely to redraw it.
 - Treat run-palette changes as style/data refreshes: update sidebar swatches,
   comparison swatches, overview datasets, and fullscreen datasets through a
   webview message without rebuilding the document.
@@ -114,10 +128,21 @@ host.
 - Treat fullscreen restoration as explicit modal state. Persist both the metric
   identity and whether the modal is open, clear both even when no Chart.js instance
   exists, and invalidate deferred modal renders when fullscreen closes.
+- Treat Chart.js destruction as a fallible lifecycle boundary. Chart.js clears
+  `chart.canvas` before `afterDestroy` hooks run, so event-cleanup closures must
+  capture the original canvas instead of dereferencing `chart.canvas`. Clear shared
+  chart references before destruction, make cleanup idempotent, and do not let a
+  cleanup exception abort fullscreen close or the next fullscreen render.
 - Multi-run comparisons are not a singleton. Each independent panel owns its own
   manager, folder set, watcher set, webview state, title, and disposal lifecycle.
   Adding a folder to a panel must rescan all roots so runs from earlier roots are
   not mistaken for deletions.
+- Comparison groups are shared workspace data, not VS Code UI state. Store the
+  versioned `.wandb-viewer-groups.json` in the first folder opened by the panel,
+  validate and bound all file content before use, retain IDs for runs from other or
+  currently unopened roots, and roll back in-memory edits when saving fails. Group
+  toggles and individual run checkboxes must remain synchronized, including the
+  group's indeterminate state.
 - Preserve VS Code disposal lifecycles. Register commands, watchers, panels, and
   listeners in the relevant `context.subscriptions` or `_disposables` collection.
 - Avoid blocking the extension host during scans and large-file processing. Retain
@@ -161,6 +186,9 @@ host.
 - Keep the overview chart controls sticky within the actual scrolling container.
   The multi-run wrapper and the shared single-run controls have different parent
   layouts, so audit both when changing toolbar positioning.
+- Keep `wandbViewer.chartColumns` explicit and consistent across machines. Align
+  its package declaration with host-side validation, and apply setting changes to
+  open webviews through the chart-grid CSS variable without rebuilding the page.
 - Treat fullscreen state as host-verified before rebuilding a multi-run webview.
   Modal open/close events update the host, and run-selection messages carry the
   current modal state so stale `vscode.getState()` data cannot reopen a closed
@@ -213,7 +241,8 @@ host.
    together when user-facing behavior changes.
    Keep the declared values for `wandbViewer.defaultRunSort` and
    `wandbViewer.runColorPalette` aligned with the validation in the multi-run
-   viewer.
+   viewer, and keep the `wandbViewer.chartColumns` enum aligned with its numeric
+   host/webview validation.
 3. Run `npm run compile`.
 4. For AI-context changes, also run `node test-ai-context.js` and add focused cases
    there when practical.
@@ -225,3 +254,8 @@ host.
    and the `protobufjs` runtime dependencies while excluding `wandb/`, `.env`,
    source maps, local datasets, and other private development artifacts.
 7. Do not commit packaged `.vsix` artifacts unless the task is explicitly a release.
+8. For a release tag, bump both `package.json` and the root/package entries in
+   `package-lock.json`, commit the bump with the source changes, and create an
+   annotated `v<package-version>` tag. The release workflow rejects a mismatched
+   tag and publishes its own validated `wandb-viewer.vsix`; do not commit that
+   generated asset.

@@ -87,6 +87,53 @@ System telemetry by itself does not make a run non-empty.
 
 ## Quick Start
 
+### Installation
+
+This fork is distributed through
+[GitHub Releases](https://github.com/erikscheurer/Bread-WandB-Viewer/releases).
+On Linux or macOS, install the latest release with:
+
+```bash
+curl -fL https://github.com/erikscheurer/Bread-WandB-Viewer/releases/latest/download/wandb-viewer.vsix -o /tmp/wandb-viewer.vsix && code --install-extension /tmp/wandb-viewer.vsix --force
+```
+
+On Windows PowerShell:
+
+```powershell
+$vsix = "$env:TEMP\wandb-viewer.vsix"; Invoke-WebRequest "https://github.com/erikscheurer/Bread-WandB-Viewer/releases/latest/download/wandb-viewer.vsix" -OutFile $vsix; code --install-extension $vsix --force
+```
+
+Alternatively, if you want to install this extension on a server, install the latest release with:
+
+```bash
+CODE_SERVER="$(find "$HOME/.vscode-server/" -path '*/code-server' -type f | head -n 1)" \
+  && test -n "$CODE_SERVER" \
+  && curl -fL https://github.com/erikscheurer/Bread-WandB-Viewer/releases/latest/download/wandb-viewer.vsix \
+    -o /tmp/wandb-viewer-$USER.vsix \
+  && "$CODE_SERVER" --install-extension /tmp/wandb-viewer-$USER.vsix --force
+```
+
+Then run `Developer: Reload Window` in VS Code. VS Code does not automatically
+update extensions installed from a VSIX, so rerun the installation command to
+upgrade to a newer release. Because the fork retains the upstream extension
+identifier, installing this VSIX replaces an installed upstream copy.
+
+<details>
+<summary>Build and install from source</summary>
+
+```bash
+npm install
+npm run compile
+npm run package:vsix -- /tmp/wandb-viewer-local.vsix
+code --install-extension /tmp/wandb-viewer-local.vsix --force
+```
+
+</details>
+
+To install the original release instead, use the
+[VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=bread-tech.wandb-viewer)
+or [upstream releases](https://github.com/Bread-Technologies/Bread-WandB-Viewer/releases).
+
 **View a single run:**
 1. Click any `.wandb` file in VS Code Explorer
 2. Charts and metrics appear instantly
@@ -245,52 +292,6 @@ network connection if those assets are not cached.
 
 ---
 
-## Installation
-
-This fork is distributed through
-[GitHub Releases](https://github.com/erikscheurer/Bread-WandB-Viewer/releases).
-On Linux or macOS, install the latest release with:
-
-```bash
-curl -fL https://github.com/erikscheurer/Bread-WandB-Viewer/releases/latest/download/wandb-viewer.vsix -o /tmp/wandb-viewer.vsix && code --install-extension /tmp/wandb-viewer.vsix --force
-```
-
-On Windows PowerShell:
-
-```powershell
-$vsix = "$env:TEMP\wandb-viewer.vsix"; Invoke-WebRequest "https://github.com/erikscheurer/Bread-WandB-Viewer/releases/latest/download/wandb-viewer.vsix" -OutFile $vsix; code --install-extension $vsix --force
-```
-
-Alternatively, if you want to install this extension on a server, install the latest release with:
-
-```bash
-CODE_SERVER="$(find "$HOME/.vscode-server/" -path '*/code-server' -type f | head -n 1)" \
-  && test -n "$CODE_SERVER" \
-  && curl -fL https://github.com/erikscheurer/Bread-WandB-Viewer/releases/latest/download/wandb-viewer.vsix \
-    -o /tmp/wandb-viewer-$USER.vsix \
-  && "$CODE_SERVER" --install-extension /tmp/wandb-viewer-$USER.vsix --force
-```
-
-Then run `Developer: Reload Window` in VS Code. VS Code does not automatically
-update extensions installed from a VSIX, so rerun the installation command to
-upgrade to a newer release. Because the fork retains the upstream extension
-identifier, installing this VSIX replaces an installed upstream copy.
-
-<details>
-<summary>Build and install from source</summary>
-
-```bash
-npm install
-npm run compile
-npm run package:vsix -- /tmp/wandb-viewer-local.vsix
-code --install-extension /tmp/wandb-viewer-local.vsix --force
-```
-
-</details>
-
-To install the original release instead, use the
-[VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=bread-tech.wandb-viewer)
-or [upstream releases](https://github.com/Bread-Technologies/Bread-WandB-Viewer/releases).
 
 ### Requirements
 
