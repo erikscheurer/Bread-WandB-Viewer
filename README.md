@@ -59,14 +59,6 @@ version adds:
 A run is considered empty when none of its run/training metrics contain values.
 System telemetry by itself does not make a run non-empty.
 
-## Multi-Run Comparison in Action
-
-![Multi-run comparison demo](media/hero.gif)
-*View multiple training runs in seconds - no browser needed*
-
-![Bread Wandb Viewer Screenshot](https://raw.githubusercontent.com/Bread-Technologies/bread_wandb_viewer_extension/main/screenshot.png)
-*Compare W&B training metrics with interactive sidebar*
-
 ---
 
 ## Features
@@ -149,6 +141,14 @@ That's it! No configuration needed.
 ---
 
 ## Visual Demos
+
+### Multi-Run Comparison in Action
+
+![Multi-run comparison demo](media/hero.gif)
+*View multiple training runs in seconds - no browser needed*
+
+![Bread Wandb Viewer Screenshot](https://raw.githubusercontent.com/Bread-Technologies/bread_wandb_viewer_extension/main/screenshot.png)
+*Compare W&B training metrics with interactive sidebar*
 
 ### AI Context Generation
 
