@@ -18,6 +18,11 @@ import {
     validateCustomRunName
 } from './customRunNames';
 import {
+    getCustomRunColors,
+    normalizeCustomRunColor,
+    setCustomRunColor
+} from './customRunColors';
+import {
     loadRunComparisonGroups,
     RunComparisonGroup,
     RUN_COMPARISON_GROUPS_FILE,
@@ -68,8 +73,9 @@ export class MultiRunViewerPanel {
     private _initialUpdateTimer: NodeJS.Timeout | null = null;
     private _defaultRunSort: RunSortMode;
     private _colorPalette: RunColorPaletteName;
-    private readonly _nameStorage: vscode.Memento;
+    private readonly _extensionStorage: vscode.Memento;
     private _customRunNames: Record<string, string>;
+    private _customRunColors: Record<string, string>;
     private _isFullscreenOpen = false;
     private _selectionRefreshTimer: NodeJS.Timeout | null = null;
     private _selectionRefreshInProgress = false;
@@ -160,8 +166,9 @@ export class MultiRunViewerPanel {
         this._extensionUri = extensionUri;
         this._folderPath = path.resolve(folderPath);
         this._folderPaths.add(this._folderPath);
-        this._nameStorage = nameStorage;
+        this._extensionStorage = nameStorage;
         this._customRunNames = getCustomRunNames(nameStorage);
+        this._customRunColors = getCustomRunColors(nameStorage);
         const configuration = vscode.workspace.getConfiguration('wandbViewer');
         const configuredRunSort = configuration.get<string>('defaultRunSort');
         const configuredColorPalette = configuration.get<string>('runColorPalette');
@@ -175,7 +182,11 @@ export class MultiRunViewerPanel {
         this._chartColumns = isChartColumns(configuredChartColumns)
             ? configuredChartColumns
             : DEFAULT_CHART_COLUMNS;
-        this._manager = new MultiRunManager(folderPath, this._colorPalette);
+        this._manager = new MultiRunManager(
+            folderPath,
+            this._colorPalette,
+            this._customRunColors
+        );
 
         // Show loading screen immediately
         this._panel.webview.html = this._getLoadingHtml();
@@ -316,6 +327,14 @@ export class MultiRunViewerPanel {
                     case 'renameRun':
                         if (typeof message.runId === 'string') {
                             await this._renameRun(message.runId);
+                        }
+                        break;
+                    case 'setRunColor':
+                        if (
+                            typeof message.runId === 'string' &&
+                            (typeof message.color === 'string' || message.color === null)
+                        ) {
+                            await this._setRunColor(message.runId, message.color);
                         }
                         break;
                     case 'fullscreenStateChanged':
@@ -685,7 +704,7 @@ export class MultiRunViewerPanel {
         }
 
         const updatedNames = await setCustomRunName(
-            this._nameStorage,
+            this._extensionStorage,
             runId,
             customName
         );
@@ -696,6 +715,44 @@ export class MultiRunViewerPanel {
             }
             panel._customRunNames = updatedNames;
             refreshes.push(panel._update(false));
+        }
+        await Promise.all(refreshes);
+    }
+
+    private async _setRunColor(runId: string, color: string | null): Promise<void> {
+        if (!this._manager.getState().runs.has(runId)) {
+            return;
+        }
+
+        const normalizedColor = color === null
+            ? undefined
+            : normalizeCustomRunColor(color);
+        if (color !== null && !normalizedColor) {
+            await this._updateRunColorsInWebview();
+            return;
+        }
+
+        let updatedColors: Record<string, string>;
+        try {
+            updatedColors = await setCustomRunColor(
+                this._extensionStorage,
+                runId,
+                normalizedColor
+            );
+        } catch {
+            vscode.window.showErrorMessage('Failed to save the custom run color.');
+            await this._updateRunColorsInWebview();
+            return;
+        }
+
+        const refreshes: Promise<void>[] = [];
+        for (const panel of MultiRunViewerPanel.panels) {
+            if (panel._disposed) {
+                continue;
+            }
+            panel._customRunColors = updatedColors;
+            panel._manager.setCustomRunColors(updatedColors);
+            refreshes.push(panel._updateRunColorsInWebview());
         }
         await Promise.all(refreshes);
     }
@@ -1044,6 +1101,7 @@ export class MultiRunViewerPanel {
         await this._panel.webview.postMessage({
             command: 'runColorsUpdated',
             runColors,
+            customRunColorIds: Object.keys(this._customRunColors),
             mergedMetrics: this._getMergedMetrics()
         });
     }
@@ -1161,10 +1219,19 @@ export class MultiRunViewerPanel {
                     data-updated-at="${run.lastModified}"
                     data-file-size="${run.fileSize}"
                     data-content-status="${contentStatus}"
+                    data-custom-color="${Object.prototype.hasOwnProperty.call(this._customRunColors, run.runId)}"
                     oncontextmenu="openRunContextMenu(event, this)"
                 >
                     <input type="checkbox" ${isSelected ? 'checked' : ''} onchange="toggleRun(this.closest('.run-item').dataset.runId, this.checked)">
-                    <div class="run-color" style="background: ${color}"></div>
+                    <input
+                        class="run-color"
+                        type="color"
+                        value="${color}"
+                        aria-label="Change color for ${this._escapeHtml(run.runName)}"
+                        title="Change this run's saved color"
+                        onclick="event.stopPropagation()"
+                        onchange="setRunColor(this.closest('.run-item').dataset.runId, this.value)"
+                    >
                     <div class="run-info">
                         <div class="run-name-row">
                             <span class="run-activity" title="Recently updated; likely still running" aria-label="Likely running">●</span>
@@ -1319,6 +1386,7 @@ export class MultiRunViewerPanel {
         <button type="button" role="menuitem" onclick="runContextAction('isolate')">Show only this run</button>
         <button type="button" role="menuitem" onclick="runContextAction('addToGroup')">Add to comparison group…</button>
         <button type="button" role="menuitem" onclick="runContextAction('rename')">Set custom run name…</button>
+        <button type="button" role="menuitem" id="resetRunColorMenuItem" onclick="runContextAction('resetColor')">Reset custom color</button>
         <button type="button" role="menuitem" onclick="runContextAction('sync')">Sync this run</button>
     </div>
 
@@ -2377,6 +2445,20 @@ export class MultiRunViewerPanel {
                 });
             }
 
+            function setRunColor(runId, color) {
+                const runItem = Array.from(
+                    document.querySelectorAll('.run-item[data-run-id]')
+                ).find(item => item.dataset.runId === runId);
+                if (runItem) {
+                    runItem.dataset.customColor = 'true';
+                }
+                vscode.postMessage({
+                    command: 'setRunColor',
+                    runId,
+                    color
+                });
+            }
+
             function selectAllRuns() {
                 const runIds = Array.from(
                     document.querySelectorAll('.run-item[data-run-id]'),
@@ -2412,6 +2494,10 @@ export class MultiRunViewerPanel {
                 event.preventDefault();
                 event.stopPropagation();
                 contextRunId = runItem.dataset.runId;
+                const resetColorMenuItem = document.getElementById('resetRunColorMenuItem');
+                if (resetColorMenuItem) {
+                    resetColorMenuItem.disabled = runItem.dataset.customColor !== 'true';
+                }
                 runContextMenu.classList.add('visible');
                 runContextMenu.setAttribute('aria-hidden', 'false');
 
@@ -2443,6 +2529,12 @@ export class MultiRunViewerPanel {
                     });
                 } else if (action === 'rename') {
                     vscode.postMessage({ command: 'renameRun', runId });
+                } else if (action === 'resetColor') {
+                    vscode.postMessage({
+                        command: 'setRunColor',
+                        runId,
+                        color: null
+                    });
                 } else if (action === 'sync') {
                     setSyncButtonsBusy(true);
                     vscode.postMessage({ command: 'syncRuns', runIds: [runId] });
@@ -2695,15 +2787,19 @@ export class MultiRunViewerPanel {
                 }
             }
 
-            function updateRunColorSwatches(runColors) {
+            function updateRunColorSwatches(runColors, customRunColorIds) {
                 if (!runColors || typeof runColors !== 'object') return;
+                const customColorSet = new Set(
+                    Array.isArray(customRunColorIds) ? customRunColorIds : []
+                );
 
                 document.querySelectorAll('.run-item[data-run-id]').forEach(item => {
                     const color = runColors[item.dataset.runId];
                     const swatch = item.querySelector('.run-color');
                     if (typeof color === 'string' && swatch) {
-                        swatch.style.background = color;
+                        swatch.value = color;
                     }
+                    item.dataset.customColor = String(customColorSet.has(item.dataset.runId));
                 });
                 document.querySelectorAll(
                     '#configCompareTable tbody tr[data-run-id]'
@@ -2809,7 +2905,10 @@ export class MultiRunViewerPanel {
                 }
 
                 if (message.command === 'runColorsUpdated') {
-                    updateRunColorSwatches(message.runColors);
+                    updateRunColorSwatches(
+                        message.runColors,
+                        message.customRunColorIds
+                    );
                 }
                 updateMergedMetrics(message.mergedMetrics);
             });
@@ -3301,9 +3400,25 @@ export class MultiRunViewerPanel {
                 accent-color: var(--vscode-focusBorder, var(--vscode-button-background));
             }
             .run-color {
-                width: 12px;
-                height: 12px;
+                width: 16px;
+                height: 16px;
+                flex: 0 0 16px;
+                padding: 0;
+                border: 0;
                 border-radius: 2px;
+                background: transparent;
+                cursor: pointer;
+            }
+            .run-color::-webkit-color-swatch-wrapper {
+                padding: 0;
+            }
+            .run-color::-webkit-color-swatch {
+                border: 1px solid var(--vscode-contrastBorder, transparent);
+                border-radius: 2px;
+            }
+            .run-color:focus-visible {
+                outline: 1px solid var(--vscode-focusBorder);
+                outline-offset: 2px;
             }
             .run-info {
                 flex: 1;
@@ -3416,6 +3531,12 @@ export class MultiRunViewerPanel {
             .run-context-menu button:hover {
                 color: var(--vscode-menu-selectionForeground, var(--vscode-list-activeSelectionForeground));
                 background: var(--vscode-menu-selectionBackground, var(--vscode-list-activeSelectionBackground));
+            }
+            .run-context-menu button:disabled {
+                color: var(--vscode-disabledForeground, var(--vscode-descriptionForeground));
+                background: transparent;
+                cursor: default;
+                opacity: 0.55;
             }
             .metadata-section {
                 margin-bottom: 8px;

@@ -47,7 +47,8 @@ version adds:
   independent run-row and parameter-column sorting, plus glob run filtering and
   sorting by name, creation time, or latest update.
 - **Stable, theme-aware visuals** — deterministic configurable run palettes,
-  improved light-theme contrast, and unfilled run curves.
+  persistent per-run color overrides, improved light-theme contrast, and unfilled
+  run curves.
 - **Multi-folder workspaces** — open independent comparison tabs or add more run
   folders to an existing viewer, with folder-specific tab titles and icons.
 - **Shared comparison groups** — save named run sets such as baselines, toggle the
@@ -189,6 +190,12 @@ aliases are keyed by run ID in VS Code's extension-global storage, survive viewe
 reloads, and never modify the run file. Submit an empty custom name to restore the
 original name. The rename field starts with the run's current displayed name for
 easy partial edits.
+
+Click a run's color swatch in the comparison sidebar to choose a custom color.
+Custom colors are keyed by run ID in VS Code's extension-global storage, so they
+survive viewer reloads and take precedence over the configured palette. Use
+**Reset custom color** in the run context menu to return to automatic palette
+assignment.
 
 Comparison groups are saved as names and run IDs in
 `.wandb-viewer-groups.json` in the first folder opened by the comparison panel.

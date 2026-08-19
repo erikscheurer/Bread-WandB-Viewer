@@ -33,13 +33,16 @@ export class MultiRunManager {
     private state: MultiRunState;
     private cacheAccessOrder: string[] = []; // For LRU eviction
     private colorPalette: RunColorPaletteName;
+    private customRunColors: Readonly<Record<string, string>>;
     private runContentStatuses = new Map<string, RunContentStatus>();
 
     constructor(
         folderPath: string,
-        colorPalette: RunColorPaletteName = DEFAULT_RUN_COLOR_PALETTE
+        colorPalette: RunColorPaletteName = DEFAULT_RUN_COLOR_PALETTE,
+        customRunColors: Readonly<Record<string, string>> = {}
     ) {
         this.colorPalette = colorPalette;
+        this.customRunColors = customRunColors;
         this.state = {
             runs: new Map(),
             parsedData: new Map(),
@@ -63,7 +66,8 @@ export class MultiRunManager {
         if (!this.state.colorMap.has(runResult.runId)) {
             this.state.colorMap.set(
                 runResult.runId,
-                this.assignRunColor(runResult.runId)
+                this.customRunColors[runResult.runId] ||
+                    this.assignRunColor(runResult.runId)
             );
         }
     }
@@ -188,6 +192,14 @@ export class MultiRunManager {
     }
 
     /**
+     * Apply extension-global per-run colors without changing palette defaults.
+     */
+    setCustomRunColors(customRunColors: Readonly<Record<string, string>>): void {
+        this.customRunColors = customRunColors;
+        this.rebuildRunColors();
+    }
+
+    /**
      * Start at the run's stable hash position and probe for an unused palette
      * entry. A color is only reused once every color in the palette is occupied.
      */
@@ -211,8 +223,19 @@ export class MultiRunManager {
         const runIds = Array.from(this.state.runs.keys())
             .sort((left, right) => left.localeCompare(right));
 
+        // Reserve explicit colors before assigning palette entries to other runs.
+        // User-selected duplicates remain valid because they are intentional.
         for (const runId of runIds) {
-            this.state.colorMap.set(runId, this.assignRunColor(runId));
+            const customColor = this.customRunColors[runId];
+            if (customColor) {
+                this.state.colorMap.set(runId, customColor);
+            }
+        }
+
+        for (const runId of runIds) {
+            if (!this.state.colorMap.has(runId)) {
+                this.state.colorMap.set(runId, this.assignRunColor(runId));
+            }
         }
     }
 
