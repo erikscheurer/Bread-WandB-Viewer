@@ -1,5 +1,10 @@
 import { RunScanResult } from './MultiRunScanner';
-import { WandbRunData, WandbMetrics, parseWandbFile, MetricPoint } from './wandbParser';
+import {
+    WandbRunData,
+    hasWandbMetricData,
+    parseWandbFile,
+    MetricPoint
+} from './wandbParser';
 import {
     DEFAULT_RUN_COLOR_PALETTE,
     getStableRunColorIndex,
@@ -29,20 +34,109 @@ export type RunContentStatus = 'unknown' | 'empty' | 'has-data';
 
 const MAX_CACHE_SIZE = 20;
 
+/**
+ * Reduce a metric series before it crosses the extension-host/webview boundary.
+ * The parsed run cache retains the complete series for AI export and summaries.
+ */
+export function downsampleMetricPoints(
+    points: MetricPoint[],
+    maxPoints: number
+): MetricPoint[] {
+    if (maxPoints <= 0 || points.length <= maxPoints) {
+        return points;
+    }
+    if (maxPoints === 1) {
+        return [points[points.length - 1]];
+    }
+    if (maxPoints === 2) {
+        return [points[0], points[points.length - 1]];
+    }
+
+    // Largest-Triangle-Three-Buckets preserves spikes and curve shape much
+    // better than selecting every nth point while keeping both endpoints.
+    const sampled: MetricPoint[] = [points[0]];
+    const bucketWidth = (points.length - 2) / (maxPoints - 2);
+    let previousIndex = 0;
+
+    for (let bucket = 0; bucket < maxPoints - 2; bucket++) {
+        const averageStart = Math.min(
+            Math.floor((bucket + 1) * bucketWidth) + 1,
+            points.length
+        );
+        const averageEnd = Math.min(
+            Math.floor((bucket + 2) * bucketWidth) + 1,
+            points.length
+        );
+        const averageRangeEnd = Math.max(averageEnd, averageStart + 1);
+        let averageStep = 0;
+        let averageValue = 0;
+        let averageCount = 0;
+
+        for (
+            let index = averageStart;
+            index < averageRangeEnd && index < points.length;
+            index++
+        ) {
+            averageStep += points[index].step;
+            averageValue += points[index].value;
+            averageCount++;
+        }
+        if (averageCount === 0) {
+            averageStep = points[points.length - 1].step;
+            averageValue = points[points.length - 1].value;
+            averageCount = 1;
+        }
+        averageStep /= averageCount;
+        averageValue /= averageCount;
+
+        const rangeStart = Math.floor(bucket * bucketWidth) + 1;
+        const rangeEnd = Math.min(
+            Math.floor((bucket + 1) * bucketWidth) + 1,
+            points.length - 1
+        );
+        const previousPoint = points[previousIndex];
+        let selectedIndex = rangeStart;
+        let largestArea = -1;
+
+        for (let index = rangeStart; index < rangeEnd; index++) {
+            const point = points[index];
+            const area = Math.abs(
+                (previousPoint.step - averageStep) *
+                    (point.value - previousPoint.value) -
+                (previousPoint.step - point.step) *
+                    (averageValue - previousPoint.value)
+            );
+            if (area > largestArea) {
+                largestArea = area;
+                selectedIndex = index;
+            }
+        }
+
+        sampled.push(points[selectedIndex]);
+        previousIndex = selectedIndex;
+    }
+
+    sampled.push(points[points.length - 1]);
+    return sampled;
+}
+
 export class MultiRunManager {
     private state: MultiRunState;
     private cacheAccessOrder: string[] = []; // For LRU eviction
     private colorPalette: RunColorPaletteName;
     private customRunColors: Readonly<Record<string, string>>;
     private runContentStatuses = new Map<string, RunContentStatus>();
+    private readonly selectNewRuns: boolean;
 
     constructor(
         folderPath: string,
         colorPalette: RunColorPaletteName = DEFAULT_RUN_COLOR_PALETTE,
-        customRunColors: Readonly<Record<string, string>> = {}
+        customRunColors: Readonly<Record<string, string>> = {},
+        selectNewRuns: boolean = true
     ) {
         this.colorPalette = colorPalette;
         this.customRunColors = customRunColors;
+        this.selectNewRuns = selectNewRuns;
         this.state = {
             runs: new Map(),
             parsedData: new Map(),
@@ -59,7 +153,7 @@ export class MultiRunManager {
         this.state.runs.set(runResult.runId, runResult);
 
         // Auto-select new runs
-        if (runResult.isVisible) {
+        if (runResult.isVisible && this.selectNewRuns) {
             this.state.selectedRunIds.add(runResult.runId);
         }
 
@@ -95,6 +189,7 @@ export class MultiRunManager {
     toggleRun(runId: string): boolean {
         if (this.state.selectedRunIds.has(runId)) {
             this.state.selectedRunIds.delete(runId);
+            this.evictIfNeeded();
             return false;
         } else {
             this.state.selectedRunIds.add(runId);
@@ -114,6 +209,7 @@ export class MultiRunManager {
             this.state.selectedRunIds.add(runId);
         } else {
             this.state.selectedRunIds.delete(runId);
+            this.evictIfNeeded();
         }
         return true;
     }
@@ -132,6 +228,7 @@ export class MultiRunManager {
      */
     deselectAll(): void {
         this.state.selectedRunIds.clear();
+        this.evictIfNeeded();
     }
 
     /**
@@ -144,6 +241,7 @@ export class MultiRunManager {
 
         this.state.selectedRunIds.clear();
         this.state.selectedRunIds.add(runId);
+        this.evictIfNeeded();
         return true;
     }
 
@@ -177,6 +275,42 @@ export class MultiRunManager {
 
     getRunContentStatus(runId: string): RunContentStatus {
         return this.runContentStatuses.get(runId) || 'unknown';
+    }
+
+    /**
+     * Classify an unparsed run without adding its full contents to the LRU.
+     * Returns true only when a current unknown status was resolved.
+     */
+    async inspectRunContentStatus(
+        runId: string,
+        shouldContinue: () => boolean = () => true
+    ): Promise<boolean> {
+        if (this.getRunContentStatus(runId) !== 'unknown') {
+            return false;
+        }
+        const run = this.state.runs.get(runId);
+        if (!run) {
+            return false;
+        }
+
+        const inspectedLastModified = run.lastModified;
+        const inspectedFileSize = run.fileSize;
+        try {
+            const hasData = await hasWandbMetricData(run.filePath, shouldContinue);
+            const currentRun = this.state.runs.get(runId);
+            if (
+                !currentRun ||
+                currentRun.lastModified !== inspectedLastModified ||
+                currentRun.fileSize !== inspectedFileSize ||
+                this.getRunContentStatus(runId) !== 'unknown'
+            ) {
+                return false;
+            }
+            this.runContentStatuses.set(runId, hasData ? 'has-data' : 'empty');
+            return true;
+        } catch {
+            return false;
+        }
     }
 
     /**
@@ -303,7 +437,10 @@ export class MultiRunManager {
     /**
      * Merge metrics from selected runs
      */
-    mergeMetrics(): { training: MergedMetric[], system: MergedMetric[] } {
+    mergeMetrics(maxPointsPerSeries: number = 0): {
+        training: MergedMetric[],
+        system: MergedMetric[]
+    } {
         const trainingMetrics = new Map<string, MergedMetric>();
         const systemMetrics = new Map<string, MergedMetric>();
 
@@ -330,7 +467,10 @@ export class MultiRunManager {
                     runId,
                     runName: run.runName,
                     color,
-                    data: metricData as MetricPoint[]
+                    data: downsampleMetricPoints(
+                        metricData as MetricPoint[],
+                        maxPointsPerSeries
+                    )
                 });
             }
 
@@ -347,7 +487,10 @@ export class MultiRunManager {
                     runId,
                     runName: run.runName,
                     color,
-                    data: metricData as MetricPoint[]
+                    data: downsampleMetricPoints(
+                        metricData as MetricPoint[],
+                        maxPointsPerSeries
+                    )
                 });
             }
         }
@@ -390,11 +533,21 @@ export class MultiRunManager {
      * Evict least recently used entries if cache is too large
      */
     private evictIfNeeded(): void {
-        while (this.state.parsedData.size > MAX_CACHE_SIZE) {
-            const lruRunId = this.cacheAccessOrder.shift();
-            if (lruRunId) {
-                this.state.parsedData.delete(lruRunId);
+        let deselectedCacheSize = Array.from(this.state.parsedData.keys())
+            .filter(runId => !this.state.selectedRunIds.has(runId))
+            .length;
+        while (deselectedCacheSize > MAX_CACHE_SIZE) {
+            const lruIndex = this.cacheAccessOrder.findIndex(
+                runId => !this.state.selectedRunIds.has(runId)
+            );
+            if (lruIndex === -1) {
+                // Selected runs must stay parsed so every selected dataset can be
+                // merged. The cache shrinks again as runs are deselected.
+                break;
             }
+            const [lruRunId] = this.cacheAccessOrder.splice(lruIndex, 1);
+            this.state.parsedData.delete(lruRunId);
+            deselectedCacheSize--;
         }
     }
 
@@ -414,6 +567,10 @@ export class MultiRunManager {
             ) {
                 this.state.parsedData.delete(runResult.runId);
                 this.runContentStatuses.set(runResult.runId, 'unknown');
+                const index = this.cacheAccessOrder.indexOf(runResult.runId);
+                if (index > -1) {
+                    this.cacheAccessOrder.splice(index, 1);
+                }
             }
         }
     }

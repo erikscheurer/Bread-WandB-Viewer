@@ -23,12 +23,13 @@ import {
     setCustomRunColor
 } from './customRunColors';
 import {
-    loadRunComparisonGroups,
+    loadRunComparisonGroupSources,
     RunComparisonGroup,
     RUN_COMPARISON_GROUPS_FILE,
     saveRunComparisonGroups,
     validateRunComparisonGroupName
 } from './runComparisonGroups';
+import { normalizeMultiRunPanelRestorationState } from './multiRunPanelState';
 
 const RUN_SORT_MODES = [
     'created-desc',
@@ -46,6 +47,11 @@ const RUN_ACTIVITY_WINDOW_MS = 2 * 60 * 1000;
 const CHART_COLUMNS = [1, 2, 3, 4] as const;
 type ChartColumns = typeof CHART_COLUMNS[number];
 const DEFAULT_CHART_COLUMNS: ChartColumns = 1;
+const INITIAL_RUN_SELECTION_MODES = ['auto', 'all', 'none'] as const;
+type InitialRunSelectionMode = typeof INITIAL_RUN_SELECTION_MODES[number];
+const DEFAULT_INITIAL_RUN_SELECTION: InitialRunSelectionMode = 'auto';
+const DEFAULT_MAX_CHART_POINTS = 2_000;
+const MAX_CHART_POINTS_LIMIT = 100_000;
 
 function isRunSortMode(value: unknown): value is RunSortMode {
     return typeof value === 'string' &&
@@ -57,7 +63,24 @@ function isChartColumns(value: unknown): value is ChartColumns {
         (CHART_COLUMNS as readonly number[]).includes(value);
 }
 
+function isInitialRunSelectionMode(
+    value: unknown
+): value is InitialRunSelectionMode {
+    return typeof value === 'string' &&
+        (INITIAL_RUN_SELECTION_MODES as readonly string[]).includes(value);
+}
+
+function normalizeMaxChartPoints(value: unknown): number {
+    return typeof value === 'number' &&
+        Number.isInteger(value) &&
+        value >= 0 &&
+        value <= MAX_CHART_POINTS_LIMIT
+        ? value
+        : DEFAULT_MAX_CHART_POINTS;
+}
+
 export class MultiRunViewerPanel {
+    public static readonly viewType = 'wandbMultiRunViewer';
     private static readonly panels = new Set<MultiRunViewerPanel>();
     private readonly _panel: vscode.WebviewPanel;
     private readonly _extensionUri: vscode.Uri;
@@ -81,8 +104,15 @@ export class MultiRunViewerPanel {
     private _selectionRefreshInProgress = false;
     private _selectionRefreshPending = false;
     private _comparisonGroups: RunComparisonGroup[] = [];
+    private _comparisonGroupFolders = new Map<string, string>();
     private _comparisonGroupsLoadErrorShown = false;
     private _chartColumns: ChartColumns;
+    private _maxChartPoints: number;
+    private _renderedMetricSignature = '';
+    private _restoredSelectedRunIds: Set<string> | null;
+    private _contentInspectionTimer: NodeJS.Timeout | null = null;
+    private _contentInspectionInProgress = false;
+    private _contentInspectionPending = false;
 
     public static createOrShow(
         extensionUri: vscode.Uri,
@@ -90,7 +120,7 @@ export class MultiRunViewerPanel {
         nameStorage: vscode.Memento
     ): MultiRunViewerPanel {
         const panel = vscode.window.createWebviewPanel(
-            'wandbMultiRunViewer',
+            MultiRunViewerPanel.viewType,
             MultiRunViewerPanel.getPanelTitle([folderPath]),
             vscode.ViewColumn.One,
             {
@@ -103,8 +133,37 @@ export class MultiRunViewerPanel {
         const viewer = new MultiRunViewerPanel(
             panel,
             extensionUri,
-            folderPath,
-            nameStorage
+            [folderPath],
+            nameStorage,
+            undefined
+        );
+        MultiRunViewerPanel.panels.add(viewer);
+        return viewer;
+    }
+
+    public static revive(
+        panel: vscode.WebviewPanel,
+        extensionUri: vscode.Uri,
+        nameStorage: vscode.Memento,
+        state: unknown
+    ): MultiRunViewerPanel | undefined {
+        const restorationState = normalizeMultiRunPanelRestorationState(state);
+        if (!restorationState) {
+            panel.dispose();
+            return undefined;
+        }
+
+        panel.webview.options = { enableScripts: true };
+        panel.iconPath = vscode.Uri.joinPath(extensionUri, 'media', 'icon.png');
+        panel.title = MultiRunViewerPanel.getPanelTitle(
+            restorationState.folderPaths
+        );
+        const viewer = new MultiRunViewerPanel(
+            panel,
+            extensionUri,
+            restorationState.folderPaths,
+            nameStorage,
+            restorationState.selectedRunIds
         );
         MultiRunViewerPanel.panels.add(viewer);
         return viewer;
@@ -159,13 +218,18 @@ export class MultiRunViewerPanel {
     private constructor(
         panel: vscode.WebviewPanel,
         extensionUri: vscode.Uri,
-        folderPath: string,
-        nameStorage: vscode.Memento
+        folderPaths: string[],
+        nameStorage: vscode.Memento,
+        restoredSelectedRunIds: string[] | undefined
     ) {
         this._panel = panel;
         this._extensionUri = extensionUri;
-        this._folderPath = path.resolve(folderPath);
-        this._folderPaths.add(this._folderPath);
+        const resolvedFolderPaths = folderPaths.map(folderPath => path.resolve(folderPath));
+        this._folderPath = resolvedFolderPaths[0];
+        resolvedFolderPaths.forEach(folderPath => this._folderPaths.add(folderPath));
+        this._restoredSelectedRunIds = restoredSelectedRunIds
+            ? new Set(restoredSelectedRunIds)
+            : null;
         this._extensionStorage = nameStorage;
         this._customRunNames = getCustomRunNames(nameStorage);
         this._customRunColors = getCustomRunColors(nameStorage);
@@ -173,6 +237,8 @@ export class MultiRunViewerPanel {
         const configuredRunSort = configuration.get<string>('defaultRunSort');
         const configuredColorPalette = configuration.get<string>('runColorPalette');
         const configuredChartColumns = configuration.get<number>('chartColumns');
+        const configuredInitialSelection = configuration.get<string>('initialRunSelection');
+        const configuredMaxChartPoints = configuration.get<number>('maxChartPoints');
         this._defaultRunSort = isRunSortMode(configuredRunSort)
             ? configuredRunSort
             : DEFAULT_RUN_SORT;
@@ -182,10 +248,17 @@ export class MultiRunViewerPanel {
         this._chartColumns = isChartColumns(configuredChartColumns)
             ? configuredChartColumns
             : DEFAULT_CHART_COLUMNS;
+        const initialRunSelection = isInitialRunSelectionMode(configuredInitialSelection)
+            ? configuredInitialSelection
+            : DEFAULT_INITIAL_RUN_SELECTION;
+        const selectNewRuns = initialRunSelection === 'all' ||
+            (initialRunSelection === 'auto' && !vscode.env.remoteName);
+        this._maxChartPoints = normalizeMaxChartPoints(configuredMaxChartPoints);
         this._manager = new MultiRunManager(
-            folderPath,
+            this._folderPath,
             this._colorPalette,
-            this._customRunColors
+            this._customRunColors,
+            selectNewRuns
         );
 
         // Show loading screen immediately
@@ -238,6 +311,16 @@ export class MultiRunViewerPanel {
                         command: 'chartColumnsUpdated',
                         columns: nextColumns
                     });
+                }
+            }
+            if (event.affectsConfiguration('wandbViewer.maxChartPoints')) {
+                const value = vscode.workspace
+                    .getConfiguration('wandbViewer')
+                    .get<number>('maxChartPoints');
+                const nextMaxChartPoints = normalizeMaxChartPoints(value);
+                if (nextMaxChartPoints !== this._maxChartPoints) {
+                    this._maxChartPoints = nextMaxChartPoints;
+                    void this._update(false);
                 }
             }
         }, null, this._disposables);
@@ -436,11 +519,14 @@ export class MultiRunViewerPanel {
             } else {
                 void this._processPendingFileChanges();
             }
+            this._scheduleContentInspection();
         }, null, this._disposables);
 
         // Watch for file changes only while the panel is visible. When it becomes
         // visible again, a metadata scan catches up on changes made while hidden.
-        this._watchFolder(this._folderPath);
+        for (const watchedFolderPath of this._folderPaths) {
+            this._watchFolder(watchedFolderPath);
+        }
     }
 
     private async addFolder(folderPath: string): Promise<void> {
@@ -484,7 +570,7 @@ export class MultiRunViewerPanel {
         this._selectionRefreshInProgress = true;
         this._selectionRefreshPending = false;
         try {
-            await this._update(false);
+            await this._refreshSelectionInWebview();
         } catch (error) {
             console.error('Failed to refresh selected runs:', error);
             vscode.window.showErrorMessage('Failed to refresh the selected runs.');
@@ -625,6 +711,7 @@ export class MultiRunViewerPanel {
                 } else {
                     await this._updateRunActivityInWebview();
                 }
+                this._scheduleContentInspection();
             }
         } catch (error) {
             console.error('Failed to process live run updates:', error);
@@ -635,11 +722,49 @@ export class MultiRunViewerPanel {
 
     private async _refreshRunDataInWebview(): Promise<void> {
         await this._manager.parseSelectedRuns();
+        const mergedMetrics = this._getMergedMetrics();
+        const metricSignature = this._getMetricSignature(mergedMetrics);
+
+        // A data-only message can update existing canvases, but a run that gains
+        // its first metric needs new chart DOM. Rebuild only for that structural
+        // change so the overview appears without toggling the run off and on.
+        if (metricSignature !== this._renderedMetricSignature) {
+            await this._update(false);
+            return;
+        }
+
         await this._panel.webview.postMessage({
             command: 'runDataUpdated',
-            mergedMetrics: this._getMergedMetrics(),
+            mergedMetrics,
+            numericRunConfigs: this._getNumericRunConfigs(),
             runContentStatuses: this._getRunContentStatuses(),
             runLastModified: this._getRunLastModified()
+        });
+    }
+
+    private async _refreshSelectionInWebview(): Promise<void> {
+        await this._manager.parseSelectedRuns();
+        const mergedMetrics = this._getMergedMetrics();
+        const metricSignature = this._getMetricSignature(mergedMetrics);
+
+        if (metricSignature !== this._renderedMetricSignature) {
+            await this._update(false);
+            return;
+        }
+
+        const selectedRunIds = new Set(this._manager.getSelectedRunIds());
+        const selectedRuns = this._manager.getRuns()
+            .filter(run => selectedRunIds.has(run.runId))
+            .map(run => this._withDisplayRunName(run));
+        await this._panel.webview.postMessage({
+            command: 'runSelectionDataUpdated',
+            mergedMetrics,
+            numericRunConfigs: this._getNumericRunConfigs(),
+            runContentStatuses: this._getRunContentStatuses(),
+            runLastModified: this._getRunLastModified(),
+            metadataHtml: this._generateMetadataHtml(selectedRuns),
+            configComparisonHtml: this._generateConfigComparisonHtml(selectedRuns),
+            hasSelection: selectedRuns.length > 0
         });
     }
 
@@ -648,6 +773,79 @@ export class MultiRunViewerPanel {
             command: 'runActivityUpdated',
             runLastModified: this._getRunLastModified()
         });
+    }
+
+    private _scheduleContentInspection(): void {
+        this._contentInspectionPending = true;
+        if (
+            this._disposed ||
+            !this._panel.visible ||
+            this._contentInspectionTimer ||
+            this._contentInspectionInProgress
+        ) {
+            return;
+        }
+
+        this._contentInspectionTimer = setTimeout(() => {
+            this._contentInspectionTimer = null;
+            void this._inspectUnknownRunContentStatuses();
+        }, 250);
+    }
+
+    private async _inspectUnknownRunContentStatuses(): Promise<void> {
+        if (
+            this._disposed ||
+            !this._panel.visible ||
+            this._contentInspectionInProgress ||
+            !this._contentInspectionPending
+        ) {
+            return;
+        }
+
+        this._contentInspectionInProgress = true;
+        this._contentInspectionPending = false;
+        let resolvedSinceUpdate = 0;
+        try {
+            for (const run of this._manager.getRuns()) {
+                if (this._disposed || !this._panel.visible) {
+                    this._contentInspectionPending = true;
+                    break;
+                }
+                if (
+                    this._manager.isRunSelected(run.runId) ||
+                    this._manager.getRunContentStatus(run.runId) !== 'unknown'
+                ) {
+                    continue;
+                }
+
+                if (await this._manager.inspectRunContentStatus(
+                    run.runId,
+                    () => !this._disposed &&
+                        this._panel.visible &&
+                        !this._manager.isRunSelected(run.runId)
+                )) {
+                    resolvedSinceUpdate++;
+                }
+                if (resolvedSinceUpdate >= 10) {
+                    resolvedSinceUpdate = 0;
+                    await this._panel.webview.postMessage({
+                        command: 'runContentStatusesUpdated',
+                        runContentStatuses: this._getRunContentStatuses()
+                    });
+                }
+            }
+        } finally {
+            if (resolvedSinceUpdate > 0 && !this._disposed) {
+                await this._panel.webview.postMessage({
+                    command: 'runContentStatusesUpdated',
+                    runContentStatuses: this._getRunContentStatuses()
+                });
+            }
+            this._contentInspectionInProgress = false;
+            if (this._contentInspectionPending) {
+                this._scheduleContentInspection();
+            }
+        }
     }
 
     private _getRunLastModified(): Record<string, number> {
@@ -677,13 +875,43 @@ export class MultiRunViewerPanel {
     }
 
     private _getMergedMetrics(): { training: MergedMetric[], system: MergedMetric[] } {
-        const mergedMetrics = this._manager.mergeMetrics();
+        const mergedMetrics = this._manager.mergeMetrics(this._maxChartPoints);
         for (const metric of [...mergedMetrics.training, ...mergedMetrics.system]) {
             for (const dataset of metric.datasets) {
                 dataset.runName = this._customRunNames[dataset.runId] || dataset.runName;
             }
         }
         return mergedMetrics;
+    }
+
+    private _getMetricSignature(
+        mergedMetrics: { training: MergedMetric[], system: MergedMetric[] }
+    ): string {
+        const training = mergedMetrics.training
+            .map(metric => metric.metricName)
+            .sort((left, right) => left.localeCompare(right));
+        const system = mergedMetrics.system
+            .map(metric => metric.metricName)
+            .sort((left, right) => left.localeCompare(right));
+        return JSON.stringify({ training, system });
+    }
+
+    private _getNumericRunConfigs(): Record<string, Record<string, number>> {
+        const configs: Record<string, Record<string, number>> = {};
+        for (const runId of this._manager.getSelectedRunIds()) {
+            const runData = this._manager.getParsedData(runId);
+            if (!runData) {
+                continue;
+            }
+            const numericConfig: Record<string, number> = {};
+            for (const [key, value] of Object.entries(runData.config)) {
+                if (typeof value === 'number' && Number.isFinite(value)) {
+                    numericConfig[key] = value;
+                }
+            }
+            configs[runId] = numericConfig;
+        }
+        return configs;
     }
 
     private async _renameRun(runId: string): Promise<void> {
@@ -759,7 +987,25 @@ export class MultiRunViewerPanel {
 
     private async _loadComparisonGroups(): Promise<void> {
         try {
-            this._comparisonGroups = await loadRunComparisonGroups(this._folderPath);
+            const sources = await loadRunComparisonGroupSources(this._folderPaths);
+            const groups: RunComparisonGroup[] = [];
+            const groupFolders = new Map<string, string>();
+
+            for (const source of sources) {
+                for (const group of source.groups) {
+                    // Group IDs are the stable UI and persistence identity. If a
+                    // copied file contains the same ID, the first deterministic
+                    // discovery result wins rather than showing duplicate toggles.
+                    if (groupFolders.has(group.id)) {
+                        continue;
+                    }
+                    groups.push(group);
+                    groupFolders.set(group.id, source.folderPath);
+                }
+            }
+
+            this._comparisonGroups = groups;
+            this._comparisonGroupFolders = groupFolders;
             this._comparisonGroupsLoadErrorShown = false;
         } catch {
             if (!this._comparisonGroupsLoadErrorShown) {
@@ -771,9 +1017,12 @@ export class MultiRunViewerPanel {
         }
     }
 
-    private async _saveComparisonGroups(): Promise<boolean> {
+    private async _saveComparisonGroups(folderPath: string): Promise<boolean> {
         try {
-            await saveRunComparisonGroups(this._folderPath, this._comparisonGroups);
+            const groups = this._comparisonGroups.filter(
+                group => this._comparisonGroupFolders.get(group.id) === folderPath
+            );
+            await saveRunComparisonGroups(folderPath, groups);
             return true;
         } catch {
             vscode.window.showErrorMessage('Could not save comparison groups.');
@@ -878,13 +1127,19 @@ export class MultiRunViewerPanel {
             runIds: selectedRuns.map(item => item.runId)
         };
         const previousGroups = this._comparisonGroups;
+        const previousGroupFolders = new Map(this._comparisonGroupFolders);
+        const groupFolder = existingGroup
+            ? this._comparisonGroupFolders.get(existingGroup.id) || this._folderPath
+            : this._folderPath;
         this._comparisonGroups = existingGroup
             ? previousGroups.map(group =>
                 group.id === existingGroup.id ? nextGroup : group
             )
             : [...previousGroups, nextGroup];
-        if (!await this._saveComparisonGroups()) {
+        this._comparisonGroupFolders.set(nextGroup.id, groupFolder);
+        if (!await this._saveComparisonGroups(groupFolder)) {
             this._comparisonGroups = previousGroups;
+            this._comparisonGroupFolders = previousGroupFolders;
             return;
         }
         await this._update(false);
@@ -927,13 +1182,16 @@ export class MultiRunViewerPanel {
         }
 
         const previousGroups = this._comparisonGroups;
+        const previousGroupFolders = new Map(this._comparisonGroupFolders);
+        const groupFolder = this._comparisonGroupFolders.get(group.id) || this._folderPath;
         this._comparisonGroups = previousGroups.map(candidate =>
             candidate.id === group.id
                 ? { ...candidate, runIds: [...candidate.runIds, runId] }
                 : candidate
         );
-        if (!await this._saveComparisonGroups()) {
+        if (!await this._saveComparisonGroups(groupFolder)) {
             this._comparisonGroups = previousGroups;
+            this._comparisonGroupFolders = previousGroupFolders;
             return;
         }
         await this._update(false);
@@ -954,11 +1212,15 @@ export class MultiRunViewerPanel {
         }
 
         const previousGroups = this._comparisonGroups;
+        const previousGroupFolders = new Map(this._comparisonGroupFolders);
+        const groupFolder = this._comparisonGroupFolders.get(groupId) || this._folderPath;
         this._comparisonGroups = previousGroups.filter(
             candidate => candidate.id !== groupId
         );
-        if (!await this._saveComparisonGroups()) {
+        this._comparisonGroupFolders.delete(groupId);
+        if (!await this._saveComparisonGroups(groupFolder)) {
             this._comparisonGroups = previousGroups;
+            this._comparisonGroupFolders = previousGroupFolders;
             return;
         }
         await this._update(false);
@@ -1147,6 +1409,15 @@ export class MultiRunViewerPanel {
                     this._manager.removeRun(existingRun.runId);
                 }
             }
+            if (this._restoredSelectedRunIds) {
+                for (const run of this._manager.getRuns()) {
+                    this._manager.setRunSelected(
+                        run.runId,
+                        this._restoredSelectedRunIds.has(run.runId)
+                    );
+                }
+                this._restoredSelectedRunIds = null;
+            }
             console.log(`[2] Run management: ${Date.now() - t2}ms`);
         } else {
             console.log('[1-2] Folder scan skipped');
@@ -1175,6 +1446,8 @@ export class MultiRunViewerPanel {
 
         const t7 = Date.now();
         this._panel.webview.html = htmlContent;
+        this._renderedMetricSignature = this._getMetricSignature(mergedMetrics);
+        this._scheduleContentInspection();
         console.log(`[7] Set webview HTML: ${Date.now() - t7}ms`);
 
         console.log(`=== Total Update Time: ${Date.now() - overallStart}ms ===\n`);
@@ -1247,8 +1520,21 @@ export class MultiRunViewerPanel {
             `;
         }).join('');
 
-        // Generate metadata HTML
-        const metadataHtml = selectedRuns.map(run => {
+        const metadataHtml = this._generateMetadataHtml(selectedRuns);
+
+        return this._getHtmlDocumentContent(
+            runs,
+            selectedRunIds,
+            mergedMetrics,
+            runListHtml,
+            metadataHtml,
+            comparisonGroupsHtml,
+            configComparisonHtml
+        );
+    }
+
+    private _generateMetadataHtml(selectedRuns: RunScanResult[]): string {
+        return selectedRuns.map(run => {
             const parsedData = this._manager.getParsedData(run.runId);
             const config = parsedData?.config || {};
             const configEntries = Object.entries(config);
@@ -1279,7 +1565,17 @@ export class MultiRunViewerPanel {
                 </div>
             `;
         }).join('');
+    }
 
+    private _getHtmlDocumentContent(
+        runs: RunScanResult[],
+        selectedRunIds: string[],
+        mergedMetrics: { training: MergedMetric[], system: MergedMetric[] },
+        runListHtml: string,
+        metadataHtml: string,
+        comparisonGroupsHtml: string,
+        configComparisonHtml: string
+    ): string {
         return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1335,7 +1631,7 @@ export class MultiRunViewerPanel {
                     <div class="comparison-groups-header">
                         <div>
                             <h4>Comparison groups</h4>
-                            <span>Saved in ${this._escapeHtml(RUN_COMPARISON_GROUPS_FILE)}</span>
+                            <span>Found recursively; new groups save in the first opened folder</span>
                         </div>
                         <button type="button" class="btn-icon" onclick="createComparisonGroup()" title="Create comparison group" aria-label="Create comparison group">＋</button>
                     </div>
@@ -1365,6 +1661,7 @@ export class MultiRunViewerPanel {
                 <button class="tab active" data-tab="training">Training Metrics</button>
                 <button class="tab" data-tab="system">System Metrics</button>
                 <button class="tab" data-tab="configComparison">Compare Configs</button>
+                <button class="tab" data-tab="customPlots">Custom Plots</button>
             </div>
 
             <div id="training" class="tab-content active">
@@ -1377,6 +1674,23 @@ export class MultiRunViewerPanel {
 
             <div id="configComparison" class="tab-content">
                 ${configComparisonHtml}
+            </div>
+
+            <div id="customPlots" class="tab-content">
+                <div class="custom-plot-builder">
+                    <h3>Create a derived plot</h3>
+                    <div class="custom-plot-form">
+                        <label>Title<input type="text" id="customPlotTitle" maxlength="100" placeholder="Loss vs tokens"></label>
+                        <label>X metric<select id="customPlotXMetric"></select></label>
+                        <label>X multiplier<select id="customPlotXMultiplier"></select></label>
+                        <label>Y metric<select id="customPlotYMetric"></select></label>
+                        <label>Y multiplier<select id="customPlotYMultiplier"></select></label>
+                        <button type="button" class="toggle-btn" id="createCustomPlotBtn">Create plot</button>
+                    </div>
+                    <div class="custom-plot-help">Each Y point is matched to the X metric at the same training step using linear interpolation. Optional multipliers use each run's numeric configuration value.</div>
+                    <div class="custom-plot-error" id="customPlotError" role="alert"></div>
+                </div>
+                <div id="customPlotList"></div>
             </div>
         </div>
     </div>
@@ -1672,14 +1986,18 @@ export class MultiRunViewerPanel {
     private _generateChartInitScript(mergedMetrics: { training: MergedMetric[], system: MergedMetric[] }): string {
         return `
             const vscode = acquireVsCodeApi();
-            let trainingMetrics = ${JSON.stringify(mergedMetrics.training)};
-            let systemMetrics = ${JSON.stringify(mergedMetrics.system)};
+            let trainingMetrics = ${this._serializeForScript(mergedMetrics.training)};
+            let systemMetrics = ${this._serializeForScript(mergedMetrics.system)};
+            let numericRunConfigs = ${this._serializeForScript(this._getNumericRunConfigs())};
+            const restoredFolderPaths = ${this._serializeForScript(Array.from(this._folderPaths))};
             let activeFullscreenMetric = null;
             let fullscreenRenderToken = 0;
             const MIN_CHART_HEIGHT = 160;
             const MAX_CHART_HEIGHT = 1200;
             const DEFAULT_CHART_HEIGHT = 200;
             const persistedViewState = vscode.getState() || {};
+            const MAX_CUSTOM_PLOTS = 20;
+            let customMetrics = [];
             let focusedRunId = typeof persistedViewState.focusedRunId === 'string'
                 ? persistedViewState.focusedRunId
                 : null;
@@ -1694,6 +2012,417 @@ export class MultiRunViewerPanel {
                     ...changes
                 });
             }
+
+            function persistRestorablePanelState() {
+                const selectedRunIds = Array.from(
+                    document.querySelectorAll('.run-item[data-run-id]')
+                ).flatMap(item => {
+                    const checkbox = item.querySelector('input[type="checkbox"]');
+                    return checkbox?.checked ? [item.dataset.runId] : [];
+                });
+                updatePersistedViewState({
+                    folderPaths: restoredFolderPaths,
+                    selectedRunIds
+                });
+            }
+            persistRestorablePanelState();
+
+            function normalizeCustomPlotDefinitions(value) {
+                if (!Array.isArray(value)) return [];
+                const seenIds = new Set();
+                return value.slice(0, MAX_CUSTOM_PLOTS).flatMap(candidate => {
+                    if (!candidate || typeof candidate !== 'object') return [];
+                    const id = typeof candidate.id === 'string' ? candidate.id : '';
+                    const title = typeof candidate.title === 'string'
+                        ? candidate.title.trim()
+                        : '';
+                    const xMetric = typeof candidate.xMetric === 'string'
+                        ? candidate.xMetric
+                        : '';
+                    const yMetric = typeof candidate.yMetric === 'string'
+                        ? candidate.yMetric
+                        : '';
+                    const normalizeMultiplier = multiplier =>
+                        typeof multiplier === 'string' && multiplier.length <= 512
+                            ? multiplier
+                            : '';
+                    if (
+                        !/^[A-Za-z0-9_-]{1,80}$/.test(id) ||
+                        seenIds.has(id) ||
+                        !title || title.length > 100 ||
+                        !xMetric || xMetric.length > 512 ||
+                        !yMetric || yMetric.length > 512
+                    ) {
+                        return [];
+                    }
+                    seenIds.add(id);
+                    return [{
+                        id,
+                        title,
+                        xMetric,
+                        yMetric,
+                        xMultiplierConfig: normalizeMultiplier(
+                            candidate.xMultiplierConfig
+                        ),
+                        yMultiplierConfig: normalizeMultiplier(
+                            candidate.yMultiplierConfig
+                        )
+                    }];
+                });
+            }
+
+            let customPlotDefinitions = normalizeCustomPlotDefinitions(
+                persistedViewState.customPlots
+            );
+
+            function getMetricsForType(type) {
+                if (type === 'training') return trainingMetrics;
+                if (type === 'system') return systemMetrics;
+                if (type === 'custom') return customMetrics;
+                return [];
+            }
+
+            function interpolateMetricValue(points, step) {
+                if (!Array.isArray(points) || points.length === 0) return null;
+                if (step < points[0].step || step > points[points.length - 1].step) {
+                    return null;
+                }
+                let low = 0;
+                let high = points.length - 1;
+                while (low <= high) {
+                    const middle = Math.floor((low + high) / 2);
+                    const point = points[middle];
+                    if (point.step === step) return point.value;
+                    if (point.step < step) low = middle + 1;
+                    else high = middle - 1;
+                }
+                if (high < 0 || low >= points.length) return null;
+                const left = points[high];
+                const right = points[low];
+                const width = right.step - left.step;
+                if (width === 0) return right.value;
+                const ratio = (step - left.step) / width;
+                return left.value + (right.value - left.value) * ratio;
+            }
+
+            function getConfigMultiplier(runId, configKey) {
+                if (!configKey) return 1;
+                const value = numericRunConfigs?.[runId]?.[configKey];
+                return Number.isFinite(value) ? value : null;
+            }
+
+            function buildCustomMetric(definition) {
+                const xMetric = trainingMetrics.find(
+                    metric => metric.metricName === definition.xMetric
+                );
+                const yMetric = trainingMetrics.find(
+                    metric => metric.metricName === definition.yMetric
+                );
+                const datasets = [];
+                if (xMetric && yMetric) {
+                    for (const yDataset of yMetric.datasets) {
+                        const xDataset = xMetric.datasets.find(
+                            dataset => dataset.runId === yDataset.runId
+                        );
+                        if (!xDataset) continue;
+                        const xMultiplier = getConfigMultiplier(
+                            yDataset.runId,
+                            definition.xMultiplierConfig
+                        );
+                        const yMultiplier = getConfigMultiplier(
+                            yDataset.runId,
+                            definition.yMultiplierConfig
+                        );
+                        if (xMultiplier === null || yMultiplier === null) continue;
+
+                        const data = yDataset.data.flatMap(point => {
+                            const xValue = interpolateMetricValue(xDataset.data, point.step);
+                            const scaledX = xValue === null ? NaN : xValue * xMultiplier;
+                            const scaledY = point.value * yMultiplier;
+                            return Number.isFinite(scaledX) && Number.isFinite(scaledY)
+                                ? [{ step: scaledX, value: scaledY }]
+                                : [];
+                        });
+                        if (data.length > 0) {
+                            datasets.push({
+                                runId: yDataset.runId,
+                                runName: yDataset.runName,
+                                color: yDataset.color,
+                                data
+                            });
+                        }
+                    }
+                }
+                return {
+                    metricName: definition.title,
+                    customPlotId: definition.id,
+                    datasets
+                };
+            }
+
+            function formatCustomAxisLabel(metricName, multiplierConfig) {
+                return multiplierConfig
+                    ? metricName + ' × config.' + multiplierConfig
+                    : metricName;
+            }
+
+            function applyCustomAxisTitles(chart, definition) {
+                if (!chart || !definition) return;
+                chart.options.scales.x.title.text = formatCustomAxisLabel(
+                    definition.xMetric,
+                    definition.xMultiplierConfig
+                );
+                chart.options.scales.y.title.text = formatCustomAxisLabel(
+                    definition.yMetric,
+                    definition.yMultiplierConfig
+                );
+            }
+
+            function replaceSelectOptions(select, values, includeNone) {
+                if (!select) return;
+                const previousValue = select.value;
+                select.replaceChildren();
+                if (includeNone) {
+                    const option = document.createElement('option');
+                    option.value = '';
+                    option.textContent = 'No multiplier';
+                    select.appendChild(option);
+                }
+                values.forEach(value => {
+                    const option = document.createElement('option');
+                    option.value = value;
+                    option.textContent = value;
+                    select.appendChild(option);
+                });
+                if (values.includes(previousValue) || (includeNone && !previousValue)) {
+                    select.value = previousValue;
+                }
+            }
+
+            function updateCustomPlotBuilderOptions() {
+                const metricNames = trainingMetrics
+                    .map(metric => metric.metricName)
+                    .sort((left, right) => left.localeCompare(right));
+                const configKeys = Array.from(new Set(
+                    Object.values(numericRunConfigs).flatMap(config =>
+                        Object.keys(config)
+                    )
+                )).sort((left, right) => left.localeCompare(right));
+                replaceSelectOptions(
+                    document.getElementById('customPlotXMetric'),
+                    metricNames,
+                    false
+                );
+                replaceSelectOptions(
+                    document.getElementById('customPlotYMetric'),
+                    metricNames,
+                    false
+                );
+                replaceSelectOptions(
+                    document.getElementById('customPlotXMultiplier'),
+                    configKeys,
+                    true
+                );
+                replaceSelectOptions(
+                    document.getElementById('customPlotYMultiplier'),
+                    configKeys,
+                    true
+                );
+                const createButton = document.getElementById('createCustomPlotBtn');
+                if (createButton) {
+                    createButton.disabled = metricNames.length === 0 ||
+                        customPlotDefinitions.length >= MAX_CUSTOM_PLOTS;
+                }
+            }
+
+            function renderCustomPlots() {
+                Object.keys(chartInstances).forEach(canvasId => {
+                    if (!canvasId.startsWith('chart-custom-')) return;
+                    const chart = chartInstances[canvasId];
+                    delete chartInstances[canvasId];
+                    destroyChartSafely(chart);
+                });
+
+                updateCustomPlotBuilderOptions();
+                customMetrics = customPlotDefinitions.map(buildCustomMetric);
+                const list = document.getElementById('customPlotList');
+                if (!list) return;
+                list.replaceChildren();
+                if (customPlotDefinitions.length === 0) {
+                    const empty = document.createElement('div');
+                    empty.className = 'no-data';
+                    empty.textContent = 'No custom plots yet.';
+                    list.appendChild(empty);
+                    return;
+                }
+
+                const grid = document.createElement('div');
+                grid.className = 'charts-grid';
+                customPlotDefinitions.forEach((definition, index) => {
+                    const metric = customMetrics[index];
+                    const container = document.createElement('div');
+                    container.className = 'chart-container';
+                    container.dataset.chartType = 'custom';
+                    container.dataset.metricName = metric.metricName;
+
+                    const header = document.createElement('div');
+                    header.className = 'chart-header';
+                    const titleGroup = document.createElement('div');
+                    const title = document.createElement('div');
+                    title.className = 'chart-title';
+                    title.textContent = definition.title;
+                    const subtitle = document.createElement('div');
+                    subtitle.className = 'custom-plot-subtitle';
+                    subtitle.textContent = formatCustomAxisLabel(
+                        definition.yMetric,
+                        definition.yMultiplierConfig
+                    ) + ' vs ' + formatCustomAxisLabel(
+                        definition.xMetric,
+                        definition.xMultiplierConfig
+                    );
+                    titleGroup.append(title, subtitle);
+
+                    const actions = document.createElement('div');
+                    actions.className = 'chart-actions';
+                    const copyButton = document.createElement('button');
+                    copyButton.className = 'btn-small btn-copy-chart';
+                    copyButton.title = 'Copy chart to clipboard';
+                    copyButton.textContent = '📋';
+                    copyButton.addEventListener('click', () =>
+                        copySingleChart('custom', index)
+                    );
+                    const reloadButton = document.createElement('button');
+                    reloadButton.className = 'btn-small';
+                    reloadButton.title = 'Refresh this chart';
+                    reloadButton.textContent = '⟳';
+                    reloadButton.addEventListener('click', () =>
+                        reloadOverviewChart('custom', index, reloadButton)
+                    );
+                    const fullscreenButton = document.createElement('button');
+                    fullscreenButton.className = 'btn-small';
+                    fullscreenButton.title = 'Open fullscreen';
+                    fullscreenButton.textContent = '⛶';
+                    fullscreenButton.addEventListener('click', () =>
+                        openFullscreen(index, 'custom')
+                    );
+                    const deleteButton = document.createElement('button');
+                    deleteButton.className = 'btn-small custom-plot-delete';
+                    deleteButton.title = 'Delete custom plot';
+                    deleteButton.textContent = '×';
+                    deleteButton.addEventListener('click', () =>
+                        deleteCustomPlot(definition.id)
+                    );
+                    actions.append(
+                        copyButton,
+                        reloadButton,
+                        fullscreenButton,
+                        deleteButton
+                    );
+                    header.append(titleGroup, actions);
+
+                    const wrapper = document.createElement('div');
+                    wrapper.className = 'chart-wrapper';
+                    const canvas = document.createElement('canvas');
+                    canvas.id = 'chart-custom-' + index;
+                    canvas.dataset.chartType = 'custom';
+                    canvas.dataset.chartIndex = String(index);
+                    canvas.dataset.metricName = metric.metricName;
+                    canvas.dataset.chartStateKey = definition.id;
+                    wrapper.appendChild(canvas);
+                    const chartResizeHandle = document.createElement('div');
+                    chartResizeHandle.className = 'chart-resize-handle';
+                    chartResizeHandle.setAttribute('role', 'separator');
+                    chartResizeHandle.setAttribute(
+                        'aria-label',
+                        'Resize ' + definition.title + ' chart'
+                    );
+                    chartResizeHandle.setAttribute('aria-orientation', 'horizontal');
+                    chartResizeHandle.setAttribute('aria-valuemin', String(MIN_CHART_HEIGHT));
+                    chartResizeHandle.setAttribute('aria-valuemax', String(MAX_CHART_HEIGHT));
+                    chartResizeHandle.setAttribute('aria-valuenow', String(DEFAULT_CHART_HEIGHT));
+                    chartResizeHandle.tabIndex = 0;
+                    chartResizeHandle.title =
+                        'Drag to resize chart height; use arrow keys when focused';
+                    container.append(header, wrapper, chartResizeHandle);
+                    grid.appendChild(container);
+
+                    const chart = createUnifiedChart(
+                        canvas,
+                        createRunDatasets(metric, false),
+                        metric.metricName,
+                        { isModal: false, enableZoom: true }
+                    );
+                    chartInstances[canvas.id] = chart;
+                    applyCustomAxisTitles(chart, definition);
+                    updateChartSmoothing(chart, globalSmoothing, showRaw);
+                    if (focusedRunId) setFocusedRun(chart, focusedRunId);
+                    chart.update('none');
+                });
+                list.appendChild(grid);
+                grid.querySelectorAll('.chart-container').forEach(
+                    initializeChartResize
+                );
+            }
+
+            function createCustomPlot() {
+                const error = document.getElementById('customPlotError');
+                if (error) error.textContent = '';
+                if (customPlotDefinitions.length >= MAX_CUSTOM_PLOTS) {
+                    if (error) error.textContent = 'At most 20 custom plots can be open.';
+                    return;
+                }
+                const xMetric = document.getElementById('customPlotXMetric')?.value || '';
+                const yMetric = document.getElementById('customPlotYMetric')?.value || '';
+                if (!xMetric || !yMetric) {
+                    if (error) error.textContent = 'Select both an X and Y metric.';
+                    return;
+                }
+                const requestedTitle = document.getElementById('customPlotTitle')?.value.trim();
+                const title = requestedTitle || yMetric + ' vs ' + xMetric;
+                const id = 'plot-' + Date.now().toString(36) + '-' +
+                    Math.random().toString(36).slice(2, 8);
+                customPlotDefinitions.push({
+                    id,
+                    title: title.slice(0, 100),
+                    xMetric,
+                    yMetric,
+                    xMultiplierConfig:
+                        document.getElementById('customPlotXMultiplier')?.value || '',
+                    yMultiplierConfig:
+                        document.getElementById('customPlotYMultiplier')?.value || ''
+                });
+                updatePersistedViewState({ customPlots: customPlotDefinitions });
+                const titleInput = document.getElementById('customPlotTitle');
+                if (titleInput) titleInput.value = '';
+                renderCustomPlots();
+            }
+
+            function deleteCustomPlot(plotId) {
+                const deletedMetric = customMetrics.find(
+                    metric => metric.customPlotId === plotId
+                );
+                if (
+                    deletedMetric &&
+                    activeFullscreenMetric?.type === 'custom' &&
+                    activeFullscreenMetric.customPlotId === plotId
+                ) {
+                    closeFullscreen();
+                }
+                customPlotDefinitions = customPlotDefinitions.filter(
+                    definition => definition.id !== plotId
+                );
+                delete savedChartHeights['custom:' + plotId];
+                updatePersistedViewState({
+                    customPlots: customPlotDefinitions,
+                    chartHeights: savedChartHeights
+                });
+                renderCustomPlots();
+            }
+
+            document.getElementById('createCustomPlotBtn')?.addEventListener(
+                'click',
+                createCustomPlot
+            );
 
             // Sidebar resizing
             let isResizing = false;
@@ -1929,19 +2658,34 @@ export class MultiRunViewerPanel {
             updateComparisonGroupCheckboxes();
 
             // Configuration-column filtering
-            const configFilterInput = document.getElementById('configFilterInput');
-            const configRunSortSelect = document.getElementById('configRunSortSelect');
-            const configColumnSortSelect = document.getElementById('configColumnSortSelect');
-            const configCompareTable = document.getElementById('configCompareTable');
-            const configCompareTableWrapper = document.getElementById('configCompareTableWrapper');
-            const configFilterEmpty = document.getElementById('configFilterEmpty');
-            const configDifferentGroup = document.getElementById('configDifferentGroup');
-            const configCommonGroup = document.getElementById('configCommonGroup');
-            const configAllGroup = document.getElementById('configAllGroup');
-            const configParameterGroupRow = document.getElementById('configParameterGroupRow');
-            const configParameterHeaderRow = document.getElementById('configParameterHeaderRow');
+            let configFilterInput;
+            let configRunSortSelect;
+            let configColumnSortSelect;
+            let configCompareTable;
+            let configCompareTableWrapper;
+            let configFilterEmpty;
+            let configDifferentGroup;
+            let configCommonGroup;
+            let configAllGroup;
+            let configParameterGroupRow;
+            let configParameterHeaderRow;
+
+            function refreshConfigComparisonElements() {
+                configFilterInput = document.getElementById('configFilterInput');
+                configRunSortSelect = document.getElementById('configRunSortSelect');
+                configColumnSortSelect = document.getElementById('configColumnSortSelect');
+                configCompareTable = document.getElementById('configCompareTable');
+                configCompareTableWrapper = document.getElementById('configCompareTableWrapper');
+                configFilterEmpty = document.getElementById('configFilterEmpty');
+                configDifferentGroup = document.getElementById('configDifferentGroup');
+                configCommonGroup = document.getElementById('configCommonGroup');
+                configAllGroup = document.getElementById('configAllGroup');
+                configParameterGroupRow = document.getElementById('configParameterGroupRow');
+                configParameterHeaderRow = document.getElementById('configParameterHeaderRow');
+            }
 
             function applyConfigColumnView(shouldPersist = true) {
+                refreshConfigComparisonElements();
                 if (
                     !configFilterInput ||
                     !configRunSortSelect ||
@@ -2131,47 +2875,60 @@ export class MultiRunViewerPanel {
                 }
             }
 
-            if (configFilterInput && typeof persistedViewState.configFilter === 'string') {
-                configFilterInput.value = persistedViewState.configFilter;
+            function initializeConfigComparisonControls() {
+                refreshConfigComparisonElements();
+                if (
+                    configFilterInput &&
+                    typeof persistedViewState.configFilter === 'string'
+                ) {
+                    configFilterInput.value = persistedViewState.configFilter;
+                }
+                if (
+                    configColumnSortSelect &&
+                    typeof persistedViewState.configSort === 'string' &&
+                    Array.from(configColumnSortSelect.options).some(option =>
+                        option.value === persistedViewState.configSort
+                    )
+                ) {
+                    configColumnSortSelect.value = persistedViewState.configSort;
+                }
+                if (
+                    configRunSortSelect &&
+                    typeof persistedViewState.configRunSort === 'string' &&
+                    Array.from(configRunSortSelect.options).some(option =>
+                        option.value === persistedViewState.configRunSort
+                    )
+                ) {
+                    configRunSortSelect.value = persistedViewState.configRunSort;
+                }
+                if (configFilterInput) {
+                    configFilterInput.addEventListener(
+                        'input',
+                        () => applyConfigColumnView()
+                    );
+                }
+                if (configRunSortSelect) {
+                    configRunSortSelect.addEventListener(
+                        'change',
+                        () => applyConfigColumnView()
+                    );
+                }
+                if (configColumnSortSelect) {
+                    configColumnSortSelect.addEventListener(
+                        'change',
+                        () => applyConfigColumnView()
+                    );
+                }
+                applyConfigColumnView(false);
             }
-            if (
-                configColumnSortSelect &&
-                typeof persistedViewState.configSort === 'string' &&
-                Array.from(configColumnSortSelect.options).some(option =>
-                    option.value === persistedViewState.configSort
-                )
-            ) {
-                configColumnSortSelect.value = persistedViewState.configSort;
-            }
-            if (
-                configRunSortSelect &&
-                typeof persistedViewState.configRunSort === 'string' &&
-                Array.from(configRunSortSelect.options).some(option =>
-                    option.value === persistedViewState.configRunSort
-                )
-            ) {
-                configRunSortSelect.value = persistedViewState.configRunSort;
-            }
-            if (configFilterInput) {
-                configFilterInput.addEventListener('input', () => applyConfigColumnView());
-            }
-            if (configRunSortSelect) {
-                configRunSortSelect.addEventListener(
-                    'change',
-                    () => applyConfigColumnView()
-                );
-            }
-            if (configColumnSortSelect) {
-                configColumnSortSelect.addEventListener(
-                    'change',
-                    () => applyConfigColumnView()
-                );
-            }
-            applyConfigColumnView(false);
+            initializeConfigComparisonControls();
 
             // Per-chart height resizing
             function getChartResizeKey(container) {
-                return container.dataset.chartType + ':' + container.dataset.metricName;
+                const canvas = container.querySelector('canvas');
+                const metricIdentity = canvas?.dataset.chartStateKey ||
+                    container.dataset.metricName;
+                return container.dataset.chartType + ':' + metricIdentity;
             }
 
             function clampChartHeight(height) {
@@ -2206,7 +2963,9 @@ export class MultiRunViewerPanel {
                 });
             }
 
-            document.querySelectorAll('.chart-container').forEach(container => {
+            function initializeChartResize(container) {
+                if (container.dataset.chartResizeInitialized === 'true') return;
+
                 const savedHeight = Number(savedChartHeights[getChartResizeKey(container)]);
                 if (Number.isFinite(savedHeight)) {
                     resizeChartContainer(container, savedHeight);
@@ -2214,6 +2973,7 @@ export class MultiRunViewerPanel {
 
                 const handle = container.querySelector('.chart-resize-handle');
                 if (!handle) return;
+                container.dataset.chartResizeInitialized = 'true';
 
                 handle.addEventListener('pointerdown', event => {
                     if (event.button !== 0) return;
@@ -2277,7 +3037,11 @@ export class MultiRunViewerPanel {
                     saveChartHeight(container);
                     event.preventDefault();
                 });
-            });
+            }
+
+            document.querySelectorAll('.chart-container').forEach(
+                initializeChartResize
+            );
 
             // Sidebar collapse/expand
             function toggleSidebar() {
@@ -2333,6 +3097,7 @@ export class MultiRunViewerPanel {
                 }
                 runItem.classList.add('selection-loading');
                 updateComparisonGroupCheckboxes();
+                persistRestorablePanelState();
             }
 
             function setOptimisticBulkSelection(selectedRunIds) {
@@ -2345,6 +3110,7 @@ export class MultiRunViewerPanel {
                     item.classList.add('selection-loading');
                 });
                 updateComparisonGroupCheckboxes();
+                persistRestorablePanelState();
             }
 
             function getComparisonGroupRunIds(groupItem) {
@@ -2673,13 +3439,30 @@ export class MultiRunViewerPanel {
                 updateChartSmoothing(chart, smoothing, isModal ? modalShowRaw : showRaw);
             }
 
-            function ensureOverviewChart(metric, type) {
-                const canvas = Array.from(
+            function findOverviewCanvas(metric, type) {
+                return Array.from(
                     document.querySelectorAll('canvas[id^="chart-"]')
                 ).find(candidate =>
                     candidate.dataset.chartType === type &&
-                    candidate.dataset.metricName === metric.metricName
+                    (
+                        type === 'custom'
+                            ? candidate.dataset.chartStateKey === metric.customPlotId
+                            : candidate.dataset.metricName === metric.metricName
+                    )
                 );
+            }
+
+            function findMetricByIdentity(metrics, identity) {
+                if (!identity) return null;
+                return metrics.find(metric =>
+                    identity.type === 'custom' && identity.customPlotId
+                        ? metric.customPlotId === identity.customPlotId
+                        : metric.metricName === identity.metricName
+                ) || null;
+            }
+
+            function ensureOverviewChart(metric, type) {
+                const canvas = findOverviewCanvas(metric, type);
                 if (!canvas) return null;
 
                 if (!chartInstances[canvas.id]) {
@@ -2715,16 +3498,11 @@ export class MultiRunViewerPanel {
             }
 
             function reloadOverviewChart(type, metricIndex, button) {
-                const metrics = type === 'training' ? trainingMetrics : systemMetrics;
+                const metrics = getMetricsForType(type);
                 const metric = metrics[metricIndex];
                 if (!metric) return;
 
-                const canvas = Array.from(
-                    document.querySelectorAll('canvas[id^="chart-"]')
-                ).find(candidate =>
-                    candidate.dataset.chartType === type &&
-                    candidate.dataset.metricName === metric.metricName
-                );
+                const canvas = findOverviewCanvas(metric, type);
                 if (!canvas) return;
 
                 const chart = ensureOverviewChart(metric, type);
@@ -2741,12 +3519,8 @@ export class MultiRunViewerPanel {
 
             function getFullscreenMetric() {
                 if (!activeFullscreenMetric) return null;
-                const metrics = activeFullscreenMetric.type === 'training'
-                    ? trainingMetrics
-                    : systemMetrics;
-                return metrics.find(metric =>
-                    metric.metricName === activeFullscreenMetric.metricName
-                ) || null;
+                const metrics = getMetricsForType(activeFullscreenMetric.type);
+                return findMetricByIdentity(metrics, activeFullscreenMetric);
             }
 
             function reloadFullscreenChart() {
@@ -2839,22 +3613,22 @@ export class MultiRunViewerPanel {
                 Object.entries(chartInstances).forEach(([canvasId, chart]) => {
                     const canvas = document.getElementById(canvasId);
                     if (!canvas) return;
+                    if (canvas.dataset.chartType === 'custom') return;
 
-                    const metrics = canvas.dataset.chartType === 'training'
-                        ? trainingMetrics
-                        : systemMetrics;
+                    const metrics = getMetricsForType(canvas.dataset.chartType);
                     const metric = metrics.find(
                         candidate => candidate.metricName === canvas.dataset.metricName
                     );
                     updateChartData(chart, metric, false);
                 });
 
+                renderCustomPlots();
+
                 if (modalChart && activeFullscreenMetric) {
-                    const metrics = activeFullscreenMetric.type === 'training'
-                        ? trainingMetrics
-                        : systemMetrics;
-                    const metric = metrics.find(
-                        candidate => candidate.metricName === activeFullscreenMetric.metricName
+                    const metrics = getMetricsForType(activeFullscreenMetric.type);
+                    const metric = findMetricByIdentity(
+                        metrics,
+                        activeFullscreenMetric
                     );
                     // A rapid sidebar selection change can temporarily remove the
                     // metric that opened this modal. Keep the current fullscreen
@@ -2863,6 +3637,29 @@ export class MultiRunViewerPanel {
                         updateChartData(modalChart, metric, true);
                     }
                 }
+            }
+
+            function updateSelectionDetails(message) {
+                const metadataContent = document.getElementById('metadataContent');
+                if (metadataContent && typeof message.metadataHtml === 'string') {
+                    metadataContent.innerHTML = message.metadataHtml ||
+                        '<div class="no-data">Select runs to view metadata</div>';
+                }
+
+                const configComparison = document.getElementById('configComparison');
+                if (
+                    configComparison &&
+                    typeof message.configComparisonHtml === 'string'
+                ) {
+                    configComparison.innerHTML = message.configComparisonHtml;
+                    initializeConfigComparisonControls();
+                }
+
+                const hasSelection = message.hasSelection === true;
+                document.querySelectorAll('.reload-runs-btn, .sync-runs-btn')
+                    .forEach(button => {
+                        button.disabled = !hasSelection;
+                    });
             }
 
             window.addEventListener('message', event => {
@@ -2895,9 +3692,19 @@ export class MultiRunViewerPanel {
                     updateRunContentStatuses(message.runContentStatuses);
                 }
                 if (
+                    message.numericRunConfigs &&
+                    typeof message.numericRunConfigs === 'object'
+                ) {
+                    numericRunConfigs = message.numericRunConfigs;
+                }
+                if (message.command === 'runSelectionDataUpdated') {
+                    updateSelectionDetails(message);
+                }
+                if (
                     (
                         message.command !== 'runDataUpdated' &&
-                        message.command !== 'runColorsUpdated'
+                        message.command !== 'runColorsUpdated' &&
+                        message.command !== 'runSelectionDataUpdated'
                     ) ||
                     !message.mergedMetrics
                 ) {
@@ -2915,13 +3722,14 @@ export class MultiRunViewerPanel {
 
             // Fullscreen modal
             function openFullscreen(metricIndex, type, shouldPersist = true) {
-                const metrics = type === 'training' ? trainingMetrics : systemMetrics;
+                const metrics = getMetricsForType(type);
                 const metric = metrics[metricIndex];
                 if (!metric) return;
 
                 activeFullscreenMetric = {
                     metricName: metric.metricName,
-                    type
+                    type,
+                    customPlotId: type === 'custom' ? metric.customPlotId : undefined
                 };
                 vscode.postMessage({
                     command: 'fullscreenStateChanged',
@@ -2965,11 +3773,10 @@ export class MultiRunViewerPanel {
                         return;
                     }
 
-                    const currentMetrics = type === 'training'
-                        ? trainingMetrics
-                        : systemMetrics;
-                    const currentMetric = currentMetrics.find(candidate =>
-                        candidate.metricName === metric.metricName
+                    const currentMetrics = getMetricsForType(type);
+                    const currentMetric = findMetricByIdentity(
+                        currentMetrics,
+                        activeFullscreenMetric
                     ) || metric;
 
                     const ctx = document.getElementById('modalChart');
@@ -2994,6 +3801,12 @@ export class MultiRunViewerPanel {
                     if (focusedRunId) {
                         setFocusedRun(modalChart, focusedRunId);
                     }
+                    if (type === 'custom') {
+                        const definition = customPlotDefinitions.find(candidate =>
+                            candidate.id === currentMetric.customPlotId
+                        );
+                        applyCustomAxisTitles(modalChart, definition);
+                    }
                     updateChartAxes(modalChart, modalLogX, modalLogY);
                 });
             }
@@ -3014,7 +3827,7 @@ export class MultiRunViewerPanel {
                             // Get metric data from dataset attributes
                             const type = canvas.dataset.chartType;
                             const index = parseInt(canvas.dataset.chartIndex);
-                            const metrics = type === 'training' ? trainingMetrics : systemMetrics;
+                            const metrics = getMetricsForType(type);
                             const metric = metrics[index];
 
                             if (!metric) return;
@@ -3040,6 +3853,8 @@ export class MultiRunViewerPanel {
                 console.log('Lazy chart rendering initialized for ' + (trainingMetrics.length + systemMetrics.length) + ' charts');
             });
 
+            renderCustomPlots();
+
             const savedFullscreenMetric = persistedViewState.fullscreenMetric;
             if (
                 ${this._isFullscreenOpen ? 'true' : 'false'} &&
@@ -3048,16 +3863,19 @@ export class MultiRunViewerPanel {
                 typeof savedFullscreenMetric.metricName === 'string' &&
                 (
                     savedFullscreenMetric.type === 'training' ||
-                    savedFullscreenMetric.type === 'system'
+                    savedFullscreenMetric.type === 'system' ||
+                    savedFullscreenMetric.type === 'custom'
                 )
             ) {
                 queueMicrotask(() => {
-                    const metrics = savedFullscreenMetric.type === 'training'
-                        ? trainingMetrics
-                        : systemMetrics;
-                    const metricIndex = metrics.findIndex(metric =>
-                        metric.metricName === savedFullscreenMetric.metricName
+                    const metrics = getMetricsForType(savedFullscreenMetric.type);
+                    const restoredMetric = findMetricByIdentity(
+                        metrics,
+                        savedFullscreenMetric
                     );
+                    const metricIndex = restoredMetric
+                        ? metrics.indexOf(restoredMetric)
+                        : -1;
                     if (metricIndex >= 0) {
                         openFullscreen(
                             metricIndex,
@@ -3796,6 +4614,56 @@ export class MultiRunViewerPanel {
                 margin-bottom: 15px;
                 color: var(--vscode-foreground);
             }
+            .custom-plot-builder {
+                margin-bottom: 20px;
+                padding: 14px;
+                border: 1px solid var(--vscode-panel-border);
+                border-radius: 6px;
+                background: var(--vscode-sideBar-background);
+            }
+            .custom-plot-builder h3 {
+                margin: 0 0 12px;
+                font-size: 1em;
+            }
+            .custom-plot-form {
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+                gap: 10px;
+                align-items: end;
+            }
+            .custom-plot-form label {
+                display: flex;
+                flex-direction: column;
+                gap: 4px;
+                color: var(--vscode-descriptionForeground);
+                font-size: 0.8em;
+            }
+            .custom-plot-form input,
+            .custom-plot-form select {
+                min-width: 0;
+                padding: 6px 8px;
+                border: 1px solid var(--vscode-input-border, var(--vscode-panel-border));
+                border-radius: 3px;
+                color: var(--vscode-input-foreground);
+                background: var(--vscode-input-background);
+            }
+            .custom-plot-help,
+            .custom-plot-subtitle {
+                color: var(--vscode-descriptionForeground);
+                font-size: 0.75em;
+            }
+            .custom-plot-help {
+                margin-top: 10px;
+            }
+            .custom-plot-error {
+                min-height: 1.2em;
+                margin-top: 6px;
+                color: var(--vscode-errorForeground);
+                font-size: 0.8em;
+            }
+            .custom-plot-delete {
+                color: var(--vscode-errorForeground);
+            }
             .tabs {
                 display: flex;
                 gap: 10px;
@@ -3949,6 +4817,15 @@ export class MultiRunViewerPanel {
             ? JSON.stringify(value)
             : String(value);
         return `<span class="config-compare-value">${this._escapeHtml(compactValue)}</span>`;
+    }
+
+    private _serializeForScript(value: unknown): string {
+        return JSON.stringify(value)
+            .replace(/</g, '\\u003c')
+            .replace(/>/g, '\\u003e')
+            .replace(/&/g, '\\u0026')
+            .replace(/\u2028/g, '\\u2028')
+            .replace(/\u2029/g, '\\u2029');
     }
 
     private async _handleGenerateAIContext(action: string) {
@@ -4110,6 +4987,11 @@ export class MultiRunViewerPanel {
             clearTimeout(this._selectionRefreshTimer);
             this._selectionRefreshTimer = null;
         }
+        if (this._contentInspectionTimer) {
+            clearTimeout(this._contentInspectionTimer);
+            this._contentInspectionTimer = null;
+        }
+        this._contentInspectionPending = false;
         this._selectionRefreshPending = false;
         this._panel.dispose();
         for (const watcher of this._folderWatchers.values()) {

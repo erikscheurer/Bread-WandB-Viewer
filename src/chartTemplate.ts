@@ -460,7 +460,7 @@ export function getChartScript(): string {
             if (!canvas || canvas.id === 'modalChart') return null;
 
             const chartType = canvas.dataset.chartType;
-            const metricName = canvas.dataset.metricName;
+            const metricName = canvas.dataset.chartStateKey || canvas.dataset.metricName;
             return chartType && metricName
                 ? chartType + ':' + metricName
                 : canvas.id;
@@ -1772,7 +1772,9 @@ export function getChartScript(): string {
 
             // Force-render if not yet lazily initialized
             if (!chartInstances[canvasId]) {
-                const metrics = type === 'training' ? trainingMetrics : systemMetrics;
+                const metrics = typeof getMetricsForType === 'function'
+                    ? getMetricsForType(type)
+                    : (type === 'training' ? trainingMetrics : systemMetrics);
                 const metric = metrics[index];
                 if (!metric) return;
 
@@ -1885,7 +1887,9 @@ export function getChartScript(): string {
                     if (!chartInstances[canvasId]) {
                         const type = canvas.dataset.chartType;
                         const index = parseInt(canvas.dataset.chartIndex);
-                        const metrics = type === 'training' ? trainingMetrics : systemMetrics;
+                        const metrics = typeof getMetricsForType === 'function'
+                            ? getMetricsForType(type)
+                            : (type === 'training' ? trainingMetrics : systemMetrics);
                         const metric = metrics[index];
 
                         if (metric) {

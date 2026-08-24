@@ -20,6 +20,21 @@ export function activate(context: vscode.ExtensionContext) {
     context.subscriptions.push(
         WandbEditorProvider.register(context)
     );
+    context.subscriptions.push(
+        vscode.window.registerWebviewPanelSerializer(
+            MultiRunViewerPanel.viewType,
+            {
+                async deserializeWebviewPanel(webviewPanel, state): Promise<void> {
+                    MultiRunViewerPanel.revive(
+                        webviewPanel,
+                        context.extensionUri,
+                        context.globalState,
+                        state
+                    );
+                }
+            }
+        )
+    );
 
     // Also keep the command for right-click on folders
     const viewRunCommand = vscode.commands.registerCommand(

@@ -32,7 +32,8 @@ version adds:
   periodically or on demand, and displayed runs can be reloaded without rebuilding
   the webview.
 - **Responsive run selection** — sidebar checkboxes update immediately while rapid
-  changes are coalesced before run parsing and chart rebuilding begin.
+  changes are coalesced; selections with the same metric structure update the
+  existing webview instead of reloading the document.
 - **State-preserving chart updates** — refreshes retain zoom, smoothing, log axes,
   run visibility, active tabs, filters, sidebar size, and fullscreen state.
   Fullscreen charts reopen reliably while keeping legend visibility synchronized
@@ -50,12 +51,16 @@ version adds:
   persistent per-run color overrides, improved light-theme contrast, and unfilled
   run curves.
 - **Multi-folder workspaces** — open independent comparison tabs or add more run
-  folders to an existing viewer, with folder-specific tab titles and icons.
+  folders to an existing viewer, with folder-specific tab titles and icons. Open
+  comparison tabs and their selected runs return after reloading VS Code.
 - **Shared comparison groups** — save named run sets such as baselines, toggle the
-  whole set at once, and continue adjusting member runs individually.
+  whole set at once, and continue adjusting member runs individually. Group files
+  are discovered recursively below every folder opened in the viewer.
 - **Richer run navigation** — full-name and empty-run tooltips, local sync-state
   badges, creation timestamps, likely-running indicators, click-to-highlight run
   names, a persisted **Hide empty** filter, and run-specific context actions.
+- **Derived custom plots** — graph one logged metric against another and scale
+  either axis by each run's numeric training-configuration value.
 
 A run is considered empty when none of its run/training metrics contain values.
 System telemetry by itself does not make a run non-empty.
@@ -90,12 +95,6 @@ On Linux or macOS, install the latest release with:
 curl -fL https://github.com/erikscheurer/Bread-WandB-Viewer/releases/latest/download/wandb-viewer.vsix -o /tmp/wandb-viewer.vsix && code --install-extension /tmp/wandb-viewer.vsix --force
 ```
 
-On Windows PowerShell:
-
-```powershell
-$vsix = "$env:TEMP\wandb-viewer.vsix"; Invoke-WebRequest "https://github.com/erikscheurer/Bread-WandB-Viewer/releases/latest/download/wandb-viewer.vsix" -OutFile $vsix; code --install-extension $vsix --force
-```
-
 Alternatively, if you want to install this extension on a server, install the latest release with:
 
 ```bash
@@ -105,6 +104,15 @@ CODE_SERVER="$(find "$HOME/.vscode-server/" -path '*/code-server' -type f | head
     -o /tmp/wandb-viewer-$USER.vsix \
   && "$CODE_SERVER" --install-extension /tmp/wandb-viewer-$USER.vsix --force
 ```
+
+<details>
+<summary>On Windows PowerShell</summary>
+
+```powershell
+$vsix = "$env:TEMP\wandb-viewer.vsix"; Invoke-WebRequest "https://github.com/erikscheurer/Bread-WandB-Viewer/releases/latest/download/wandb-viewer.vsix" -OutFile $vsix; code --install-extension $vsix --force
+```
+
+</details>
 
 Then run `Developer: Reload Window` in VS Code. VS Code does not automatically
 update extensions installed from a VSIX, so rerun the installation command to
@@ -181,6 +189,9 @@ Compare training runs side-by-side to understand what hyperparameters and config
 - Resizable sidebar for better workspace management
 - Resizable chart heights with draggable dividers
 - Automatic folder scanning for all runs
+- Comparison panels reopen after `Developer: Reload Window` or a VS Code restart,
+  retaining their folder roots, selected runs, tabs, filters, chart controls,
+  custom plots, and other persisted view state
 
 Ideal for hyperparameter tuning, ablation studies, and experiment analysis. No need to switch to your browser to compare metrics.
 
@@ -198,11 +209,12 @@ survive viewer reloads and take precedence over the configured palette. Use
 assignment.
 
 Comparison groups are saved as names and run IDs in
-`.wandb-viewer-groups.json` in the first folder opened by the comparison panel.
-This makes the selections shareable with collaborators without storing local paths
-or run data. In a multi-folder panel, the group file still belongs to that first
-folder, while a group may reference runs from any folder currently added to the
-panel.
+`.wandb-viewer-groups.json`. The viewer discovers these files recursively below
+every folder opened in the panel and merges their groups. Existing groups are
+edited in their original file; new groups are saved in the first folder opened by
+the panel. This makes selections shareable with collaborators without storing
+local paths or run data, and a group may retain IDs for runs that are not currently
+open.
 
 ### ☁ Local Sync Status and Optional Upload
 
@@ -249,6 +261,24 @@ Advanced chart controls for detailed metric analysis.
 - **Raw Data Overlay:** Show the raw trace behind its smoothed run in overview and fullscreen charts, with both values combined in one tooltip
 - **Auto-decimation:** Large datasets (500+ points) automatically downsampled for performance
 
+### 🧮 Custom Derived Plots
+
+The **Custom Plots** tab builds an X/Y chart from two logged training metrics. For
+example, select optimizer steps for X and loss for Y, then select a
+tokens-per-optimizer-step configuration value as the X multiplier to graph loss
+against estimated tokens.
+
+- Metric series are aligned by their training step; the X value is
+  linearly interpolated when the two metrics were logged at different intervals
+- X and Y can independently use a numeric configuration value as a per-run
+  multiplier
+- Runs missing a selected metric or multiplier are omitted from that derived plot
+- Definitions are bounded, validated, and saved in VS Code webview state without
+  evaluating arbitrary formulas or JavaScript
+- Custom plots participate in smoothing, log axes, zoom, fullscreen, copy,
+  in-place reload, run-color updates, focused-run highlighting, and persistent
+  drag or keyboard height resizing
+
 ### 📂 Automatic File Watching
 
 While the viewer is visible, the extension detects new or updated `.wandb` files
@@ -257,6 +287,10 @@ therefore keep updating without waiting for training to stop.
 
 - Existing charts update in place, preserving zoom, log axes, smoothing, and
   fullscreen state
+- A run that starts empty creates its overview charts as soon as its first metric
+  values are written
+- Initially unselected runs are classified in the background with a lightweight,
+  block-by-block scan; this does not retain their metrics or configs in the LRU
 - Structural refreshes preserve the active metrics/configuration tab, metric and
   run filters, run ordering, sidebar tab and width, per-chart zoom, and hidden runs
 - Live parsing and chart updates pause while the viewer is hidden to save CPU and
@@ -333,6 +367,8 @@ network connection if those assets are not cached.
 | `wandbViewer.defaultRunSort` | `created-desc` | Initial multi-run ordering; supports creation time, name, and latest-update order |
 | `wandbViewer.runColorPalette` | `tableau10` | Stable run colors from Tableau, Okabe–Ito, Observable, ColorBrewer, Paul Tol, Matplotlib, Plotly (24/26), or background-aware Glasbey (64) palettes; colors are not reused before the palette is exhausted |
 | `wandbViewer.chartColumns` | `1` | Number of chart columns in the multi-run viewer; choose 1–4 to make the layout consistent across machines |
+| `wandbViewer.initialRunSelection` | `auto` | Initial multi-run selection: `auto` selects all runs locally but starts with none in remote extension hosts; `all` and `none` override that behavior |
+| `wandbViewer.maxChartPoints` | `2000` | Maximum points transferred per run/metric for charts using shape-preserving LTTB sampling; `0` disables the limit, while AI export always uses full data |
 
 The additional categorical palettes follow the published
 [D3/ColorBrewer schemes](https://d3js.org/d3-scale-chromatic/categorical) and
@@ -363,7 +399,7 @@ For developers and power users interested in how this extension works.
 - **Binary Parsing:** Direct protobuf parsing of `.wandb` files (LevelDB-style format)
 - **No Viewing-Time W&B Cloud Dependencies:** No W&B CLI or API is required to parse runs
 - **Optional Sync Integration:** Confirmed uploads spawn `wandb sync` without a shell; local status uses W&B's `.synced` marker convention
-- **Performance:** LRU cache (20 runs), LTTB decimation for large datasets, lazy chart initialization
+- **Performance:** selected-run retention plus a 20-run deselected LRU cache, host-side LTTB transfer sampling, Chart.js render decimation, and lazy chart initialization
 - **File Watching:** Throttled filesystem events backed by modification polling and periodic run discovery
 - **Chart Library:** Chart.js 4.4.0 with zoom plugin for interactive visualizations
 
@@ -380,9 +416,11 @@ For developers and power users interested in how this extension works.
 ### Performance Optimizations
 
 - **Quick Metadata:** Reads only first 16KB for fast folder scanning
-- **Metric Decimation:** LTTB algorithm for datasets >500 points
+- **Metric Decimation:** LTTB sampling before the Remote SSH/webview boundary,
+  followed by Chart.js decimation for datasets over 500 points
 - **Lazy Loading:** Charts initialized only when visible
-- **LRU Cache:** Parsed run data cached (max 20 runs)
+- **LRU Cache:** Every selected run stays parsed; up to 20 recently used
+  deselected runs remain cached for quick reactivation
 - **Coalesced Updates:** File changes are throttled and processed serially
 
 ---

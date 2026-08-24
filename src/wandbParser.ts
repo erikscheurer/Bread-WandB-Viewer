@@ -30,6 +30,7 @@ export interface WandbRunData {
 const FILE_HEADER_SIZE = 7;
 const RECORD_HEADER_SIZE = 7;
 const BLOCK_SIZE = 32768; // 32KB
+const MAX_INSPECTION_RECORD_BYTES = 8 * 1024 * 1024;
 
 // Record types
 const RECORD_TYPE_FULL = 1;
@@ -468,6 +469,161 @@ export function parseWandbFile(filePath: string): WandbRunData {
     postProcessRunData(runData);
 
     return runData;
+}
+
+/**
+ * Determine whether a run contains at least one real time-series metric without
+ * retaining its full metric/config payload. Reads one log block at a time and
+ * yields between blocks so background sidebar classification does not monopolize
+ * the extension host.
+ */
+export async function hasWandbMetricData(
+    filePath: string,
+    shouldContinue: () => boolean = () => true
+): Promise<boolean> {
+    loadProtoSchemaSync();
+    if (!RecordType) {
+        return false;
+    }
+
+    const file = await fs.promises.open(filePath, 'r');
+    const metricSteps = new Map<string, Set<number>>();
+    let pendingData: Buffer[] = [];
+    let pendingLength = 0;
+
+    const inspectRecord = (recordData: Buffer): boolean => {
+        try {
+            const record = RecordType!.decode(recordData) as any;
+            const history = record.history;
+            if (!history || !Array.isArray(history.item)) {
+                return false;
+            }
+
+            const step = history.step?.num !== undefined
+                ? Number(history.step.num)
+                : 0;
+            for (const item of history.item) {
+                const key = item.key || (
+                    Array.isArray(item.nested_key) && item.nested_key.length > 0
+                        ? item.nested_key.join('/')
+                        : ''
+                );
+                if (
+                    !key ||
+                    key === '_step' ||
+                    key === '_runtime' ||
+                    key === '_timestamp' ||
+                    typeof item.value_json !== 'string'
+                ) {
+                    continue;
+                }
+
+                let value: unknown;
+                try {
+                    value = JSON.parse(item.value_json);
+                } catch {
+                    continue;
+                }
+                if (typeof value !== 'number' || !Number.isFinite(value)) {
+                    continue;
+                }
+
+                const steps = metricSteps.get(key) || new Set<number>();
+                steps.add(Number.isFinite(step) ? step : 0);
+                metricSteps.set(key, steps);
+                if (steps.size >= 2) {
+                    return true;
+                }
+            }
+        } catch {
+            // Ignore malformed protobuf records like the full parser does.
+        }
+        return false;
+    };
+
+    try {
+        const stats = await file.stat();
+        const block = Buffer.alloc(BLOCK_SIZE);
+        for (let position = 0; position < stats.size; position += BLOCK_SIZE) {
+            if (!shouldContinue()) {
+                throw new Error('metric-inspection-cancelled');
+            }
+            const { bytesRead } = await file.read(
+                block,
+                0,
+                Math.min(BLOCK_SIZE, stats.size - position),
+                position
+            );
+            if (bytesRead === 0) {
+                break;
+            }
+            if (
+                position === 0 &&
+                (bytesRead < FILE_HEADER_SIZE || block.subarray(0, 4).toString('ascii') !== ':W&B')
+            ) {
+                throw new Error('Invalid wandb file header');
+            }
+
+            let offset = position === 0 ? FILE_HEADER_SIZE : 0;
+            while (offset + RECORD_HEADER_SIZE <= bytesRead) {
+                if (
+                    block[offset] === 0 &&
+                    block[offset + 1] === 0 &&
+                    block[offset + 2] === 0 &&
+                    block[offset + 3] === 0
+                ) {
+                    break;
+                }
+
+                const length = block.readUInt16LE(offset + 4);
+                const recordType = block[offset + 6];
+                if (recordType < RECORD_TYPE_FULL || recordType > RECORD_TYPE_LAST) {
+                    offset++;
+                    continue;
+                }
+                const payloadStart = offset + RECORD_HEADER_SIZE;
+                const payloadEnd = payloadStart + length;
+                if (payloadEnd > bytesRead) {
+                    break;
+                }
+                const payload = Buffer.from(block.subarray(payloadStart, payloadEnd));
+                offset = payloadEnd;
+
+                if (recordType === RECORD_TYPE_FULL) {
+                    pendingData = [];
+                    pendingLength = 0;
+                    if (inspectRecord(payload)) {
+                        return true;
+                    }
+                } else if (recordType === RECORD_TYPE_FIRST) {
+                    pendingData = [payload];
+                    pendingLength = payload.length;
+                } else if (recordType === RECORD_TYPE_MIDDLE && pendingData.length > 0) {
+                    pendingLength += payload.length;
+                    if (pendingLength <= MAX_INSPECTION_RECORD_BYTES) {
+                        pendingData.push(payload);
+                    } else {
+                        pendingData = [];
+                    }
+                } else if (recordType === RECORD_TYPE_LAST && pendingData.length > 0) {
+                    pendingLength += payload.length;
+                    if (pendingLength <= MAX_INSPECTION_RECORD_BYTES) {
+                        pendingData.push(payload);
+                        if (inspectRecord(Buffer.concat(pendingData, pendingLength))) {
+                            return true;
+                        }
+                    }
+                    pendingData = [];
+                    pendingLength = 0;
+                }
+            }
+
+            await new Promise<void>(resolve => setImmediate(resolve));
+        }
+        return false;
+    } finally {
+        await file.close();
+    }
 }
 
 /**
