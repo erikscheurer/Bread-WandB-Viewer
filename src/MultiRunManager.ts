@@ -17,6 +17,8 @@ export interface MergedMetric {
     datasets: Array<{
         runId: string;
         runName: string;
+        runGroup?: string;
+        groupColor?: string;
         color: string;
         data: MetricPoint[];
     }>;
@@ -439,10 +441,12 @@ export class MultiRunManager {
      */
     mergeMetrics(maxPointsPerSeries: number = 0): {
         training: MergedMetric[],
-        system: MergedMetric[]
+        system: MergedMetric[],
+        summary: MergedMetric[]
     } {
         const trainingMetrics = new Map<string, MergedMetric>();
         const systemMetrics = new Map<string, MergedMetric>();
+        const summaryMetrics = new Map<string, MergedMetric>();
 
         // Collect all metric names first
         for (const runId of this.state.selectedRunIds) {
@@ -453,6 +457,26 @@ export class MultiRunManager {
             if (!run) continue;
 
             const color = this.getRunColor(runId);
+
+            for (const [metricName, value] of Object.entries(data.summaryMetricValues || {})) {
+                const summaryMetricName = `summary/${metricName}`;
+                if (!summaryMetrics.has(summaryMetricName)) {
+                    summaryMetrics.set(summaryMetricName, {
+                        metricName: summaryMetricName,
+                        datasets: []
+                    });
+                }
+                summaryMetrics.get(summaryMetricName)!.datasets.push({
+                    runId,
+                    runName: run.runName,
+                    runGroup: run.runGroup,
+                    color,
+                    data: [{
+                        step: Number.isFinite(data.summaryStep) ? data.summaryStep! : 0,
+                        value
+                    }]
+                });
+            }
 
             // Process training metrics
             for (const [metricName, metricData] of Object.entries(data.metrics)) {
@@ -466,6 +490,7 @@ export class MultiRunManager {
                 trainingMetrics.get(metricName)!.datasets.push({
                     runId,
                     runName: run.runName,
+                    runGroup: run.runGroup,
                     color,
                     data: downsampleMetricPoints(
                         metricData as MetricPoint[],
@@ -486,6 +511,7 @@ export class MultiRunManager {
                 systemMetrics.get(metricName)!.datasets.push({
                     runId,
                     runName: run.runName,
+                    runGroup: run.runGroup,
                     color,
                     data: downsampleMetricPoints(
                         metricData as MetricPoint[],
@@ -497,7 +523,8 @@ export class MultiRunManager {
 
         return {
             training: Array.from(trainingMetrics.values()),
-            system: Array.from(systemMetrics.values())
+            system: Array.from(systemMetrics.values()),
+            summary: Array.from(summaryMetrics.values())
         };
     }
 

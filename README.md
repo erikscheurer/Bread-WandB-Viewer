@@ -56,11 +56,17 @@ version adds:
 - **Shared comparison groups** — save named run sets such as baselines, toggle the
   whole set at once, and continue adjusting member runs individually. Group files
   are discovered recursively below every folder opened in the viewer.
+- **W&B run grouping** — group and toggle runs by their native W&B `run_group` in
+  the sidebar; groups start collapsed, retain separate metric lines while sharing
+  one color, and expose one group color picker in grouped mode. Custom plots join
+  runs from the same group into a connected series.
 - **Richer run navigation** — full-name and empty-run tooltips, local sync-state
   badges, creation timestamps, likely-running indicators, click-to-highlight run
   names, a persisted **Hide empty** filter, and run-specific context actions.
 - **Derived custom plots** — graph one logged metric against another and scale
-  either axis by each run's numeric training-configuration value.
+  either axis by each run's numeric training-configuration value. Numeric W&B
+  summary fields are available only as Y metrics and automatically use `_step`
+  as their X axis.
 
 A run is considered empty when none of its run/training metrics contain values.
 System telemetry by itself does not make a run non-empty.
@@ -207,6 +213,10 @@ Custom colors are keyed by run ID in VS Code's extension-global storage, so they
 survive viewer reloads and take precedence over the configured palette. Use
 **Reset custom color** in the run context menu to return to automatic palette
 assignment.
+
+When W&B grouping is enabled, the per-run color pickers are hidden and the group
+header color picker controls the shared group color. Group colors are also saved
+in extension-global storage and persist across viewer reloads.
 
 Comparison groups are saved as names and run IDs in
 `.wandb-viewer-groups.json`. The viewer discovers these files recursively below
@@ -433,6 +443,17 @@ Found a bug or have a feature request?
 - **Pull Requests:** Contributions welcome!
 - **Fork source:** [erikscheurer/Bread-WandB-Viewer](https://github.com/erikscheurer/Bread-WandB-Viewer)
 - **Original project:** [Bread-Technologies/Bread-WandB-Viewer](https://github.com/Bread-Technologies/Bread-WandB-Viewer)
+
+ToDos:
+- improve group run selection:
+  - when creating a new group select the currently selected views by default for the new group
+  - For long run names, the names are cut off in the selection. If possible improve this by showing the full names, on hover have a tooltip show, and maybe show the run color next to the run. But it looks like this is a vs code interal thing, before you do major changes, ask me and describe the issue
+- The step displayed in the tooltip is sometimes wrong. I suspect that this is due to the sampling of only a limited number of runs. But its only sometimes wrong: If I go from the left side of the end of the run it shows the correct number of steps, but when i go from the right side its wrong (4k vs 21k)
+- someone reported that the fullscreen is broken sometimes: when clicking on fullscreen of some metric another metric is fullscreened instead
+- Make plots collapsable and allow for reodering of plots (minimal interface, no need to be able to drag and drop entire plots or something, rather have a button that pops up a list of plots and you can then drag and drop this list)
+- It does not recognize runs that have been added to the folder through symbolic links
+- currently, if there are few datapoints, the viewer adds these dots at every datapoint. Remove those
+- Realize the proposal in [docs](docs/proposals/2026-08-26-agent-query-cli.md)
 
 ---
 

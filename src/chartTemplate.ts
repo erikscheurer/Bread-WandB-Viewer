@@ -658,8 +658,10 @@ export function getChartScript(): string {
 
         function getTooltipSwatchStyle(context) {
             const color = context.dataset.borderColor;
-            const isHovered = getDatasetRunKey(context.dataset) ===
-                context.chart.$hoveredRunKey;
+            const isHovered = datasetHasRunKey(
+                context.dataset,
+                context.chart.$hoveredRunKey
+            );
             return {
                 borderColor: color,
                 backgroundColor: isHovered
@@ -685,7 +687,7 @@ export function getChartScript(): string {
                 if (!tooltip || tooltip.opacity === 0 || !hoveredRunKey) return;
 
                 const hoveredIndex = tooltip.dataPoints.findIndex(context =>
-                    getDatasetRunKey(context.dataset) === hoveredRunKey
+                    datasetHasRunKey(context.dataset, hoveredRunKey)
                 );
                 if (hoveredIndex < 0) return;
 
@@ -839,86 +841,17 @@ export function getChartScript(): string {
 
         function installRangeInteractions(chart) {
             const canvas = chart.canvas;
+            let pointerDown = null;
             let gesture = null;
+            let pendingGesturePoint = null;
+            let gestureFrame = null;
 
-            canvas.classList.add('range-interactive-chart');
+            const applyPendingGesture = () => {
+                gestureFrame = null;
+                if (!gesture || !pendingGesturePoint) return;
 
-            const finishGesture = event => {
-                if (!gesture) return;
-
-                if (gesture.type === 'select' && event.type !== 'pointercancel') {
-                    const selection = chart.$rangeSelection;
-                    if (selection) {
-                        const distanceX = Math.abs(selection.end.x - selection.start.x);
-                        const distanceY = Math.abs(selection.end.y - selection.start.y);
-
-                        if (distanceX >= RANGE_MIN_DISTANCE) {
-                            const xScale = chart.scales.x;
-                            const xStart = xScale.getValueForPixel(selection.start.x);
-                            const xEnd = xScale.getValueForPixel(selection.end.x);
-                            const xRange = {
-                                min: Math.min(xStart, xEnd),
-                                max: Math.max(xStart, xEnd)
-                            };
-                            const isBox = distanceY >= RANGE_BOX_THRESHOLD;
-                            let yRange = null;
-
-                            if (isBox) {
-                                const yScale = chart.scales.y;
-                                const yStart = yScale.getValueForPixel(selection.start.y);
-                                const yEnd = yScale.getValueForPixel(selection.end.y);
-                                yRange = {
-                                    min: Math.min(yStart, yEnd),
-                                    max: Math.max(yStart, yEnd)
-                                };
-                            }
-
-                            chart.zoomScale('x', xRange, 'none');
-
-                            if (yRange) {
-                                chart.zoomScale('y', yRange, 'none');
-                            } else {
-                                fitYAxisToVisibleX(chart, xRange.min, xRange.max);
-                            }
-                        }
-                    }
-                }
-                chart.$rangeSelection = null;
-                chart.draw();
-                captureChartViewState(chart);
-
-                if (canvas.hasPointerCapture(event.pointerId)) {
-                    canvas.releasePointerCapture(event.pointerId);
-                }
-                gesture = null;
-                canvas.style.cursor = '';
-            };
-
-            const onPointerDown = event => {
-                if (event.button !== 0) return;
-
-                const point = getChartPointerPosition(chart, event);
-                if (!isPointInChartArea(chart, point)) return;
-
-                gesture = {
-                    type: event.shiftKey ? 'pan' : 'select',
-                    start: point,
-                    last: point
-                };
-                canvas.setPointerCapture(event.pointerId);
-                canvas.style.cursor = gesture.type === 'pan' ? 'grabbing' : 'crosshair';
-
-                if (gesture.type === 'select') {
-                    chart.$rangeSelection = { start: point, end: point };
-                    chart.draw();
-                }
-                event.preventDefault();
-            };
-
-            const onPointerMove = event => {
-                if (!gesture) return;
-
-                const point = getChartPointerPosition(chart, event);
+                const point = pendingGesturePoint;
+                pendingGesturePoint = null;
                 if (gesture.type === 'pan') {
                     const deltaX = point.x - gesture.last.x;
                     const deltaY = point.y - gesture.last.y;
@@ -934,6 +867,139 @@ export function getChartScript(): string {
                     chart.$rangeSelection.end = point;
                     chart.draw();
                 }
+            };
+
+            const scheduleGestureFrame = () => {
+                if (gestureFrame === null) {
+                    gestureFrame = requestAnimationFrame(applyPendingGesture);
+                }
+            };
+
+            canvas.classList.add('range-interactive-chart');
+
+            const finishGesture = event => {
+                if (!pointerDown) return;
+
+                if (gesture && event.type !== 'pointercancel') {
+                    pendingGesturePoint = getChartPointerPosition(chart, event);
+                    if (gestureFrame !== null) {
+                        cancelAnimationFrame(gestureFrame);
+                        gestureFrame = null;
+                    }
+                    applyPendingGesture();
+                } else if (gesture) {
+                    pendingGesturePoint = null;
+                    if (gestureFrame !== null) {
+                        cancelAnimationFrame(gestureFrame);
+                        gestureFrame = null;
+                    }
+                }
+
+                if (gesture && event.type !== 'pointercancel') {
+                    if (gesture.type === 'select') {
+                        const selection = chart.$rangeSelection;
+                        if (selection) {
+                            const distanceX = Math.abs(selection.end.x - selection.start.x);
+                            const distanceY = Math.abs(selection.end.y - selection.start.y);
+
+                            if (distanceX >= RANGE_MIN_DISTANCE) {
+                                const xScale = chart.scales.x;
+                                const xStart = xScale.getValueForPixel(selection.start.x);
+                                const xEnd = xScale.getValueForPixel(selection.end.x);
+                                const xRange = {
+                                    min: Math.min(xStart, xEnd),
+                                    max: Math.max(xStart, xEnd)
+                                };
+                                const isBox = distanceY >= RANGE_BOX_THRESHOLD;
+                                let yRange = null;
+
+                                if (isBox) {
+                                    const yScale = chart.scales.y;
+                                    const yStart = yScale.getValueForPixel(selection.start.y);
+                                    const yEnd = yScale.getValueForPixel(selection.end.y);
+                                    yRange = {
+                                        min: Math.min(yStart, yEnd),
+                                        max: Math.max(yStart, yEnd)
+                                    };
+                                }
+
+                                chart.zoomScale('x', xRange, 'none');
+
+                                if (yRange) {
+                                    chart.zoomScale('y', yRange, 'none');
+                                } else {
+                                    fitYAxisToVisibleX(chart, xRange.min, xRange.max);
+                                }
+                            }
+                        }
+                    }
+                    chart.$rangeSelection = null;
+                    chart.draw();
+                    // A single final layout/update keeps long pan or selection
+                    // gestures from leaving a canvas with stale dimensions.
+                    chart.resize();
+                    chart.update('none');
+                    captureChartViewState(chart);
+                } else if (gesture) {
+                    chart.$rangeSelection = null;
+                    chart.draw();
+                }
+
+                if (canvas.hasPointerCapture(event.pointerId)) {
+                    canvas.releasePointerCapture(event.pointerId);
+                }
+                pointerDown = null;
+                gesture = null;
+                pendingGesturePoint = null;
+                canvas.style.cursor = '';
+            };
+
+            const onPointerDown = event => {
+                if (event.button !== 0) return;
+
+                const point = getChartPointerPosition(chart, event);
+                if (!isPointInChartArea(chart, point)) return;
+
+                pointerDown = {
+                    point,
+                    pointerId: event.pointerId,
+                    shiftKey: event.shiftKey
+                };
+                pendingGesturePoint = null;
+                canvas.setPointerCapture(event.pointerId);
+                event.preventDefault();
+            };
+
+            const onPointerMove = event => {
+                if (!pointerDown) return;
+
+                const point = getChartPointerPosition(chart, event);
+                if (!gesture) {
+                    const distance = Math.hypot(
+                        point.x - pointerDown.point.x,
+                        point.y - pointerDown.point.y
+                    );
+                    if (distance < 3) return;
+
+                    gesture = {
+                        type: pointerDown.shiftKey ? 'pan' : 'select',
+                        start: pointerDown.point,
+                        last: point
+                    };
+                    canvas.style.cursor = gesture.type === 'pan'
+                        ? 'grabbing'
+                        : 'crosshair';
+                    if (gesture.type === 'select') {
+                        chart.$rangeSelection = {
+                            start: pointerDown.point,
+                            end: point
+                        };
+                        chart.draw();
+                    }
+                }
+
+                pendingGesturePoint = point;
+                scheduleGestureFrame();
                 event.preventDefault();
             };
 
@@ -964,6 +1030,13 @@ export function getChartScript(): string {
             canvas.addEventListener('wheel', onWheel, { passive: false });
 
             chart.$rangeInteractionCleanup = () => {
+                if (gestureFrame !== null) {
+                    cancelAnimationFrame(gestureFrame);
+                }
+                gestureFrame = null;
+                pointerDown = null;
+                pendingGesturePoint = null;
+                gesture = null;
                 canvas.removeEventListener('pointerdown', onPointerDown);
                 canvas.removeEventListener('pointermove', onPointerMove);
                 canvas.removeEventListener('pointerup', finishGesture);
@@ -997,11 +1070,28 @@ export function getChartScript(): string {
             return dataset && (dataset._runId || dataset._runName);
         }
 
+        function getDatasetRunKeys(dataset) {
+            if (!dataset) return [];
+            const keys = [];
+            const datasetKey = getDatasetRunKey(dataset);
+            if (datasetKey) keys.push(datasetKey);
+            if (Array.isArray(dataset._runIds)) {
+                dataset._runIds.forEach(runId => {
+                    if (runId && !keys.includes(runId)) keys.push(runId);
+                });
+            }
+            return keys;
+        }
+
+        function datasetHasRunKey(dataset, runKey) {
+            return Boolean(runKey) && getDatasetRunKeys(dataset).includes(runKey);
+        }
+
         function chartHasRunKey(chart, runKey) {
             return Boolean(
                 chart &&
                 runKey &&
-                chart.data.datasets.some(dataset => getDatasetRunKey(dataset) === runKey)
+                chart.data.datasets.some(dataset => datasetHasRunKey(dataset, runKey))
             );
         }
 
@@ -1069,7 +1159,7 @@ export function getChartScript(): string {
                     };
 
                     const baseStyle = dataset.$hoverBaseStyle;
-                    const isHoveredRun = getDatasetRunKey(dataset) === runKey;
+                    const isHoveredRun = datasetHasRunKey(dataset, runKey);
                     dataset.borderColor = !isHoveredRun
                         ? withColorAlpha(baseStyle.borderColor, 0.18)
                         : baseStyle.borderColor;
@@ -1209,8 +1299,7 @@ export function getChartScript(): string {
                                 const runKey = clickedDataset._runId || clickedDataset._runName;
                                 const setRunVisibility = (targetRunKey, visible) => {
                                     chart.data.datasets.forEach((dataset, datasetIndex) => {
-                                        const datasetRunKey = dataset._runId || dataset._runName;
-                                        if (datasetRunKey === targetRunKey) {
+                                        if (datasetHasRunKey(dataset, targetRunKey)) {
                                             chart.setDatasetVisibility(datasetIndex, visible);
                                         }
                                     });
@@ -1238,8 +1327,10 @@ export function getChartScript(): string {
                                                 getRunVisibility(chart);
                                         }
                                         chart.data.datasets.forEach((dataset, datasetIndex) => {
-                                            const datasetRunKey = dataset._runId || dataset._runName;
-                                            chart.setDatasetVisibility(datasetIndex, datasetRunKey === runKey);
+                                            chart.setDatasetVisibility(
+                                                datasetIndex,
+                                                datasetHasRunKey(dataset, runKey)
+                                            );
                                         });
                                         chart.$isolatedRunKey = runKey;
                                     }
@@ -1253,8 +1344,7 @@ export function getChartScript(): string {
                                 }
                                 chart.$legendClickTimer = setTimeout(() => {
                                     const runIsVisible = chart.data.datasets.some((dataset, datasetIndex) => {
-                                        const datasetRunKey = dataset._runId || dataset._runName;
-                                        return datasetRunKey === runKey &&
+                                        return datasetHasRunKey(dataset, runKey) &&
                                             chart.isDatasetVisible(datasetIndex);
                                     });
                                     setRunVisibility(runKey, !runIsVisible);
@@ -1281,7 +1371,7 @@ export function getChartScript(): string {
                                     const currentTheme = getChartThemeColors();
                                     return labels.map(item => {
                                         const dataset = chart.data.datasets[item.datasetIndex];
-                                        const isHovered = getDatasetRunKey(dataset) === hoveredRunKey;
+                                        const isHovered = datasetHasRunKey(dataset, hoveredRunKey);
                                         return {
                                             ...item,
                                             fillStyle: isHovered
@@ -1320,10 +1410,9 @@ export function getChartScript(): string {
                                             ? rawValue.toExponential(decimals)
                                             : rawValue.toFixed(decimals);
                                     const formatted = formatValue(value);
-                                    const runKey = context.dataset._runId || context.dataset._runName;
+                                    const runKey = getDatasetRunKey(context.dataset);
                                     const rawDataset = context.chart.data.datasets.find(dataset => {
-                                        const datasetRunKey = dataset._runId || dataset._runName;
-                                        return dataset._isRaw && datasetRunKey === runKey;
+                                    return dataset._isRaw && datasetHasRunKey(dataset, runKey);
                                     });
                                     const rawPoint = rawDataset && rawDataset.data[context.dataIndex];
                                     const rawValue = rawPoint && typeof rawPoint === 'object'
@@ -1457,6 +1546,7 @@ export function getChartScript(): string {
                         _originalColor: d._originalColor,
                         _runName: d._runName,
                         _runId: d._runId,
+                        _runIds: d._runIds,
                         _isOriginal: true,
                         _runVisible: originalVisibility[originalIndex]
                     });
@@ -1484,6 +1574,7 @@ export function getChartScript(): string {
                             _originalColor: d._originalColor,
                             _runName: d._runName,
                             _runId: d._runId,
+                            _runIds: d._runIds,
                             _isOriginal: false,
                             _isRaw: true,
                             _runVisible: runVisible
@@ -1506,6 +1597,7 @@ export function getChartScript(): string {
                         _originalColor: d._originalColor,
                         _runName: d._runName,
                         _runId: d._runId,
+                        _runIds: d._runIds,
                         _isOriginal: true,
                         _runVisible: runVisible
                     });

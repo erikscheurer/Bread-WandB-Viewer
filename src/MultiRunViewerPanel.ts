@@ -20,7 +20,9 @@ import {
 import {
     getCustomRunColors,
     normalizeCustomRunColor,
-    setCustomRunColor
+    setCustomRunColor,
+    getCustomWandbGroupColors,
+    setCustomWandbGroupColor
 } from './customRunColors';
 import {
     loadRunComparisonGroupSources,
@@ -99,6 +101,7 @@ export class MultiRunViewerPanel {
     private readonly _extensionStorage: vscode.Memento;
     private _customRunNames: Record<string, string>;
     private _customRunColors: Record<string, string>;
+    private _customWandbGroupColors: Record<string, string>;
     private _isFullscreenOpen = false;
     private _selectionRefreshTimer: NodeJS.Timeout | null = null;
     private _selectionRefreshInProgress = false;
@@ -233,6 +236,7 @@ export class MultiRunViewerPanel {
         this._extensionStorage = nameStorage;
         this._customRunNames = getCustomRunNames(nameStorage);
         this._customRunColors = getCustomRunColors(nameStorage);
+        this._customWandbGroupColors = getCustomWandbGroupColors(nameStorage);
         const configuration = vscode.workspace.getConfiguration('wandbViewer');
         const configuredRunSort = configuration.get<string>('defaultRunSort');
         const configuredColorPalette = configuration.get<string>('runColorPalette');
@@ -374,6 +378,20 @@ export class MultiRunViewerPanel {
                             );
                         }
                         break;
+                    case 'toggleWandbRunGroup':
+                        if (
+                            typeof message.runGroup === 'string' &&
+                            typeof message.selected === 'boolean'
+                        ) {
+                            if (typeof message.fullscreenOpen === 'boolean') {
+                                this._isFullscreenOpen = message.fullscreenOpen;
+                            }
+                            await this._setWandbRunGroupSelected(
+                                message.runGroup,
+                                message.selected
+                            );
+                        }
+                        break;
                     case 'createComparisonGroup':
                         await this._editComparisonGroup();
                         break;
@@ -418,6 +436,17 @@ export class MultiRunViewerPanel {
                             (typeof message.color === 'string' || message.color === null)
                         ) {
                             await this._setRunColor(message.runId, message.color);
+                        }
+                        break;
+                    case 'setWandbGroupColor':
+                        if (
+                            typeof message.runGroup === 'string' &&
+                            (typeof message.color === 'string' || message.color === null)
+                        ) {
+                            await this._setWandbGroupColor(
+                                message.runGroup,
+                                message.color
+                            );
                         }
                         break;
                     case 'fullscreenStateChanged':
@@ -874,18 +903,38 @@ export class MultiRunViewerPanel {
         };
     }
 
-    private _getMergedMetrics(): { training: MergedMetric[], system: MergedMetric[] } {
+    private _getWandbGroupColors(): Record<string, string> {
+        const groupColors: Record<string, string> = {};
+        const runs = this._manager.getRuns()
+            .filter(run => Boolean(run.runGroup))
+            .sort((left, right) => left.runId.localeCompare(right.runId));
+        for (const run of runs) {
+            const groupName = run.runGroup!;
+            if (this._customWandbGroupColors[groupName]) {
+                groupColors[groupName] = this._customWandbGroupColors[groupName];
+            } else if (!groupColors[groupName]) {
+                groupColors[groupName] = this._manager.getRunColor(run.runId);
+            }
+        }
+        return groupColors;
+    }
+
+    private _getMergedMetrics(): { training: MergedMetric[], system: MergedMetric[], summary: MergedMetric[] } {
         const mergedMetrics = this._manager.mergeMetrics(this._maxChartPoints);
-        for (const metric of [...mergedMetrics.training, ...mergedMetrics.system]) {
+        const groupColors = this._getWandbGroupColors();
+        for (const metric of [...mergedMetrics.training, ...mergedMetrics.system, ...mergedMetrics.summary]) {
             for (const dataset of metric.datasets) {
                 dataset.runName = this._customRunNames[dataset.runId] || dataset.runName;
+                dataset.groupColor = dataset.runGroup
+                    ? groupColors[dataset.runGroup]
+                    : undefined;
             }
         }
         return mergedMetrics;
     }
 
     private _getMetricSignature(
-        mergedMetrics: { training: MergedMetric[], system: MergedMetric[] }
+        mergedMetrics: { training: MergedMetric[], system: MergedMetric[], summary: MergedMetric[] }
     ): string {
         const training = mergedMetrics.training
             .map(metric => metric.metricName)
@@ -980,6 +1029,46 @@ export class MultiRunViewerPanel {
             }
             panel._customRunColors = updatedColors;
             panel._manager.setCustomRunColors(updatedColors);
+            refreshes.push(panel._updateRunColorsInWebview());
+        }
+        await Promise.all(refreshes);
+    }
+
+    private async _setWandbGroupColor(
+        runGroup: string,
+        color: string | null
+    ): Promise<void> {
+        if (!this._manager.getRuns().some(run => run.runGroup === runGroup)) {
+            return;
+        }
+
+        const normalizedColor = color === null
+            ? undefined
+            : normalizeCustomRunColor(color);
+        if (color !== null && !normalizedColor) {
+            await this._updateRunColorsInWebview();
+            return;
+        }
+
+        let updatedColors: Record<string, string>;
+        try {
+            updatedColors = await setCustomWandbGroupColor(
+                this._extensionStorage,
+                runGroup,
+                normalizedColor
+            );
+        } catch {
+            vscode.window.showErrorMessage('Failed to save the custom W&B group color.');
+            await this._updateRunColorsInWebview();
+            return;
+        }
+
+        const refreshes: Promise<void>[] = [];
+        for (const panel of MultiRunViewerPanel.panels) {
+            if (panel._disposed) {
+                continue;
+            }
+            panel._customWandbGroupColors = updatedColors;
             refreshes.push(panel._updateRunColorsInWebview());
         }
         await Promise.all(refreshes);
@@ -1244,6 +1333,25 @@ export class MultiRunViewerPanel {
         this._scheduleSelectionRefresh();
     }
 
+    private async _setWandbRunGroupSelected(
+        runGroup: string,
+        selected: boolean
+    ): Promise<void> {
+        const matchingRuns = this._manager.getRuns()
+            .filter(run => run.runGroup === runGroup);
+        if (matchingRuns.length === 0) {
+            return;
+        }
+        for (const run of matchingRuns) {
+            this._manager.setRunSelected(run.runId, selected);
+        }
+        await this._panel.webview.postMessage({
+            command: 'bulkRunSelectionAcknowledged',
+            selectedRunIds: this._manager.getSelectedRunIds()
+        });
+        this._scheduleSelectionRefresh();
+    }
+
     private async _handleSyncRuns(runIds: string[]): Promise<void> {
         const uniqueRunIds = Array.from(new Set(runIds));
         const runs = uniqueRunIds
@@ -1363,6 +1471,7 @@ export class MultiRunViewerPanel {
         await this._panel.webview.postMessage({
             command: 'runColorsUpdated',
             runColors,
+            runGroupColors: this._getWandbGroupColors(),
             customRunColorIds: Object.keys(this._customRunColors),
             mergedMetrics: this._getMergedMetrics()
         });
@@ -1456,7 +1565,7 @@ export class MultiRunViewerPanel {
     private _getHtmlContent(
         runs: RunScanResult[],
         selectedRunIds: string[],
-        mergedMetrics: { training: MergedMetric[], system: MergedMetric[] }
+        mergedMetrics: { training: MergedMetric[], system: MergedMetric[], summary: MergedMetric[] }
     ): string {
         const selectedSet = new Set(selectedRunIds);
         const selectedRuns = runs.filter(run => selectedSet.has(run.runId));
@@ -1465,6 +1574,7 @@ export class MultiRunViewerPanel {
             runs,
             selectedSet
         );
+        const wandbGroupColors = this._getWandbGroupColors();
 
         // Generate sidebar run list
         const runListHtml = runs.map(run => {
@@ -1488,6 +1598,9 @@ export class MultiRunViewerPanel {
                     data-run-name="${this._escapeHtml(run.runName)}"
                     data-run-id="${this._escapeHtml(run.runId)}"
                     data-run-project="${this._escapeHtml(run.project || '')}"
+                    data-run-group="${this._escapeHtml(run.runGroup || '')}"
+                    data-base-color="${color}"
+                    data-group-color="${run.runGroup ? wandbGroupColors[run.runGroup] || color : color}"
                     data-created-at="${run.createdAt}"
                     data-updated-at="${run.lastModified}"
                     data-file-size="${run.fileSize}"
@@ -1551,6 +1664,10 @@ export class MultiRunViewerPanel {
                                 <span class="config-key">Created:</span>
                                 <span class="config-value">${this._escapeHtml(this._formatTimestamp(run.createdAt))}</span>
                             </div>
+                            <div class="config-item">
+                                <span class="config-key">W&B group:</span>
+                                <span class="config-value">${this._escapeHtml(run.runGroup || 'Not set')}</span>
+                            </div>
                             ${configEntries.map(([key, value]) => `
                                 <div class="config-item">
                                     <span class="config-key">${this._escapeHtml(key)}:</span>
@@ -1570,7 +1687,7 @@ export class MultiRunViewerPanel {
     private _getHtmlDocumentContent(
         runs: RunScanResult[],
         selectedRunIds: string[],
-        mergedMetrics: { training: MergedMetric[], system: MergedMetric[] },
+        mergedMetrics: { training: MergedMetric[], system: MergedMetric[], summary: MergedMetric[] },
         runListHtml: string,
         metadataHtml: string,
         comparisonGroupsHtml: string,
@@ -1624,6 +1741,14 @@ export class MultiRunViewerPanel {
                         aria-pressed="false"
                         title="Hide runs confirmed to have no run metric values"
                     >Hide empty</button>
+                    <button
+                        type="button"
+                        class="run-group-toggle"
+                        id="groupRunsBtn"
+                        aria-pressed="false"
+                        title="Group runs by their native W&B group"
+                        onclick="toggleWandbRunGroups()"
+                    >Group</button>
                 </div>
                 <div id="runList">${runListHtml}</div>
                 <div class="run-filter-empty" id="runFilterEmpty">No runs match this filter.</div>
@@ -1809,6 +1934,7 @@ export class MultiRunViewerPanel {
             <tr
                 data-run-id="${this._escapeHtml(run.runId)}"
                 data-run-name="${this._escapeHtml(run.runName)}"
+                data-run-group="${this._escapeHtml(run.runGroup || '')}"
                 data-created-at="${run.createdAt}"
                 data-updated-at="${run.lastModified}"
             >
@@ -1983,11 +2109,12 @@ export class MultiRunViewerPanel {
         return key;
     }
 
-    private _generateChartInitScript(mergedMetrics: { training: MergedMetric[], system: MergedMetric[] }): string {
+    private _generateChartInitScript(mergedMetrics: { training: MergedMetric[], system: MergedMetric[], summary: MergedMetric[] }): string {
         return `
             const vscode = acquireVsCodeApi();
             let trainingMetrics = ${this._serializeForScript(mergedMetrics.training)};
             let systemMetrics = ${this._serializeForScript(mergedMetrics.system)};
+            let summaryMetrics = ${this._serializeForScript(mergedMetrics.summary)};
             let numericRunConfigs = ${this._serializeForScript(this._getNumericRunConfigs())};
             const restoredFolderPaths = ${this._serializeForScript(Array.from(this._folderPaths))};
             let activeFullscreenMetric = null;
@@ -2001,6 +2128,14 @@ export class MultiRunViewerPanel {
             let focusedRunId = typeof persistedViewState.focusedRunId === 'string'
                 ? persistedViewState.focusedRunId
                 : null;
+            let groupWandbRuns = persistedViewState.groupWandbRuns === true;
+            const expandedWandbGroups = new Set(
+                Array.isArray(persistedViewState.expandedWandbGroups)
+                    ? persistedViewState.expandedWandbGroups.filter(
+                        groupName => typeof groupName === 'string'
+                    )
+                    : []
+            );
             const savedChartHeights = persistedViewState.chartHeights &&
                 typeof persistedViewState.chartHeights === 'object'
                 ? persistedViewState.chartHeights
@@ -2078,8 +2213,17 @@ export class MultiRunViewerPanel {
             function getMetricsForType(type) {
                 if (type === 'training') return trainingMetrics;
                 if (type === 'system') return systemMetrics;
+                if (type === 'summary') return summaryMetrics;
                 if (type === 'custom') return customMetrics;
                 return [];
+            }
+
+            function getCustomSourceMetrics() {
+                return trainingMetrics.concat(summaryMetrics);
+            }
+
+            function isSummaryMetric(metricName) {
+                return summaryMetrics.some(metric => metric.metricName === metricName);
             }
 
             function interpolateMetricValue(points, step) {
@@ -2112,19 +2256,23 @@ export class MultiRunViewerPanel {
             }
 
             function buildCustomMetric(definition) {
-                const xMetric = trainingMetrics.find(
+                const availableMetrics = getCustomSourceMetrics();
+                const summaryYMetric = isSummaryMetric(definition.yMetric);
+                const usesStepX = summaryYMetric || definition.xMetric === '_step';
+                const xMetric = availableMetrics.find(
                     metric => metric.metricName === definition.xMetric
                 );
-                const yMetric = trainingMetrics.find(
+                const yMetric = availableMetrics.find(
                     metric => metric.metricName === definition.yMetric
                 );
                 const datasets = [];
-                if (xMetric && yMetric) {
+                const groupedDatasets = new Map();
+                if (yMetric && (usesStepX || xMetric)) {
                     for (const yDataset of yMetric.datasets) {
-                        const xDataset = xMetric.datasets.find(
+                        const xDataset = xMetric?.datasets.find(
                             dataset => dataset.runId === yDataset.runId
                         );
-                        if (!xDataset) continue;
+                        if (!usesStepX && !xDataset) continue;
                         const xMultiplier = getConfigMultiplier(
                             yDataset.runId,
                             definition.xMultiplierConfig
@@ -2136,7 +2284,9 @@ export class MultiRunViewerPanel {
                         if (xMultiplier === null || yMultiplier === null) continue;
 
                         const data = yDataset.data.flatMap(point => {
-                            const xValue = interpolateMetricValue(xDataset.data, point.step);
+                            const xValue = usesStepX
+                                ? point.step
+                                : interpolateMetricValue(xDataset.data, point.step);
                             const scaledX = xValue === null ? NaN : xValue * xMultiplier;
                             const scaledY = point.value * yMultiplier;
                             return Number.isFinite(scaledX) && Number.isFinite(scaledY)
@@ -2144,14 +2294,59 @@ export class MultiRunViewerPanel {
                                 : [];
                         });
                         if (data.length > 0) {
-                            datasets.push({
-                                runId: yDataset.runId,
-                                runName: yDataset.runName,
-                                color: yDataset.color,
-                                data
+                            // A grouped custom plot is a group-level series: keep
+                            // the source runs together so evaluation points from
+                            // one W&B group are connected in step order. Do not
+                            // deduplicate equal steps; two runs evaluated at the
+                            // same step are both meaningful and should be joined.
+                            const groupKey = groupWandbRuns && yDataset.runGroup
+                                ? 'group:' + yDataset.runGroup
+                                : yDataset.runId;
+                            let grouped = groupedDatasets.get(groupKey);
+                            if (!grouped) {
+                                grouped = {
+                                    runId: groupKey,
+                                    runName: yDataset.runGroup || yDataset.runName,
+                                    runGroup: yDataset.runGroup,
+                                    groupColor: yDataset.groupColor,
+                                    color: yDataset.color,
+                                    runIds: [],
+                                    points: []
+                                };
+                                groupedDatasets.set(groupKey, grouped);
+                            }
+                            if (!grouped.runIds.includes(yDataset.runId)) {
+                                grouped.runIds.push(yDataset.runId);
+                            }
+                            data.forEach((point, pointIndex) => {
+                                grouped.points.push({
+                                    step: point.step,
+                                    value: point.value,
+                                    runId: yDataset.runId,
+                                    pointIndex
+                                });
                             });
                         }
                     }
+                }
+                for (const grouped of groupedDatasets.values()) {
+                    grouped.points.sort((left, right) =>
+                        left.step - right.step ||
+                        left.runId.localeCompare(right.runId) ||
+                        left.pointIndex - right.pointIndex
+                    );
+                    datasets.push({
+                        runId: grouped.runId,
+                        runName: grouped.runName,
+                        runGroup: grouped.runGroup,
+                        groupColor: grouped.groupColor,
+                        color: grouped.color,
+                        runIds: grouped.runIds,
+                        data: grouped.points.map(point => ({
+                            step: point.step,
+                            value: point.value
+                        }))
+                    });
                 }
                 return {
                     metricName: definition.title,
@@ -2200,9 +2395,14 @@ export class MultiRunViewerPanel {
             }
 
             function updateCustomPlotBuilderOptions() {
-                const metricNames = trainingMetrics
-                    .map(metric => metric.metricName)
-                    .sort((left, right) => left.localeCompare(right));
+                const metricNames = Array.from(new Set(
+                    getCustomSourceMetrics().map(metric => metric.metricName)
+                )).sort((left, right) => left.localeCompare(right));
+                const xMetricNames = Array.from(new Set(
+                    trainingMetrics
+                        .map(metric => metric.metricName)
+                        .filter(metricName => !metricName.startsWith('summary/'))
+                )).sort((left, right) => left.localeCompare(right));
                 const configKeys = Array.from(new Set(
                     Object.values(numericRunConfigs).flatMap(config =>
                         Object.keys(config)
@@ -2210,7 +2410,10 @@ export class MultiRunViewerPanel {
                 )).sort((left, right) => left.localeCompare(right));
                 replaceSelectOptions(
                     document.getElementById('customPlotXMetric'),
-                    metricNames,
+                    [
+                        ...xMetricNames,
+                        '_step'
+                    ],
                     false
                 );
                 replaceSelectOptions(
@@ -2218,6 +2421,20 @@ export class MultiRunViewerPanel {
                     metricNames,
                     false
                 );
+                const xMetricSelect = document.getElementById('customPlotXMetric');
+                const yMetricSelect = document.getElementById('customPlotYMetric');
+                const yIsSummary = isSummaryMetric(yMetricSelect?.value || '');
+                if (xMetricSelect) {
+                    xMetricSelect.disabled = yIsSummary;
+                    if (yIsSummary) {
+                        xMetricSelect.value = '_step';
+                    }
+                }
+                const xMultiplierSelect = document.getElementById('customPlotXMultiplier');
+                if (xMultiplierSelect) {
+                    xMultiplierSelect.disabled = yIsSummary;
+                    if (yIsSummary) xMultiplierSelect.value = '';
+                }
                 replaceSelectOptions(
                     document.getElementById('customPlotXMultiplier'),
                     configKeys,
@@ -2243,6 +2460,31 @@ export class MultiRunViewerPanel {
                     destroyChartSafely(chart);
                 });
 
+                let migratedSummaryPlot = false;
+                customPlotDefinitions = customPlotDefinitions.map(definition => {
+                    const summaryMetricName = isSummaryMetric(definition.yMetric)
+                        ? definition.yMetric
+                        : isSummaryMetric('summary/' + definition.yMetric)
+                            ? 'summary/' + definition.yMetric
+                            : null;
+                    if (summaryMetricName && (
+                        definition.yMetric !== summaryMetricName ||
+                        definition.xMetric !== '_step' ||
+                        definition.xMultiplierConfig
+                    )) {
+                        migratedSummaryPlot = true;
+                        return {
+                            ...definition,
+                            yMetric: summaryMetricName,
+                            xMetric: '_step',
+                            xMultiplierConfig: ''
+                        };
+                    }
+                    return definition;
+                });
+                if (migratedSummaryPlot) {
+                    updatePersistedViewState({ customPlots: customPlotDefinitions });
+                }
                 updateCustomPlotBuilderOptions();
                 customMetrics = customPlotDefinitions.map(buildCustomMetric);
                 const list = document.getElementById('customPlotList');
@@ -2346,21 +2588,13 @@ export class MultiRunViewerPanel {
                     container.append(header, wrapper, chartResizeHandle);
                     grid.appendChild(container);
 
-                    const chart = createUnifiedChart(
-                        canvas,
-                        createRunDatasets(metric, false),
-                        metric.metricName,
-                        { isModal: false, enableZoom: true }
-                    );
-                    chartInstances[canvas.id] = chart;
-                    applyCustomAxisTitles(chart, definition);
-                    updateChartSmoothing(chart, globalSmoothing, showRaw);
-                    if (focusedRunId) setFocusedRun(chart, focusedRunId);
-                    chart.update('none');
                 });
                 list.appendChild(grid);
                 grid.querySelectorAll('.chart-container').forEach(
                     initializeChartResize
+                );
+                grid.querySelectorAll('canvas[id^="chart-custom-"]').forEach(
+                    canvas => chartObserver.observe(canvas)
                 );
             }
 
@@ -2373,7 +2607,7 @@ export class MultiRunViewerPanel {
                 }
                 const xMetric = document.getElementById('customPlotXMetric')?.value || '';
                 const yMetric = document.getElementById('customPlotYMetric')?.value || '';
-                if (!xMetric || !yMetric) {
+                if (!yMetric || (!isSummaryMetric(yMetric) && !xMetric)) {
                     if (error) error.textContent = 'Select both an X and Y metric.';
                     return;
                 }
@@ -2384,7 +2618,7 @@ export class MultiRunViewerPanel {
                 customPlotDefinitions.push({
                     id,
                     title: title.slice(0, 100),
-                    xMetric,
+                    xMetric: isSummaryMetric(yMetric) ? '_step' : xMetric,
                     yMetric,
                     xMultiplierConfig:
                         document.getElementById('customPlotXMultiplier')?.value || '',
@@ -2422,6 +2656,10 @@ export class MultiRunViewerPanel {
             document.getElementById('createCustomPlotBtn')?.addEventListener(
                 'click',
                 createCustomPlot
+            );
+            document.getElementById('customPlotYMetric')?.addEventListener(
+                'change',
+                updateCustomPlotBuilderOptions
             );
 
             // Sidebar resizing
@@ -2495,6 +2733,7 @@ export class MultiRunViewerPanel {
             const runFilterInput = document.getElementById('runFilterInput');
             const runSortSelect = document.getElementById('runSortSelect');
             const hideEmptyRunsBtn = document.getElementById('hideEmptyRunsBtn');
+            const groupRunsBtn = document.getElementById('groupRunsBtn');
             const runList = document.getElementById('runList');
             const runFilterEmpty = document.getElementById('runFilterEmpty');
             const runCountHeading = document.getElementById('runCountHeading');
@@ -2528,6 +2767,77 @@ export class MultiRunViewerPanel {
                 return new RegExp(regexPattern, 'i');
             }
 
+            function applyRunGroupColors() {
+                document.querySelectorAll('.run-item[data-run-id]').forEach(item => {
+                    const swatch = item.querySelector('.run-color');
+                    if (!swatch) return;
+                    const isGrouped = groupWandbRuns && Boolean(item.dataset.runGroup);
+                    const color = isGrouped
+                        ? item.dataset.groupColor
+                        : item.dataset.baseColor;
+                    if (color) swatch.value = color;
+                    swatch.disabled = isGrouped;
+                    swatch.classList.toggle('group-run-color-hidden', isGrouped);
+                    swatch.title = isGrouped
+                        ? 'This run uses its W&B group color while grouping is active'
+                        : "Change this run's saved color";
+                });
+                document.querySelectorAll('.wandb-run-group-color').forEach(swatch => {
+                    const header = swatch.closest('.wandb-run-group-header');
+                    const groupName = header?.dataset.runGroup || '';
+                    const groupItem = Array.from(
+                        document.querySelectorAll('.run-item[data-run-group]')
+                    ).find(item => item.dataset.runGroup === groupName);
+                    const groupColor = groupItem?.dataset.groupColor;
+                    if (groupColor) {
+                        header.dataset.groupColor = groupColor;
+                        swatch.value = groupColor;
+                    }
+                    swatch.title = 'Change color for W&B group ' + groupName;
+                });
+                document.querySelectorAll(
+                    '#configCompareTable tbody tr[data-run-id]'
+                ).forEach(row => {
+                    const runItem = Array.from(
+                        document.querySelectorAll('.run-item[data-run-id]')
+                    ).find(item => item.dataset.runId === row.dataset.runId);
+                    const color = groupWandbRuns && row.dataset.runGroup
+                        ? runItem?.dataset.groupColor
+                        : runItem?.dataset.baseColor;
+                    const swatch = row.querySelector('.config-compare-run-color');
+                    if (color && swatch) swatch.style.background = color;
+                });
+            }
+
+            function setWandbGroupCollapsed(
+                groupName,
+                collapsed,
+                shouldPersist = true
+            ) {
+                const header = Array.from(
+                    document.querySelectorAll('.wandb-run-group-header')
+                ).find(candidate => candidate.dataset.runGroup === groupName);
+                if (header) {
+                    header.classList.toggle('collapsed', collapsed);
+                    header.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+                }
+                document.querySelectorAll('.run-item[data-run-group]').forEach(item => {
+                    if (item.dataset.runGroup === groupName) {
+                        item.classList.toggle('wandb-group-member-collapsed', collapsed);
+                    }
+                });
+                if (collapsed) {
+                    expandedWandbGroups.delete(groupName);
+                } else {
+                    expandedWandbGroups.add(groupName);
+                }
+                if (shouldPersist) {
+                    updatePersistedViewState({
+                        expandedWandbGroups: Array.from(expandedWandbGroups)
+                    });
+                }
+            }
+
             function applyRunListView(shouldPersist = true) {
                 if (!runFilterInput || !runSortSelect || !runList) return;
 
@@ -2535,7 +2845,14 @@ export class MultiRunViewerPanel {
                 const filterPattern = globToRegExp(filterText);
                 const sortMode = runSortSelect.value;
                 const hideEmptyRuns = hideEmptyRunsBtn?.getAttribute('aria-pressed') === 'true';
+                runList.querySelectorAll('.wandb-run-group-header').forEach(header => header.remove());
                 const runItems = Array.from(runList.querySelectorAll('.run-item'));
+                runItems.forEach(item =>
+                    item.classList.remove('wandb-group-member-collapsed')
+                );
+                const wandbGroupCount = new Set(
+                    runItems.map(item => item.dataset.runGroup).filter(Boolean)
+                ).size;
                 const compareText = (a, b) => a.localeCompare(b, undefined, {
                     numeric: true,
                     sensitivity: 'base'
@@ -2566,6 +2883,7 @@ export class MultiRunViewerPanel {
 
                 let visibleCount = 0;
                 let emptyCount = 0;
+                const visibleGroups = new Map();
                 runItems.forEach(item => {
                     const isEmpty = item.dataset.contentStatus === 'empty';
                     if (isEmpty) {
@@ -2574,7 +2892,8 @@ export class MultiRunViewerPanel {
                     const searchableText = [
                         item.dataset.runName,
                         item.dataset.runId,
-                        item.dataset.runProject
+                        item.dataset.runProject,
+                        item.dataset.runGroup
                     ].join(' ');
                     const matchesText = !filterText || filterPattern.test(searchableText);
                     const isVisible = matchesText && (!hideEmptyRuns || !isEmpty);
@@ -2582,8 +2901,72 @@ export class MultiRunViewerPanel {
                     if (isVisible) {
                         visibleCount++;
                     }
-                    runList.appendChild(item);
+                    const groupName = item.dataset.runGroup || '';
+                    if (groupWandbRuns && groupName) {
+                        if (!visibleGroups.has(groupName)) visibleGroups.set(groupName, []);
+                        visibleGroups.get(groupName).push(item);
+                    } else {
+                        runList.appendChild(item);
+                    }
                 });
+
+                if (groupWandbRuns) {
+                    for (const [groupName, items] of visibleGroups) {
+                        const header = document.createElement('div');
+                        header.className = 'wandb-run-group-header';
+                        header.dataset.runGroup = groupName;
+                        header.dataset.groupColor = items[0]?.dataset.groupColor || '';
+                        header.hidden = !items.some(item => !item.hidden);
+                        header.setAttribute('role', 'button');
+                        header.tabIndex = 0;
+                        const checkbox = document.createElement('input');
+                        checkbox.type = 'checkbox';
+                        checkbox.className = 'wandb-run-group-toggle';
+                        checkbox.setAttribute('aria-label', 'Toggle W&B group ' + groupName);
+                        checkbox.addEventListener('click', event => event.stopPropagation());
+                        checkbox.addEventListener('change', () =>
+                            toggleWandbRunGroup(groupName, checkbox.checked)
+                        );
+                        const color = document.createElement('input');
+                        color.type = 'color';
+                        color.className = 'wandb-run-group-color';
+                        color.value = items[0]?.dataset.groupColor || '#808080';
+                        color.setAttribute('aria-label', 'Change color for W&B group ' + groupName);
+                        color.title = 'Change color for W&B group ' + groupName;
+                        color.addEventListener('click', event => event.stopPropagation());
+                        color.addEventListener('change', () =>
+                            setWandbGroupColor(groupName, color.value)
+                        );
+                        const chevron = document.createElement('span');
+                        chevron.className = 'wandb-run-group-chevron';
+                        const label = document.createElement('span');
+                        label.className = 'wandb-run-group-name';
+                        label.textContent = groupName;
+                        const count = document.createElement('span');
+                        count.className = 'wandb-run-group-count';
+                        count.textContent = '(' + items.length + ')';
+                        header.append(checkbox, color, chevron, label, count);
+                        const isCollapsed = !expandedWandbGroups.has(groupName);
+                        header.addEventListener('click', () =>
+                            setWandbGroupCollapsed(
+                                groupName,
+                                !header.classList.contains('collapsed')
+                            )
+                        );
+                        header.addEventListener('keydown', event => {
+                            if (event.key !== 'Enter' && event.key !== ' ') return;
+                            event.preventDefault();
+                            setWandbGroupCollapsed(
+                                groupName,
+                                !header.classList.contains('collapsed')
+                            );
+                        });
+                        runList.appendChild(header);
+                        items.forEach(item => runList.appendChild(item));
+                        setWandbGroupCollapsed(groupName, isCollapsed, false);
+                    }
+                    updateWandbGroupCheckboxes();
+                }
 
                 if (hideEmptyRunsBtn) {
                     hideEmptyRunsBtn.disabled = emptyCount === 0;
@@ -2593,6 +2976,12 @@ export class MultiRunViewerPanel {
                         : hideEmptyRuns
                             ? 'Show runs confirmed to have no run metric values'
                             : 'Hide runs confirmed to have no run metric values';
+                }
+                if (groupRunsBtn) {
+                    groupRunsBtn.disabled = wandbGroupCount === 0;
+                    groupRunsBtn.title = wandbGroupCount === 0
+                        ? 'No native W&B run groups were found'
+                        : 'Group runs by their native W&B group (' + wandbGroupCount + ' found)';
                 }
 
                 if (runFilterEmpty) {
@@ -2607,9 +2996,11 @@ export class MultiRunViewerPanel {
                     updatePersistedViewState({
                         runFilter: runFilterInput.value,
                         runSort: sortMode,
-                        hideEmptyRuns
+                        hideEmptyRuns,
+                        groupWandbRuns
                     });
                 }
+                applyRunGroupColors();
             }
 
             if (runFilterInput && typeof persistedViewState.runFilter === 'string') {
@@ -2630,6 +3021,10 @@ export class MultiRunViewerPanel {
                     persistedViewState.hideEmptyRuns === true ? 'true' : 'false'
                 );
             }
+            if (groupRunsBtn) {
+                groupRunsBtn.setAttribute('aria-pressed', groupWandbRuns ? 'true' : 'false');
+                groupRunsBtn.classList.toggle('active', groupWandbRuns);
+            }
             if (runFilterInput) {
                 runFilterInput.addEventListener('input', () => applyRunListView());
             }
@@ -2642,6 +3037,28 @@ export class MultiRunViewerPanel {
                     hideEmptyRunsBtn.setAttribute('aria-pressed', isActive ? 'false' : 'true');
                     applyRunListView();
                 });
+            }
+            function toggleWandbRunGroups() {
+                groupWandbRuns = !groupWandbRuns;
+                if (groupRunsBtn) {
+                    groupRunsBtn.setAttribute('aria-pressed', groupWandbRuns ? 'true' : 'false');
+                    groupRunsBtn.classList.toggle('active', groupWandbRuns);
+                }
+                applyRunListView();
+                applyRunGroupColors();
+                Object.entries(chartInstances).forEach(([canvasId, chart]) => {
+                    const canvas = document.getElementById(canvasId);
+                    if (canvas && canvas.dataset.chartType !== 'custom') {
+                        const metric = getMetricsForType(canvas.dataset.chartType)
+                            .find(candidate => candidate.metricName === canvas.dataset.metricName);
+                        updateChartData(chart, metric, false);
+                    }
+                });
+                renderCustomPlots();
+                if (modalChart && activeFullscreenMetric) {
+                    updateChartData(modalChart, getFullscreenMetric(), true);
+                }
+                updatePersistedViewState({ groupWandbRuns });
             }
             applyRunListView(false);
             updateRunActivityIndicators();
@@ -3097,6 +3514,7 @@ export class MultiRunViewerPanel {
                 }
                 runItem.classList.add('selection-loading');
                 updateComparisonGroupCheckboxes();
+                updateWandbGroupCheckboxes();
                 persistRestorablePanelState();
             }
 
@@ -3110,6 +3528,7 @@ export class MultiRunViewerPanel {
                     item.classList.add('selection-loading');
                 });
                 updateComparisonGroupCheckboxes();
+                updateWandbGroupCheckboxes();
                 persistRestorablePanelState();
             }
 
@@ -3143,6 +3562,40 @@ export class MultiRunViewerPanel {
                     checkbox.checked = runIds.length > 0 && selectedCount === runIds.length;
                     checkbox.indeterminate = selectedCount > 0 && selectedCount < runIds.length;
                     checkbox.disabled = runIds.length === 0;
+                });
+            }
+
+            function updateWandbGroupCheckboxes() {
+                document.querySelectorAll('.wandb-run-group-header').forEach(header => {
+                    const groupName = header.dataset.runGroup || '';
+                    const runCheckboxes = Array.from(
+                        document.querySelectorAll('.run-item[data-run-group]')
+                    ).filter(item => item.dataset.runGroup === groupName)
+                        .map(item => item.querySelector('input[type="checkbox"]'))
+                        .filter(Boolean);
+                    const checkbox = header.querySelector('.wandb-run-group-toggle');
+                    if (!checkbox) return;
+                    const selectedCount = runCheckboxes.filter(item => item.checked).length;
+                    checkbox.checked = runCheckboxes.length > 0 &&
+                        selectedCount === runCheckboxes.length;
+                    checkbox.indeterminate = selectedCount > 0 &&
+                        selectedCount < runCheckboxes.length;
+                    checkbox.disabled = runCheckboxes.length === 0;
+                });
+            }
+
+            function toggleWandbRunGroup(runGroup, selected) {
+                const runIds = Array.from(
+                    document.querySelectorAll('.run-item[data-run-group]')
+                ).filter(item => item.dataset.runGroup === runGroup)
+                    .map(item => item.dataset.runId);
+                runIds.forEach(runId => setOptimisticRunSelection(runId, selected));
+                updateWandbGroupCheckboxes();
+                vscode.postMessage({
+                    command: 'toggleWandbRunGroup',
+                    runGroup,
+                    selected,
+                    fullscreenOpen: isFullscreenCurrentlyOpen()
                 });
             }
 
@@ -3221,6 +3674,14 @@ export class MultiRunViewerPanel {
                 vscode.postMessage({
                     command: 'setRunColor',
                     runId,
+                    color
+                });
+            }
+
+            function setWandbGroupColor(runGroup, color) {
+                vscode.postMessage({
+                    command: 'setWandbGroupColor',
+                    runGroup,
                     color
                 });
             }
@@ -3393,23 +3854,34 @@ export class MultiRunViewerPanel {
                 );
             }
 
+            function getGroupedDatasetColor(dataset) {
+                return groupWandbRuns && dataset.runGroup && dataset.groupColor
+                    ? dataset.groupColor
+                    : dataset.color;
+            }
+
             function createRunDatasets(metric, isModal) {
                 return metric.datasets.map(dataset => ({
+                    ...dataset,
+                    color: getGroupedDatasetColor(dataset),
                     label: dataset.runName,
                     data: dataset.data.map(d => ({ x: d.step, y: d.value })),
-                    borderColor: dataset.color,
-                    backgroundColor: dataset.color + '20',
+                    borderColor: getGroupedDatasetColor(dataset),
+                    backgroundColor: getGroupedDatasetColor(dataset) + '20',
                     fill: false,
                     tension: 0.1,
                     pointRadius: dataset.data.length > (isModal ? 100 : 50) ? 0 : (isModal ? 3 : 2),
                     pointHoverRadius: isModal ? 5 : 4,
-                    pointBackgroundColor: dataset.color + '59',
-                    pointBorderColor: dataset.color + '99',
+                    pointBackgroundColor: getGroupedDatasetColor(dataset) + '59',
+                    pointBorderColor: getGroupedDatasetColor(dataset) + '99',
                     borderWidth: 2,
                     _originalData: dataset.data.map(d => ({ x: d.step, y: d.value })),
-                    _originalColor: dataset.color,
+                    _originalColor: getGroupedDatasetColor(dataset),
                     _runName: dataset.runName,
                     _runId: dataset.runId,
+                    _runIds: Array.isArray(dataset.runIds)
+                        ? dataset.runIds
+                        : [dataset.runId],
                     _isOriginal: true
                 }));
             }
@@ -3477,6 +3949,12 @@ export class MultiRunViewerPanel {
                         globalSmoothing,
                         showRaw
                     );
+                    if (type === 'custom') {
+                        const definition = customPlotDefinitions.find(candidate =>
+                            candidate.id === metric.customPlotId
+                        );
+                        applyCustomAxisTitles(chartInstances[canvas.id], definition);
+                    }
                     if (focusedRunId) {
                         setFocusedRun(chartInstances[canvas.id], focusedRunId);
                     }
@@ -3561,7 +4039,7 @@ export class MultiRunViewerPanel {
                 }
             }
 
-            function updateRunColorSwatches(runColors, customRunColorIds) {
+            function updateRunColorSwatches(runColors, runGroupColors, customRunColorIds) {
                 if (!runColors || typeof runColors !== 'object') return;
                 const customColorSet = new Set(
                     Array.isArray(customRunColorIds) ? customRunColorIds : []
@@ -3569,16 +4047,22 @@ export class MultiRunViewerPanel {
 
                 document.querySelectorAll('.run-item[data-run-id]').forEach(item => {
                     const color = runColors[item.dataset.runId];
-                    const swatch = item.querySelector('.run-color');
-                    if (typeof color === 'string' && swatch) {
-                        swatch.value = color;
+                    if (typeof color === 'string') {
+                        item.dataset.baseColor = color;
+                    }
+                    const groupColor = runGroupColors?.[item.dataset.runGroup];
+                    if (typeof groupColor === 'string') {
+                        item.dataset.groupColor = groupColor;
                     }
                     item.dataset.customColor = String(customColorSet.has(item.dataset.runId));
                 });
+                applyRunGroupColors();
                 document.querySelectorAll(
                     '#configCompareTable tbody tr[data-run-id]'
                 ).forEach(row => {
-                    const color = runColors[row.dataset.runId];
+                    const color = groupWandbRuns && row.dataset.runGroup
+                        ? runGroupColors?.[row.dataset.runGroup] || runColors[row.dataset.runId]
+                        : runColors[row.dataset.runId];
                     const swatch = row.querySelector('.config-compare-run-color');
                     if (typeof color === 'string' && swatch) {
                         swatch.style.background = color;
@@ -3609,6 +4093,7 @@ export class MultiRunViewerPanel {
             function updateMergedMetrics(mergedMetrics) {
                 trainingMetrics = mergedMetrics.training || [];
                 systemMetrics = mergedMetrics.system || [];
+                summaryMetrics = mergedMetrics.summary || [];
 
                 Object.entries(chartInstances).forEach(([canvasId, chart]) => {
                     const canvas = document.getElementById(canvasId);
@@ -3714,6 +4199,7 @@ export class MultiRunViewerPanel {
                 if (message.command === 'runColorsUpdated') {
                     updateRunColorSwatches(
                         message.runColors,
+                        message.runGroupColors,
                         message.customRunColorIds
                     );
                 }
@@ -4044,8 +4530,9 @@ export class MultiRunViewerPanel {
                 position: sticky;
                 top: -10px;
                 z-index: 5;
+                container-type: inline-size;
                 display: grid;
-                grid-template-columns: minmax(72px, 1fr) minmax(92px, 0.9fr) auto;
+                grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
                 align-items: center;
                 gap: 6px;
                 margin: -2px -2px 8px;
@@ -4076,6 +4563,95 @@ export class MultiRunViewerPanel {
                 font-size: 0.8em;
                 white-space: nowrap;
                 cursor: pointer;
+            }
+            .run-group-toggle {
+                min-width: 0;
+                padding: 5px 7px;
+                border: 1px solid var(--vscode-button-border, var(--vscode-panel-border));
+                border-radius: 3px;
+                color: var(--vscode-foreground);
+                background: transparent;
+                font-family: var(--vscode-font-family);
+                font-size: 0.8em;
+                white-space: nowrap;
+                cursor: pointer;
+            }
+            .run-group-toggle:hover,
+            .run-group-toggle.active {
+                color: var(--vscode-button-foreground);
+                background: var(--vscode-button-background);
+                border-color: var(--vscode-button-background);
+            }
+            .wandb-run-group-header {
+                display: flex;
+                align-items: center;
+                gap: 7px;
+                margin: 9px 4px 4px;
+                padding: 4px 4px 3px;
+                border-bottom: 1px solid var(--vscode-panel-border);
+                color: var(--vscode-descriptionForeground);
+                font-size: 0.75em;
+                font-weight: 600;
+                cursor: pointer;
+            }
+            .wandb-run-group-header[hidden] {
+                display: none;
+            }
+            .wandb-run-group-toggle {
+                width: 16px;
+                height: 16px;
+                flex: 0 0 16px;
+                margin: 0;
+                cursor: pointer;
+                accent-color: var(--vscode-focusBorder, var(--vscode-button-background));
+            }
+            .wandb-run-group-color {
+                width: 16px;
+                height: 16px;
+                flex: 0 0 16px;
+                padding: 0;
+                border: 0;
+                border-radius: 2px;
+                background: transparent;
+                cursor: pointer;
+            }
+            .wandb-run-group-color::-webkit-color-swatch-wrapper {
+                padding: 0;
+            }
+            .wandb-run-group-color::-webkit-color-swatch {
+                border: 1px solid var(--vscode-contrastBorder, transparent);
+                border-radius: 2px;
+            }
+            .wandb-run-group-color:focus-visible {
+                outline: 1px solid var(--vscode-focusBorder);
+                outline-offset: 2px;
+            }
+            .wandb-run-group-chevron {
+                width: 10px;
+                flex: 0 0 10px;
+                color: var(--vscode-descriptionForeground);
+            }
+            .wandb-run-group-chevron::before {
+                content: '▾';
+            }
+            .wandb-run-group-header.collapsed .wandb-run-group-chevron::before {
+                content: '▸';
+            }
+            .wandb-run-group-name {
+                min-width: 0;
+                overflow: hidden;
+                text-overflow: ellipsis;
+                white-space: nowrap;
+            }
+            .wandb-run-group-count {
+                margin-left: auto;
+                color: var(--vscode-descriptionForeground);
+                font-weight: 400;
+            }
+            @container (min-width: 390px) {
+                .run-list-tools {
+                    grid-template-columns: minmax(72px, 1fr) minmax(92px, 0.9fr) auto auto;
+                }
             }
             .run-empty-filter:hover:not(:disabled) {
                 background: var(--vscode-toolbar-hoverBackground, var(--vscode-list-hoverBackground));
@@ -4227,6 +4803,12 @@ export class MultiRunViewerPanel {
                 background: transparent;
                 cursor: pointer;
             }
+            .run-color.group-run-color-hidden {
+                display: none;
+            }
+            .run-item.wandb-group-member-collapsed {
+                display: none;
+            }
             .run-color::-webkit-color-swatch-wrapper {
                 padding: 0;
             }
@@ -4237,6 +4819,10 @@ export class MultiRunViewerPanel {
             .run-color:focus-visible {
                 outline: 1px solid var(--vscode-focusBorder);
                 outline-offset: 2px;
+            }
+            .run-color:disabled {
+                cursor: default;
+                opacity: 1;
             }
             .run-info {
                 flex: 1;

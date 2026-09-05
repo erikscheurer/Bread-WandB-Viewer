@@ -164,6 +164,32 @@ async function testMultiRunHelpers() {
     if (unselectedManager.getSelectedCount() !== 0) {
         throw new Error('Disabled initial selection must leave discovered runs unselected');
     }
+    const summaryManager = new MultiRunManager('/test', undefined, {}, true);
+    summaryManager.addRun({
+        runId: 'eval-1',
+        runName: 'eval-1',
+        runGroup: 'model-a',
+        isVisible: true
+    });
+    summaryManager.getState().parsedData.set('eval-1', {
+        runId: 'eval-1',
+        config: {},
+        metrics: {},
+        systemMetrics: {},
+        summaryMetricValues: { 'arc_challenge/acc_norm': 0.5 },
+        summaryStep: 100
+    });
+    const mergedSummary = summaryManager.mergeMetrics();
+    const summaryMetric = mergedSummary.summary.find(
+        metric => metric.metricName === 'summary/arc_challenge/acc_norm'
+    );
+    if (
+        mergedSummary.training.length !== 0 ||
+        summaryMetric?.datasets[0]?.data[0]?.step !== 100 ||
+        summaryMetric?.datasets[0]?.runGroup !== 'model-a'
+    ) {
+        throw new Error('Summary metrics must remain custom-only step-based series');
+    }
     console.log('✓ Selected-run retention and initial selection work\n');
 
     console.log('Test 6: Recursive Comparison Group Discovery');

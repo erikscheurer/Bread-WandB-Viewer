@@ -19,6 +19,9 @@ export interface WandbConfig {
 export interface WandbRunData {
     runId: string;
     project?: string;
+    runGroup?: string;
+    summaryMetricValues?: Record<string, number>;
+    summaryStep?: number;
     runName?: string;
     config: WandbConfig;
     metrics: WandbMetrics;
@@ -495,6 +498,22 @@ export async function hasWandbMetricData(
         try {
             const record = RecordType!.decode(recordData) as any;
             const history = record.history;
+            const summary = record.summary;
+            if (summary?.update && Array.isArray(summary.update)) {
+                for (const item of summary.update) {
+                    const key = item.key || (item.nested_key && item.nested_key.length > 0 ? item.nested_key.join('/') : '');
+                    if (!key || typeof item.value_json !== 'string') continue;
+                    let value: unknown;
+                    try { value = JSON.parse(item.value_json); } catch { continue; }
+                    if (key === '_step' || key === 'summary/_step') {
+                        if (typeof value === 'number' && Number.isFinite(value)) return true;
+                    }
+                    if (key.startsWith('summary/') && isSummaryMetricKey(key) &&
+                        typeof value === 'number' && Number.isFinite(value)) {
+                        return true;
+                    }
+                }
+            }
             if (!history || !Array.isArray(history.item)) {
                 return false;
             }
@@ -776,18 +795,20 @@ function parseProtobufRecord(data: Buffer, runData: WandbRunData): void {
 
                 if (!key || !valueJson) continue;
 
-                // Store summary values in config if they're not already there
-                // and if they're not time-series metrics
-                if (runData.config[key] === undefined && !runData.metrics[key]) {
-                    try {
-                        const value = JSON.parse(valueJson);
-                        // Only store scalar values in config
-                        if (typeof value === 'number' || typeof value === 'string' || typeof value === 'boolean' || value === null) {
-                            runData.config[`summary/${key}`] = value;
-                        }
-                    } catch {
-                        // Skip invalid JSON
+                try {
+                    const value = JSON.parse(valueJson);
+                    const summaryKey = key.startsWith('summary/') ? key.slice('summary/'.length) : key;
+                    if (summaryKey === '_step' && typeof value === 'number' && Number.isFinite(value)) {
+                        runData.summaryStep = value;
+                    } else if (isSummaryMetricKey(key) && typeof value === 'number' && Number.isFinite(value)) {
+                        runData.summaryMetricValues = runData.summaryMetricValues || {};
+                        runData.summaryMetricValues[summaryKey] = value;
+                    } else if (runData.config[key] === undefined && !runData.metrics[key] &&
+                        (typeof value === 'string' || typeof value === 'boolean' || value === null)) {
+                        runData.config[`summary/${key}`] = value;
                     }
+                } catch {
+                    // Skip invalid JSON
                 }
             }
         }
@@ -798,6 +819,9 @@ function parseProtobufRecord(data: Buffer, runData: WandbRunData): void {
         const run = record.run;
         if (run.project && !runData.project) {
             runData.project = run.project;
+        }
+        if (run.run_group && !runData.runGroup) {
+            runData.runGroup = run.run_group;
         }
         if (run.display_name && !runData.runName) {
             runData.runName = run.display_name;
@@ -912,6 +936,12 @@ function postProcessRunData(runData: WandbRunData): void {
             runData.config[key] = val.value;
         }
     }
+}
+
+function isSummaryMetricKey(key: string): boolean {
+    const metricKey = key.startsWith('summary/') ? key.slice('summary/'.length) : key;
+    return !metricKey.startsWith('_') &&
+        !/(?:_stderr|\/stderr|\/sample_len|\/sample_count|\/name|\/alias|_eval_results\/|\/size|\/ncols|\/nrows|\/_type|\/path|\/sha256|\/log_mode|\/artifact_path|\/latest_artifact_path)$/.test(metricKey);
 }
 
 /**

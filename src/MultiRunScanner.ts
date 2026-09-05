@@ -8,6 +8,8 @@ export interface RunScanResult {
     runId: string;
     runName: string;
     project?: string;
+    /** Native W&B run group, when present in the run record. */
+    runGroup?: string;
     createdAt: number;
     lastModified: number;
     fileSize: number;
@@ -95,6 +97,7 @@ export async function quickParseMetadata(filePath: string): Promise<RunScanResul
     let runId = path.basename(filePath, '.wandb').replace('run-', '');
     let runName = runId;
     let project: string | undefined = undefined;
+    let runGroup: string | undefined = undefined;
 
     try {
         // Read only first 16KB to find RunRecord (avoid reading entire file)
@@ -114,6 +117,7 @@ export async function quickParseMetadata(filePath: string): Promise<RunScanResul
                     runId = record.run.run_id || runId;
                     runName = record.run.display_name || record.run.run_id || runId;
                     project = record.run.project;
+                    runGroup = record.run.run_group || record.run.runGroup || undefined;
                     const startTime = record.run.start_time || record.run.startTime;
                     if (startTime) {
                         const seconds = Number(startTime.seconds);
@@ -140,6 +144,7 @@ export async function quickParseMetadata(filePath: string): Promise<RunScanResul
         runId,
         runName,
         project,
+        runGroup,
         createdAt,
         lastModified: stats.mtimeMs,
         fileSize: stats.size,
@@ -476,6 +481,7 @@ async function loadProtoSchema(): Promise<protobuf.Root> {
     wandbInternal.add(new protobuf.Type('RunRecord')
         .add(new protobuf.Field('run_id', 1, 'string'))
         .add(new protobuf.Field('project', 3, 'string'))
+        .add(new protobuf.Field('run_group', 6, 'string'))
         .add(new protobuf.Field('display_name', 8, 'string'))
         .add(new protobuf.Field('start_time', 17, 'Timestamp'))
     );
