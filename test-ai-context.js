@@ -4,7 +4,7 @@ const { summarizeMetric } = require('./out/aiContext/MetricSummarizer');
 const { generateAIContext, calculateTokenEstimate } = require('./out/aiContext/ContextGenerator');
 const { downsampleMetricPoints, MultiRunManager } = require('./out/MultiRunManager');
 const { loadRunComparisonGroupSources } = require('./out/runComparisonGroups');
-const { hasWandbMetricData } = require('./out/wandbParser');
+const { addSummaryMetricMeans, hasWandbMetricData } = require('./out/wandbParser');
 const {
     normalizeMultiRunPanelRestorationState
 } = require('./out/multiRunPanelState');
@@ -14,6 +14,22 @@ const os = require('os');
 const path = require('path');
 
 console.log('Testing AI Context Generation...\n');
+
+const derivedSummaryMetrics = {
+    'longbench_qmsum/score': 0.4,
+    'longbench_gov_report/score': 0.8,
+    'longbench_qmsum/rouge_score': 0.2,
+    'longbench_gov_report/rouge_score': 0.6,
+    'other_single/score': 0.9
+};
+addSummaryMetricMeans(derivedSummaryMetrics);
+if (
+    derivedSummaryMetrics['longbench_mean/score'] !== 0.6000000000000001 ||
+    derivedSummaryMetrics['longbench_mean/rouge_score'] !== 0.4 ||
+    derivedSummaryMetrics['other_mean/score'] !== undefined
+) {
+    throw new Error('Summary task families must produce suite-level mean metrics');
+}
 
 // Test 1: Config Differ
 console.log('Test 1: Config Comparison');

@@ -4217,6 +4217,7 @@ export class MultiRunViewerPanel {
                     type,
                     customPlotId: type === 'custom' ? metric.customPlotId : undefined
                 };
+                const fullscreenMetricIdentity = { ...activeFullscreenMetric };
                 vscode.postMessage({
                     command: 'fullscreenStateChanged',
                     open: true
@@ -4262,8 +4263,9 @@ export class MultiRunViewerPanel {
                     const currentMetrics = getMetricsForType(type);
                     const currentMetric = findMetricByIdentity(
                         currentMetrics,
-                        activeFullscreenMetric
-                    ) || metric;
+                        fullscreenMetricIdentity
+                    );
+                    if (!currentMetric) return;
 
                     const ctx = document.getElementById('modalChart');
                     const datasets = createRunDatasets(currentMetric, true);

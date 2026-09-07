@@ -907,6 +907,10 @@ function parseProtobufRecord(data: Buffer, runData: WandbRunData): void {
  * Post-process run data: deduplicate, sort, and clean up
  */
 function postProcessRunData(runData: WandbRunData): void {
+    if (runData.summaryMetricValues) {
+        addSummaryMetricMeans(runData.summaryMetricValues);
+    }
+
     // Deduplicate and sort metrics
     for (const metricName of Object.keys(runData.metrics)) {
         runData.metrics[metricName] = deduplicateAndSort(runData.metrics[metricName]);
@@ -934,6 +938,44 @@ function postProcessRunData(runData: WandbRunData): void {
         const val = runData.config[key];
         if (val && typeof val === 'object' && 'value' in val && Object.keys(val).length === 1) {
             runData.config[key] = val.value;
+        }
+    }
+}
+
+/**
+ * Add suite-level means for summary metrics named
+ * `<suite>_<task>/<measurement>`. A family needs at least two task metrics so
+ * unrelated summary keys containing an underscore do not create synthetic
+ * means. Explicitly logged `_mean` values always take precedence.
+ */
+export function addSummaryMetricMeans(summaryMetrics: Record<string, number>): void {
+    const families = new Map<string, { total: number; count: number }>();
+
+    for (const [metricName, value] of Object.entries(summaryMetrics)) {
+        if (!Number.isFinite(value)) continue;
+
+        const slashIndex = metricName.indexOf('/');
+        if (slashIndex <= 0 || slashIndex === metricName.length - 1) continue;
+
+        const taskNamespace = metricName.slice(0, slashIndex);
+        const separatorIndex = taskNamespace.indexOf('_');
+        if (separatorIndex <= 0 || separatorIndex === taskNamespace.length - 1) continue;
+
+        const suite = taskNamespace.slice(0, separatorIndex);
+        const task = taskNamespace.slice(separatorIndex + 1);
+        if (task === 'mean') continue;
+
+        const measurement = metricName.slice(slashIndex + 1);
+        const meanMetricName = `${suite}_mean/${measurement}`;
+        const family = families.get(meanMetricName) || { total: 0, count: 0 };
+        family.total += value;
+        family.count += 1;
+        families.set(meanMetricName, family);
+    }
+
+    for (const [meanMetricName, family] of families) {
+        if (family.count >= 2 && summaryMetrics[meanMetricName] === undefined) {
+            summaryMetrics[meanMetricName] = family.total / family.count;
         }
     }
 }
