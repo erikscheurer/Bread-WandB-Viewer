@@ -263,6 +263,20 @@ export function getChartStyles(): string {
 
         .chart-container.hidden, .metric-card.hidden { display: none; }
 
+        .chart-container.chart-collapsed {
+            min-height: 0;
+        }
+
+        .chart-container.chart-collapsed .chart-header {
+            margin-bottom: 0;
+        }
+
+        .chart-container.chart-collapsed .chart-wrapper,
+        .chart-container.chart-collapsed .chart-resize-handle,
+        .chart-container.chart-collapsed .custom-plot-subtitle {
+            display: none;
+        }
+
         .chart-header {
             display: flex;
             justify-content: space-between;
@@ -1398,6 +1412,30 @@ export function getChartScript(): string {
                                 return !context.dataset._isRaw;
                             },
                             callbacks: {
+                                title: function(contexts) {
+                                    if (!contexts || contexts.length === 0) return '';
+                                    const chart = contexts[0].chart;
+                                    const pointerX = Number(chart.$pointerXValue);
+                                    const hoveredRunKey = chart.$hoveredRunKey;
+                                    const hoveredContext = hoveredRunKey
+                                        ? contexts.find(context =>
+                                            datasetHasRunKey(context.dataset, hoveredRunKey)
+                                        )
+                                        : null;
+                                    const nearestContext = hoveredContext || contexts.reduce(
+                                        (nearest, context) => {
+                                            if (!Number.isFinite(pointerX)) return nearest;
+                                            return Math.abs(Number(context.parsed.x) - pointerX) <
+                                                Math.abs(Number(nearest.parsed.x) - pointerX)
+                                                ? context
+                                                : nearest;
+                                        },
+                                        contexts[0]
+                                    );
+                                    return chart.scales.x.getLabelForValue(
+                                        Number(nearestContext.parsed.x)
+                                    );
+                                },
                                 labelColor: function(context) {
                                     return getTooltipSwatchStyle(context);
                                 },
@@ -1477,6 +1515,7 @@ export function getChartScript(): string {
                         }
                     },
                     onHover: function(event, activeElements, chart) {
+                        chart.$pointerXValue = chart.scales.x.getValueForPixel(event.x);
                         setHoveredRun(
                             chart,
                             findHoveredRunKey(chart, event, activeElements)
@@ -1537,7 +1576,7 @@ export function getChartScript(): string {
                         backgroundColor: d._originalColor + '20',
                         fill: false,
                         tension: 0.1,
-                        pointRadius: d._originalData.length > 100 ? 0 : 2,
+                        pointRadius: 0,
                         pointHoverRadius: 4,
                         pointBackgroundColor: d._originalColor + '59',
                         pointBorderColor: d._originalColor + '99',
@@ -1588,7 +1627,7 @@ export function getChartScript(): string {
                         backgroundColor: d._originalColor + '20',
                         fill: false,
                         tension: 0.1,
-                        pointRadius: d._originalData.length > 100 ? 0 : 2,
+                        pointRadius: 0,
                         pointHoverRadius: 4,
                         pointBackgroundColor: d._originalColor + '59',
                         pointBorderColor: d._originalColor + '99',
@@ -1726,6 +1765,15 @@ export function getChartScript(): string {
             updatePersistedViewState({ metricFilter: searchText });
         }
 
+        let metricFilterTimer = null;
+        function scheduleMetricFilter() {
+            if (metricFilterTimer) clearTimeout(metricFilterTimer);
+            metricFilterTimer = setTimeout(() => {
+                metricFilterTimer = null;
+                filterMetrics();
+            }, 200);
+        }
+
         function restorePersistedChartControls() {
             const state = readPersistedViewState();
             const smoothingInput = document.getElementById('globalSmoothing');
@@ -1857,8 +1905,8 @@ export function getChartScript(): string {
 
         // ==================== SINGLE CHART COPY ====================
 
-        async function copySingleChart(type, index) {
-            const canvasId = 'chart-' + type + '-' + index;
+        async function copySingleChart(type, index, requestedCanvasId) {
+            const canvasId = requestedCanvasId || 'chart-' + type + '-' + index;
             const canvas = document.getElementById(canvasId);
             if (!canvas) return;
 
@@ -1867,7 +1915,11 @@ export function getChartScript(): string {
                 const metrics = typeof getMetricsForType === 'function'
                     ? getMetricsForType(type)
                     : (type === 'training' ? trainingMetrics : systemMetrics);
-                const metric = metrics[index];
+                const metric = metrics.find(candidate =>
+                    type === 'custom'
+                        ? candidate.customPlotId === canvas.dataset.chartStateKey
+                        : candidate.metricName === canvas.dataset.metricName
+                ) || metrics[index];
                 if (!metric) return;
 
                 const datasets = metric.datasets.map(dataset => ({
@@ -1877,7 +1929,7 @@ export function getChartScript(): string {
                     backgroundColor: dataset.color + '20',
                     fill: false,
                     tension: 0.1,
-                    pointRadius: dataset.data.length > 50 ? 0 : 2,
+                    pointRadius: 0,
                     pointHoverRadius: 4,
                     pointBackgroundColor: dataset.color + '59',
                     pointBorderColor: dataset.color + '99',
@@ -1982,7 +2034,11 @@ export function getChartScript(): string {
                         const metrics = typeof getMetricsForType === 'function'
                             ? getMetricsForType(type)
                             : (type === 'training' ? trainingMetrics : systemMetrics);
-                        const metric = metrics[index];
+                        const metric = metrics.find(candidate =>
+                            type === 'custom'
+                                ? candidate.customPlotId === canvas.dataset.chartStateKey
+                                : candidate.metricName === canvas.dataset.metricName
+                        ) || metrics[index];
 
                         if (metric) {
                             const datasets = metric.datasets.map(dataset => ({
@@ -1992,7 +2048,7 @@ export function getChartScript(): string {
                                 backgroundColor: dataset.color + '20',
                                 fill: false,
                                 tension: 0.1,
-                                pointRadius: dataset.data.length > 50 ? 0 : 2,
+                                pointRadius: 0,
                                 pointHoverRadius: 4,
                                 pointBackgroundColor: dataset.color + '59',
                                 pointBorderColor: dataset.color + '99',
@@ -2248,7 +2304,7 @@ export function getControlsBarHtml(leadingControlsHtml: string = ''): string {
             ${leadingControlsHtml}
             <div class="control-group">
                 <label for="searchInput">Search:</label>
-                <input type="text" id="searchInput" placeholder="Filter metrics (regex)..." oninput="filterMetrics()">
+                <input type="text" id="searchInput" placeholder="Filter metrics (regex)..." oninput="scheduleMetricFilter()">
             </div>
             <div class="control-group smoothing-control">
                 <label for="globalSmoothing">Smoothing:</label>

@@ -41,9 +41,9 @@ version adds:
   and smoothed traces behave as one run. Chart controls remain visible while
   scrolling through long metric lists.
 - **Improved chart interaction** — X-range and box zoom, two-axis panning,
-  Ctrl+scroll cursor zoom, resizable chart rows, visibility-preserving legend
-  isolation, linked run highlighting across lines and point markers, and clearer
-  cursor-sorted tooltips.
+  Ctrl+scroll cursor zoom, collapsible and reorderable chart rows, resizable chart
+  heights, visibility-preserving legend isolation, linked run highlighting, and
+  cursor-sorted tooltips with the step taken from the nearest plotted point.
 - **Better run comparison** — side-by-side configuration comparison with search,
   independent run-row and parameter-column sorting, plus glob run filtering and
   sorting by name, creation time, or latest update.
@@ -55,7 +55,8 @@ version adds:
   comparison tabs and their selected runs return after reloading VS Code.
 - **Shared comparison groups** — save named run sets such as baselines, toggle the
   whole set at once, and continue adjusting member runs individually. Group files
-  are discovered recursively below every folder opened in the viewer.
+  are discovered recursively below every folder opened in the viewer, and new
+  groups start with the currently selected runs.
 - **W&B run grouping** — group and toggle runs by their native W&B `run_group` in
   the sidebar; groups start collapsed, retain separate metric lines while sharing
   one color, and expose one group color picker in grouped mode. Custom plots join
@@ -191,10 +192,13 @@ Compare training runs side-by-side to understand what hyperparameters and config
 - Create, edit, delete, and toggle named comparison groups from the bottom of the
   sidebar; a partially selected group displays an indeterminate checkbox
 - Add a run to an existing or new comparison group from its right-click menu
+- Group run pickers show each full display name and run ID on a detail row
 - Right-click actions to copy the run ID, isolate a run, or sync it
 - Resizable sidebar for better workspace management
 - Resizable chart heights with draggable dividers
-- Automatic folder scanning for all runs
+- Collapsible plots and a compact drag list for reordering plots and metric groups
+- Automatic folder scanning for all runs, including runs reached through symbolic
+  links (with symlink-cycle protection)
 - Comparison panels reopen after `Developer: Reload Window` or a VS Code restart,
   retaining their folder roots, selected runs, tabs, filters, chart controls,
   custom plots, and other persisted view state
@@ -205,8 +209,8 @@ Original W&B run names remain read-only because they are embedded in the `.wandb
 binary log. The run context menu can assign a custom display name instead. These
 aliases are keyed by run ID in VS Code's extension-global storage, survive viewer
 reloads, and never modify the run file. Submit an empty custom name to restore the
-original name. The rename field starts with the run's current displayed name for
-easy partial edits.
+original name. Renaming uses an immediate inline field in the sidebar, so it does
+not wait for an extension-host dialog or rebuild the chart webview.
 
 Click a run's color swatch in the comparison sidebar to choose a custom color.
 Custom colors are keyed by run ID in VS Code's extension-global storage, so they
@@ -266,6 +270,8 @@ Advanced chart controls for detailed metric analysis.
 - **Cursor Zoom:** Hold Ctrl and scroll to zoom both axes around the pointer
 - **Pan:** Shift+drag in any direction to pan the X and Y axes
 - **Fullscreen:** Click expand icon on any chart
+- **Plot layout:** Collapse individual plots or use **Organize plots** to reorder
+  the active tab from a compact drag list; metric prefix groups remain together
 - **Reload and copy:** Rebuild an overview or fullscreen plot with the reload button; copy a fullscreen chart directly to the clipboard
 - **Log Scales:** Toggle X and Y axis logarithmic scales
 - **Raw Data Overlay:** Show the raw trace behind its smoothed run in overview and fullscreen charts, with both values combined in one tooltip
@@ -307,6 +313,7 @@ therefore keep updating without waiting for training to stop.
   resume with a catch-up scan when it becomes visible again
 - A modification-time check catches file updates missed by the filesystem watcher
 - Detects new runs added to folders
+- Follows file and directory symbolic links without recursing through cycles
 - Updates existing run views when files change
 
 ### 📊 Metadata & System Metrics
@@ -444,16 +451,12 @@ Found a bug or have a feature request?
 - **Fork source:** [erikscheurer/Bread-WandB-Viewer](https://github.com/erikscheurer/Bread-WandB-Viewer)
 - **Original project:** [Bread-Technologies/Bread-WandB-Viewer](https://github.com/Bread-Technologies/Bread-WandB-Viewer)
 
-ToDos:
-- improve group run selection:
-  - when creating a new group select the currently selected views by default for the new group
-  - For long run names, the names are cut off in the selection. If possible improve this by showing the full names, on hover have a tooltip show, and maybe show the run color next to the run. But it looks like this is a vs code interal thing, before you do major changes, ask me and describe the issue
-- The step displayed in the tooltip is sometimes wrong. I suspect that this is due to the sampling of only a limited number of runs. But its only sometimes wrong: If I go from the left side of the end of the run it shows the correct number of steps, but when i go from the right side its wrong (4k vs 21k)
-- someone reported that the fullscreen is broken sometimes: when clicking on fullscreen of some metric another metric is fullscreened instead
-- Make plots collapsable and allow for reodering of plots (minimal interface, no need to be able to drag and drop entire plots or something, rather have a button that pops up a list of plots and you can then drag and drop this list)
-- It does not recognize runs that have been added to the folder through symbolic links
-- currently, if there are few datapoints, the viewer adds these dots at every datapoint. Remove those
-- Realize the proposal in [docs](docs/proposals/2026-08-26-agent-query-cli.md)
+<!--
+Deferred ideas:
+- Allow custom cross-run plots that map a metric at `_step` to another run's
+  summary value, potentially using the smoothed X value.
+- Realize the proposal in docs/proposals/2026-08-26-agent-query-cli.md.
+-->
 
 ---
 

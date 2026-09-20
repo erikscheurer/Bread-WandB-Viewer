@@ -426,8 +426,11 @@ export class MultiRunViewerPanel {
                         }
                         break;
                     case 'renameRun':
-                        if (typeof message.runId === 'string') {
-                            await this._renameRun(message.runId);
+                        if (
+                            typeof message.runId === 'string' &&
+                            typeof message.customName === 'string'
+                        ) {
+                            await this._renameRun(message.runId, message.customName);
                         }
                         break;
                     case 'setRunColor':
@@ -963,35 +966,67 @@ export class MultiRunViewerPanel {
         return configs;
     }
 
-    private async _renameRun(runId: string): Promise<void> {
+    private async _renameRun(runId: string, customName: string): Promise<void> {
         const run = this._manager.getState().runs.get(runId);
         if (!run) {
             return;
         }
 
-        const customName = await vscode.window.showInputBox({
-            title: 'Set Custom Run Name',
-            prompt: 'Stored by this VS Code extension. Leave empty to restore the original W&B name.',
-            value: this._customRunNames[runId] || run.runName,
-            placeHolder: run.runName,
-            validateInput: validateCustomRunName
-        });
-        if (customName === undefined) {
+        const validationError = validateCustomRunName(customName);
+        if (validationError) {
+            await this._panel.webview.postMessage({
+                command: 'runNameUpdateRejected',
+                runId,
+                runName: this._getDisplayRunName(run),
+                message: validationError
+            });
             return;
         }
 
-        const updatedNames = await setCustomRunName(
-            this._extensionStorage,
-            runId,
-            customName
-        );
-        const refreshes: Promise<void>[] = [];
+        let updatedNames: Record<string, string>;
+        try {
+            updatedNames = await setCustomRunName(
+                this._extensionStorage,
+                runId,
+                customName
+            );
+        } catch {
+            await this._panel.webview.postMessage({
+                command: 'runNameUpdateRejected',
+                runId,
+                runName: this._getDisplayRunName(run),
+                message: 'Could not save the custom run name.'
+            });
+            return;
+        }
+
+        const refreshes: Thenable<boolean>[] = [];
         for (const panel of MultiRunViewerPanel.panels) {
             if (panel._disposed) {
                 continue;
             }
             panel._customRunNames = updatedNames;
-            refreshes.push(panel._update(false));
+            const displayRuns = panel._manager.getRuns().map(candidate =>
+                panel._withDisplayRunName(candidate)
+            );
+            const selectedRunIds = new Set(panel._manager.getSelectedRunIds());
+            const selectedRuns = displayRuns.filter(candidate =>
+                selectedRunIds.has(candidate.runId)
+            );
+            refreshes.push(panel._panel.webview.postMessage({
+                command: 'runNamesUpdated',
+                runNames: Object.fromEntries(
+                    displayRuns.map(candidate => [candidate.runId, candidate.runName])
+                ),
+                mergedMetrics: panel._getMergedMetrics(),
+                metadataHtml: panel._generateMetadataHtml(selectedRuns),
+                configComparisonHtml: panel._generateConfigComparisonHtml(selectedRuns),
+                comparisonGroupsHtml: panel._generateComparisonGroupsHtml(
+                    displayRuns,
+                    selectedRunIds
+                ),
+                hasSelection: selectedRuns.length > 0
+            }));
         }
         await Promise.all(refreshes);
     }
@@ -1170,7 +1205,9 @@ export class MultiRunViewerPanel {
             return;
         }
 
-        const currentRunIds = new Set(existingGroup?.runIds || []);
+        const currentRunIds = new Set(
+            existingGroup?.runIds || this._manager.getSelectedRunIds()
+        );
         if (requiredRunId) {
             currentRunIds.add(requiredRunId);
         }
@@ -1180,6 +1217,7 @@ export class MultiRunViewerPanel {
             knownRuns.map(run => ({
                 label: this._getDisplayRunName(run),
                 description: run.runId,
+                detail: `${this._getDisplayRunName(run)} — ${run.runId}`,
                 runId: run.runId,
                 picked: currentRunIds.has(run.runId)
             }));
@@ -1188,6 +1226,7 @@ export class MultiRunViewerPanel {
                 runItems.push({
                     label: unknownRunId,
                     description: 'Run is not currently open',
+                    detail: unknownRunId,
                     runId: unknownRunId,
                     picked: true
                 });
@@ -1596,6 +1635,9 @@ export class MultiRunViewerPanel {
                 <div
                     class="run-item${isEmpty ? ' empty-run' : ''}${isLikelyRunning ? ' running-run' : ''}"
                     data-run-name="${this._escapeHtml(run.runName)}"
+                    data-original-run-name="${this._escapeHtml(
+                        this._manager.getState().runs.get(run.runId)?.runName || run.runName
+                    )}"
                     data-run-id="${this._escapeHtml(run.runId)}"
                     data-run-project="${this._escapeHtml(run.project || '')}"
                     data-run-group="${this._escapeHtml(run.runGroup || '')}"
@@ -1778,6 +1820,7 @@ export class MultiRunViewerPanel {
                     <div class="control-group">
                         <button class="toggle-btn reload-runs-btn" id="reloadRunsBtn" onclick="reloadSelectedRuns('reloadRunsBtn')" title="Reload data for selected runs" ${selectedRunIds.length === 0 ? 'disabled' : ''}>⟳ Reload runs</button>
                         <button class="toggle-btn sync-runs-btn" id="syncRunsBtn" onclick="syncSelectedRuns()" title="Upload selected runs using the local wandb CLI" ${selectedRunIds.length === 0 ? 'disabled' : ''}>☁ Sync selected</button>
+                        <button class="toggle-btn" id="organizePlotsBtn" onclick="openChartOrganizer()" title="Collapse or reorder plots in the active tab">☷ Organize plots</button>
                     </div>
                 `)}
             </div>
@@ -1828,6 +1871,20 @@ export class MultiRunViewerPanel {
         <button type="button" role="menuitem" id="resetRunColorMenuItem" onclick="runContextAction('resetColor')">Reset custom color</button>
         <button type="button" role="menuitem" onclick="runContextAction('sync')">Sync this run</button>
     </div>
+
+    <dialog class="chart-organizer" id="chartOrganizerDialog">
+        <div class="chart-organizer-header">
+            <div>
+                <h3>Organize plots</h3>
+                <p>Drag plots to reorder them. Metric prefix groups stay together.</p>
+            </div>
+            <button type="button" class="btn-small" onclick="closeChartOrganizer()" aria-label="Close plot organizer">×</button>
+        </div>
+        <ol class="chart-organizer-list" id="chartOrganizerList"></ol>
+        <div class="chart-organizer-footer">
+            <button type="button" class="toggle-btn" onclick="closeChartOrganizer()">Done</button>
+        </div>
+    </dialog>
 
         ${getModalHtml(`
         <button class="toggle-btn reload-runs-btn" id="modalReloadRunsBtn" onclick="reloadSelectedRuns('modalReloadRunsBtn')" title="Reload data for selected runs" ${selectedRunIds.length === 0 ? 'disabled' : ''}>⟳ Reload runs</button>
@@ -2023,9 +2080,9 @@ export class MultiRunViewerPanel {
                             <div class="chart-header">
                                 <div class="chart-title">${this._escapeHtml(metric.metricName)}</div>
                                 <div class="chart-actions">
-                                    <button class="btn-small btn-copy-chart" onclick="copySingleChart('${type}', ${metric.index})" title="Copy chart to clipboard">📋</button>
-                                    <button class="btn-small" onclick="reloadOverviewChart('${type}', ${metric.index}, this)" title="Refresh this chart">⟳</button>
-                                    <button class="btn-small" onclick="openFullscreen(${metric.index}, '${type}')">⛶</button>
+                                    <button class="btn-small btn-copy-chart" onclick="copyChartFromButton(this)" title="Copy chart to clipboard">📋</button>
+                                    <button class="btn-small" onclick="reloadChartFromButton(this)" title="Refresh this chart">⟳</button>
+                                    <button class="btn-small" onclick="openFullscreenFromButton(this)" title="Open fullscreen">⛶</button>
                                 </div>
                             </div>
                             <div class="chart-wrapper">
@@ -2140,6 +2197,18 @@ export class MultiRunViewerPanel {
                 typeof persistedViewState.chartHeights === 'object'
                 ? persistedViewState.chartHeights
                 : {};
+            let chartOrder = Array.isArray(persistedViewState.chartOrder)
+                ? persistedViewState.chartOrder.slice(0, 10_000).filter(
+                    key => typeof key === 'string' && key.length <= 600
+                )
+                : [];
+            const collapsedChartKeys = new Set(
+                Array.isArray(persistedViewState.collapsedCharts)
+                    ? persistedViewState.collapsedCharts.slice(0, 10_000).filter(
+                        key => typeof key === 'string' && key.length <= 600
+                    )
+                    : []
+            );
 
             function updatePersistedViewState(changes) {
                 vscode.setState({
@@ -2531,21 +2600,21 @@ export class MultiRunViewerPanel {
                     copyButton.title = 'Copy chart to clipboard';
                     copyButton.textContent = '📋';
                     copyButton.addEventListener('click', () =>
-                        copySingleChart('custom', index)
+                        copyChartFromButton(copyButton)
                     );
                     const reloadButton = document.createElement('button');
                     reloadButton.className = 'btn-small';
                     reloadButton.title = 'Refresh this chart';
                     reloadButton.textContent = '⟳';
                     reloadButton.addEventListener('click', () =>
-                        reloadOverviewChart('custom', index, reloadButton)
+                        reloadChartFromButton(reloadButton)
                     );
                     const fullscreenButton = document.createElement('button');
                     fullscreenButton.className = 'btn-small';
                     fullscreenButton.title = 'Open fullscreen';
                     fullscreenButton.textContent = '⛶';
                     fullscreenButton.addEventListener('click', () =>
-                        openFullscreen(index, 'custom')
+                        openFullscreenFromButton(fullscreenButton)
                     );
                     const deleteButton = document.createElement('button');
                     deleteButton.className = 'btn-small custom-plot-delete';
@@ -2593,6 +2662,10 @@ export class MultiRunViewerPanel {
                 grid.querySelectorAll('.chart-container').forEach(
                     initializeChartResize
                 );
+                grid.querySelectorAll('.chart-container').forEach(
+                    initializeChartOrganization
+                );
+                applyChartOrganization();
                 grid.querySelectorAll('canvas[id^="chart-custom-"]').forEach(
                     canvas => chartObserver.observe(canvas)
                 );
@@ -2738,6 +2811,7 @@ export class MultiRunViewerPanel {
             const runFilterEmpty = document.getElementById('runFilterEmpty');
             const runCountHeading = document.getElementById('runCountHeading');
             const RUN_ACTIVITY_WINDOW_MS = ${RUN_ACTIVITY_WINDOW_MS};
+            let runFilterTimer = null;
 
             function updateRunActivityIndicators(lastModifiedByRunId) {
                 document.querySelectorAll('.run-item[data-run-id]').forEach(item => {
@@ -3026,7 +3100,13 @@ export class MultiRunViewerPanel {
                 groupRunsBtn.classList.toggle('active', groupWandbRuns);
             }
             if (runFilterInput) {
-                runFilterInput.addEventListener('input', () => applyRunListView());
+                runFilterInput.addEventListener('input', () => {
+                    if (runFilterTimer) clearTimeout(runFilterTimer);
+                    runFilterTimer = setTimeout(() => {
+                        runFilterTimer = null;
+                        applyRunListView();
+                    }, 200);
+                });
             }
             if (runSortSelect) {
                 runSortSelect.addEventListener('change', () => applyRunListView());
@@ -3086,6 +3166,7 @@ export class MultiRunViewerPanel {
             let configAllGroup;
             let configParameterGroupRow;
             let configParameterHeaderRow;
+            let configFilterTimer = null;
 
             function refreshConfigComparisonElements() {
                 configFilterInput = document.getElementById('configFilterInput');
@@ -3321,7 +3402,13 @@ export class MultiRunViewerPanel {
                 if (configFilterInput) {
                     configFilterInput.addEventListener(
                         'input',
-                        () => applyConfigColumnView()
+                        () => {
+                            if (configFilterTimer) clearTimeout(configFilterTimer);
+                            configFilterTimer = setTimeout(() => {
+                                configFilterTimer = null;
+                                applyConfigColumnView();
+                            }, 200);
+                        }
                     );
                 }
                 if (configRunSortSelect) {
@@ -3459,6 +3546,190 @@ export class MultiRunViewerPanel {
             document.querySelectorAll('.chart-container').forEach(
                 initializeChartResize
             );
+
+            function getChartOrganizationKey(container) {
+                return getChartResizeKey(container);
+            }
+
+            function setChartCollapsed(container, collapsed, shouldPersist = true) {
+                const key = getChartOrganizationKey(container);
+                if (!key) return;
+                container.classList.toggle('chart-collapsed', collapsed);
+                const button = container.querySelector('.chart-collapse-button');
+                if (button) {
+                    button.textContent = collapsed ? '▸' : '▾';
+                    button.title = collapsed ? 'Expand plot' : 'Collapse plot';
+                    button.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+                }
+                if (collapsed) {
+                    collapsedChartKeys.add(key);
+                } else {
+                    collapsedChartKeys.delete(key);
+                    if (shouldPersist) {
+                        const canvas = container.querySelector('canvas');
+                        if (canvas) chartObserver.observe(canvas);
+                    }
+                }
+                if (shouldPersist) {
+                    updatePersistedViewState({
+                        collapsedCharts: Array.from(collapsedChartKeys)
+                    });
+                }
+            }
+
+            function initializeChartOrganization(container) {
+                if (container.dataset.chartOrganizationInitialized === 'true') return;
+                const actions = container.querySelector('.chart-actions');
+                if (!actions) return;
+
+                const button = document.createElement('button');
+                button.type = 'button';
+                button.className = 'btn-small chart-collapse-button';
+                button.setAttribute('aria-label', 'Collapse or expand plot');
+                button.addEventListener('click', () =>
+                    setChartCollapsed(
+                        container,
+                        !container.classList.contains('chart-collapsed')
+                    )
+                );
+                actions.prepend(button);
+                container.dataset.chartOrganizationInitialized = 'true';
+                setChartCollapsed(
+                    container,
+                    collapsedChartKeys.has(getChartOrganizationKey(container)),
+                    false
+                );
+            }
+
+            function applyChartOrganization() {
+                const rank = new Map(chartOrder.map((key, index) => [key, index]));
+                document.querySelectorAll('.charts-grid').forEach(grid => {
+                    const containers = Array.from(
+                        grid.querySelectorAll(':scope > .chart-container')
+                    );
+                    containers.sort((left, right) =>
+                        (rank.get(getChartOrganizationKey(left)) ?? Number.MAX_SAFE_INTEGER) -
+                        (rank.get(getChartOrganizationKey(right)) ?? Number.MAX_SAFE_INTEGER)
+                    );
+                    containers.forEach(container => grid.appendChild(container));
+                });
+                ['training', 'system'].forEach(tabId => {
+                    const tab = document.getElementById(tabId);
+                    if (!tab) return;
+                    const groups = Array.from(tab.querySelectorAll(':scope > .metric-group'));
+                    const getGroupRank = group => Math.min(
+                        ...Array.from(group.querySelectorAll('.chart-container')).map(
+                            container => rank.get(getChartOrganizationKey(container)) ??
+                                Number.MAX_SAFE_INTEGER
+                        )
+                    );
+                    groups.sort((left, right) =>
+                        getGroupRank(left) - getGroupRank(right)
+                    );
+                    groups.forEach(group => tab.appendChild(group));
+                });
+            }
+
+            function getActiveChartContainers() {
+                const activeTab = document.querySelector('.tab.active')?.dataset.tab;
+                const content = activeTab ? document.getElementById(activeTab) : null;
+                return content
+                    ? Array.from(content.querySelectorAll('.chart-container'))
+                    : [];
+            }
+
+            function saveOrganizerOrder() {
+                const list = document.getElementById('chartOrganizerList');
+                if (!list) return;
+                const activeKeys = new Set(
+                    getActiveChartContainers().map(getChartOrganizationKey)
+                );
+                const orderedActiveKeys = Array.from(
+                    list.querySelectorAll('[data-chart-key]'),
+                    item => item.dataset.chartKey
+                );
+                chartOrder = [
+                    ...chartOrder.filter(key => !activeKeys.has(key)),
+                    ...orderedActiveKeys
+                ];
+                updatePersistedViewState({ chartOrder });
+                applyChartOrganization();
+            }
+
+            function openChartOrganizer() {
+                const dialog = document.getElementById('chartOrganizerDialog');
+                const list = document.getElementById('chartOrganizerList');
+                if (!dialog || !list) return;
+                list.replaceChildren();
+
+                const containers = getActiveChartContainers();
+                if (containers.length === 0) {
+                    const empty = document.createElement('li');
+                    empty.className = 'chart-organizer-empty';
+                    empty.textContent = 'The active tab has no plots.';
+                    list.appendChild(empty);
+                }
+                let draggedItem = null;
+                containers.forEach(container => {
+                    const item = document.createElement('li');
+                    item.draggable = true;
+                    item.dataset.chartKey = getChartOrganizationKey(container);
+                    item.className = 'chart-organizer-item';
+
+                    const handle = document.createElement('span');
+                    handle.className = 'chart-organizer-handle';
+                    handle.textContent = '⋮⋮';
+                    const label = document.createElement('span');
+                    label.className = 'chart-organizer-label';
+                    label.textContent = container.querySelector('.chart-title')?.textContent ||
+                        container.dataset.metricName || 'Plot';
+                    const group = container.closest('.metric-group')?.querySelector('h3');
+                    if (group) label.title = 'Group: ' + group.textContent;
+                    const collapse = document.createElement('input');
+                    collapse.type = 'checkbox';
+                    collapse.checked = !container.classList.contains('chart-collapsed');
+                    collapse.title = 'Show plot contents';
+                    collapse.setAttribute('aria-label', 'Show ' + label.textContent);
+                    collapse.addEventListener('change', () =>
+                        setChartCollapsed(container, !collapse.checked)
+                    );
+                    item.append(handle, label, collapse);
+                    item.addEventListener('dragstart', () => {
+                        draggedItem = item;
+                        item.classList.add('dragging');
+                    });
+                    item.addEventListener('dragend', () => {
+                        item.classList.remove('dragging');
+                        draggedItem = null;
+                        saveOrganizerOrder();
+                    });
+                    item.addEventListener('dragover', event => {
+                        event.preventDefault();
+                        if (!draggedItem || draggedItem === item) return;
+                        const before = event.clientY <
+                            item.getBoundingClientRect().top + item.offsetHeight / 2;
+                        list.insertBefore(draggedItem, before ? item : item.nextSibling);
+                    });
+                    list.appendChild(item);
+                });
+                dialog.showModal();
+            }
+
+            function closeChartOrganizer() {
+                const dialog = document.getElementById('chartOrganizerDialog');
+                if (dialog?.open) dialog.close();
+            }
+
+            document.getElementById('chartOrganizerDialog')?.addEventListener(
+                'click',
+                event => {
+                    if (event.target === event.currentTarget) closeChartOrganizer();
+                }
+            );
+            document.querySelectorAll('.chart-container').forEach(
+                initializeChartOrganization
+            );
+            applyChartOrganization();
 
             // Sidebar collapse/expand
             function toggleSidebar() {
@@ -3755,7 +4026,7 @@ export class MultiRunViewerPanel {
                         runId
                     });
                 } else if (action === 'rename') {
-                    vscode.postMessage({ command: 'renameRun', runId });
+                    beginInlineRunRename(runId);
                 } else if (action === 'resetColor') {
                     vscode.postMessage({
                         command: 'setRunColor',
@@ -3766,6 +4037,71 @@ export class MultiRunViewerPanel {
                     setSyncButtonsBusy(true);
                     vscode.postMessage({ command: 'syncRuns', runIds: [runId] });
                 }
+            }
+
+            function setRunNameInSidebar(runId, runName) {
+                const runItem = Array.from(
+                    document.querySelectorAll('.run-item[data-run-id]')
+                ).find(item => item.dataset.runId === runId);
+                if (!runItem || typeof runName !== 'string') return;
+
+                runItem.dataset.runName = runName;
+                const nameElement = runItem.querySelector('.run-name');
+                if (nameElement) {
+                    nameElement.textContent = runName;
+                    nameElement.title = runItem.dataset.contentStatus === 'empty'
+                        ? runName + '\\nThis run is empty (no run metrics have values; system metrics do not count).'
+                        : runName;
+                }
+            }
+
+            function beginInlineRunRename(runId) {
+                const runItem = Array.from(
+                    document.querySelectorAll('.run-item[data-run-id]')
+                ).find(item => item.dataset.runId === runId);
+                const nameElement = runItem?.querySelector('.run-name');
+                if (!runItem || !nameElement || nameElement.querySelector('input')) return;
+
+                const previousName = runItem.dataset.runName || '';
+                const input = document.createElement('input');
+                input.type = 'text';
+                input.className = 'run-rename-input';
+                input.maxLength = 200;
+                input.value = previousName;
+                input.setAttribute('aria-label', 'Custom run name');
+                nameElement.replaceChildren(input);
+                input.focus();
+                input.select();
+
+                let finished = false;
+                const finish = save => {
+                    if (finished) return;
+                    finished = true;
+                    const requestedName = input.value.trim();
+                    const displayName = save
+                        ? requestedName || runItem.dataset.originalRunName || previousName
+                        : previousName;
+                    setRunNameInSidebar(runId, displayName);
+                    if (save) {
+                        applyRunListView();
+                        vscode.postMessage({
+                            command: 'renameRun',
+                            runId,
+                            customName: requestedName
+                        });
+                    }
+                };
+                input.addEventListener('click', event => event.stopPropagation());
+                input.addEventListener('keydown', event => {
+                    if (event.key === 'Enter') {
+                        event.preventDefault();
+                        finish(true);
+                    } else if (event.key === 'Escape') {
+                        event.preventDefault();
+                        finish(false);
+                    }
+                });
+                input.addEventListener('blur', () => finish(true));
             }
 
             document.addEventListener('click', event => {
@@ -3870,7 +4206,7 @@ export class MultiRunViewerPanel {
                     backgroundColor: getGroupedDatasetColor(dataset) + '20',
                     fill: false,
                     tension: 0.1,
-                    pointRadius: dataset.data.length > (isModal ? 100 : 50) ? 0 : (isModal ? 3 : 2),
+                    pointRadius: 0,
                     pointHoverRadius: isModal ? 5 : 4,
                     pointBackgroundColor: getGroupedDatasetColor(dataset) + '59',
                     pointBorderColor: getGroupedDatasetColor(dataset) + '99',
@@ -3931,6 +4267,53 @@ export class MultiRunViewerPanel {
                         ? metric.customPlotId === identity.customPlotId
                         : metric.metricName === identity.metricName
                 ) || null;
+            }
+
+            function getChartSelectionFromButton(button) {
+                const container = button?.closest('.chart-container');
+                const canvas = container?.querySelector('canvas');
+                const type = container?.dataset.chartType;
+                if (!canvas || !type) return null;
+                const identity = {
+                    type,
+                    metricName: container.dataset.metricName || '',
+                    customPlotId: type === 'custom'
+                        ? canvas.dataset.chartStateKey
+                        : undefined
+                };
+                const metrics = getMetricsForType(type);
+                const metric = findMetricByIdentity(metrics, identity);
+                return metric ? { type, metric, metrics } : null;
+            }
+
+            function copyChartFromButton(button) {
+                const selection = getChartSelectionFromButton(button);
+                if (!selection) return;
+                copySingleChart(
+                    selection.type,
+                    selection.metrics.indexOf(selection.metric),
+                    button.closest('.chart-container')?.querySelector('canvas')?.id
+                );
+            }
+
+            function reloadChartFromButton(button) {
+                const selection = getChartSelectionFromButton(button);
+                if (!selection) return;
+                reloadOverviewChart(
+                    selection.type,
+                    selection.metrics.indexOf(selection.metric),
+                    button
+                );
+            }
+
+            function openFullscreenFromButton(button) {
+                const selection = getChartSelectionFromButton(button);
+                if (!selection) return;
+                openFullscreen({
+                    type: selection.type,
+                    metricName: selection.metric.metricName,
+                    customPlotId: selection.metric.customPlotId
+                }, selection.type);
             }
 
             function ensureOverviewChart(metric, type) {
@@ -4145,6 +4528,16 @@ export class MultiRunViewerPanel {
                     .forEach(button => {
                         button.disabled = !hasSelection;
                     });
+
+                const comparisonGroupList = document.getElementById('comparisonGroupList');
+                if (
+                    comparisonGroupList &&
+                    typeof message.comparisonGroupsHtml === 'string'
+                ) {
+                    comparisonGroupList.innerHTML = message.comparisonGroupsHtml ||
+                        '<div class="comparison-groups-empty">No groups yet.</div>';
+                    updateComparisonGroupCheckboxes();
+                }
             }
 
             window.addEventListener('message', event => {
@@ -4186,10 +4579,34 @@ export class MultiRunViewerPanel {
                     updateSelectionDetails(message);
                 }
                 if (
+                    message.command === 'runNamesUpdated' &&
+                    message.runNames &&
+                    typeof message.runNames === 'object'
+                ) {
+                    Object.entries(message.runNames).forEach(([runId, runName]) => {
+                        if (typeof runName === 'string') {
+                            setRunNameInSidebar(runId, runName);
+                        }
+                    });
+                    applyRunListView(false);
+                    updateSelectionDetails(message);
+                }
+                if (message.command === 'runNameUpdateRejected') {
+                    setRunNameInSidebar(message.runId, message.runName);
+                    if (typeof message.message === 'string') {
+                        vscode.postMessage({
+                            command: 'showWarning',
+                            message: message.message
+                        });
+                    }
+                    return;
+                }
+                if (
                     (
                         message.command !== 'runDataUpdated' &&
                         message.command !== 'runColorsUpdated' &&
-                        message.command !== 'runSelectionDataUpdated'
+                        message.command !== 'runSelectionDataUpdated' &&
+                        message.command !== 'runNamesUpdated'
                     ) ||
                     !message.mergedMetrics
                 ) {
@@ -4207,9 +4624,9 @@ export class MultiRunViewerPanel {
             });
 
             // Fullscreen modal
-            function openFullscreen(metricIndex, type, shouldPersist = true) {
+            function openFullscreen(metricIdentity, type, shouldPersist = true) {
                 const metrics = getMetricsForType(type);
-                const metric = metrics[metricIndex];
+                const metric = findMetricByIdentity(metrics, metricIdentity);
                 if (!metric) return;
 
                 activeFullscreenMetric = {
@@ -4314,9 +4731,14 @@ export class MultiRunViewerPanel {
                         requestAnimationFrame(() => {
                             // Get metric data from dataset attributes
                             const type = canvas.dataset.chartType;
-                            const index = parseInt(canvas.dataset.chartIndex);
                             const metrics = getMetricsForType(type);
-                            const metric = metrics[index];
+                            const metric = findMetricByIdentity(metrics, {
+                                type,
+                                metricName: canvas.dataset.metricName,
+                                customPlotId: type === 'custom'
+                                    ? canvas.dataset.chartStateKey
+                                    : undefined
+                            });
 
                             if (!metric) return;
 
@@ -4361,12 +4783,9 @@ export class MultiRunViewerPanel {
                         metrics,
                         savedFullscreenMetric
                     );
-                    const metricIndex = restoredMetric
-                        ? metrics.indexOf(restoredMetric)
-                        : -1;
-                    if (metricIndex >= 0) {
+                    if (restoredMetric) {
                         openFullscreen(
-                            metricIndex,
+                            savedFullscreenMetric,
                             savedFullscreenMetric.type,
                             false
                         );
@@ -4871,6 +5290,16 @@ export class MultiRunViewerPanel {
             .run-name:hover {
                 text-decoration: underline;
             }
+            .run-rename-input {
+                width: 100%;
+                min-width: 0;
+                padding: 1px 4px;
+                border: 1px solid var(--vscode-focusBorder);
+                color: var(--vscode-input-foreground);
+                background: var(--vscode-input-background);
+                font: inherit;
+                outline: none;
+            }
             .run-meta {
                 font-size: 0.7em;
                 color: var(--vscode-descriptionForeground);
@@ -5248,6 +5677,79 @@ export class MultiRunViewerPanel {
                 margin-top: 6px;
                 color: var(--vscode-errorForeground);
                 font-size: 0.8em;
+            }
+            .chart-organizer {
+                width: min(560px, calc(100vw - 40px));
+                max-height: min(720px, calc(100vh - 40px));
+                padding: 0;
+                border: 1px solid var(--vscode-panel-border);
+                border-radius: 8px;
+                color: var(--vscode-foreground);
+                background: var(--vscode-editor-background);
+                box-shadow: 0 12px 36px rgba(0, 0, 0, 0.35);
+            }
+            .chart-organizer::backdrop {
+                background: rgba(0, 0, 0, 0.45);
+            }
+            .chart-organizer-header,
+            .chart-organizer-footer {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                gap: 12px;
+                padding: 14px 16px;
+                border-bottom: 1px solid var(--vscode-panel-border);
+            }
+            .chart-organizer-header h3,
+            .chart-organizer-header p {
+                margin: 0;
+            }
+            .chart-organizer-header p {
+                margin-top: 4px;
+                color: var(--vscode-descriptionForeground);
+                font-size: 0.78em;
+            }
+            .chart-organizer-footer {
+                justify-content: flex-end;
+                border-top: 1px solid var(--vscode-panel-border);
+                border-bottom: 0;
+            }
+            .chart-organizer-list {
+                max-height: min(560px, calc(100vh - 180px));
+                margin: 0;
+                padding: 10px;
+                overflow-y: auto;
+                list-style: none;
+            }
+            .chart-organizer-item {
+                display: flex;
+                align-items: center;
+                gap: 10px;
+                margin: 4px 0;
+                padding: 9px 10px;
+                border: 1px solid var(--vscode-panel-border);
+                border-radius: 4px;
+                background: var(--vscode-sideBar-background);
+                cursor: grab;
+            }
+            .chart-organizer-item.dragging {
+                opacity: 0.45;
+            }
+            .chart-organizer-handle {
+                color: var(--vscode-descriptionForeground);
+                letter-spacing: -3px;
+            }
+            .chart-organizer-label {
+                flex: 1;
+                min-width: 0;
+                overflow: hidden;
+                text-overflow: ellipsis;
+                white-space: nowrap;
+            }
+            .chart-organizer-empty {
+                padding: 24px;
+                text-align: center;
+                color: var(--vscode-descriptionForeground);
             }
             .custom-plot-delete {
                 color: var(--vscode-errorForeground);

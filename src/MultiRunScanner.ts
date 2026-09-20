@@ -55,18 +55,41 @@ export function detectRunSyncStatus(filePath: string): RunSyncStatus {
  */
 export async function scanFolderForRuns(folderPath: string): Promise<RunScanResult[]> {
     const results: RunScanResult[] = [];
+    const visitedDirectories = new Set<string>();
 
     async function scanDirectory(dirPath: string): Promise<void> {
         try {
+            // Follow directory symlinks while guarding against links that point
+            // back to an ancestor (or to the same directory through another
+            // alias). `readdir` reports symlinks as neither files nor folders.
+            const realDirectoryPath = await fs.promises.realpath(dirPath);
+            if (visitedDirectories.has(realDirectoryPath)) {
+                return;
+            }
+            visitedDirectories.add(realDirectoryPath);
+
             const entries = await fs.promises.readdir(dirPath, { withFileTypes: true });
 
             for (const entry of entries) {
                 const fullPath = path.join(dirPath, entry.name);
+                let isDirectory = entry.isDirectory();
+                let isFile = entry.isFile();
 
-                if (entry.isDirectory()) {
+                if (entry.isSymbolicLink()) {
+                    try {
+                        const targetStats = await fs.promises.stat(fullPath);
+                        isDirectory = targetStats.isDirectory();
+                        isFile = targetStats.isFile();
+                    } catch {
+                        // Broken or temporarily unavailable links are ignored.
+                        continue;
+                    }
+                }
+
+                if (isDirectory) {
                     // Recursively scan subdirectories
                     await scanDirectory(fullPath);
-                } else if (entry.isFile() && entry.name.endsWith('.wandb')) {
+                } else if (isFile && entry.name.endsWith('.wandb')) {
                     // Found a .wandb file
                     try {
                         const metadata = await quickParseMetadata(fullPath);

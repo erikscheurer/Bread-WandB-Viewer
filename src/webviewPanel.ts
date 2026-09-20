@@ -361,7 +361,7 @@ export class WandbViewerPanel {
                         backgroundColor: color + '20',
                         fill: false,
                         tension: 0.1,
-                        pointRadius: data.length > 50 ? 0 : 3,
+                        pointRadius: 0,
                         pointHoverRadius: 5
                     }]
                 },
