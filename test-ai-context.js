@@ -1,5 +1,7 @@
 // Simple test for AI Context generation
 const { compareConfigs } = require('./out/aiContext/ConfigDiffer');
+const { flattenConfig } = require('./out/configUtils');
+const assert = require('assert/strict');
 const { summarizeMetric } = require('./out/aiContext/MetricSummarizer');
 const { generateAIContext, calculateTokenEstimate } = require('./out/aiContext/ContextGenerator');
 const { downsampleMetricPoints, MultiRunManager } = require('./out/MultiRunManager');
@@ -59,6 +61,23 @@ if (
 }
 console.log('✓ Config comparison works\n');
 
+const nestedConfigs = new Map([
+    ['run1', { model: { optimizer: { lr: 0.01 }, layers: [32, 64] }, optional: null }],
+    ['run2', { model: { layers: [32, 64], optimizer: { lr: 0.02, decay: 0.1 } }, optional: null }]
+]);
+const nestedComparison = compareConfigs(nestedConfigs);
+assert.deepEqual(nestedComparison.differences['model.optimizer.lr'], { run1: 0.01, run2: 0.02 });
+assert.deepEqual(nestedComparison.differences['model.optimizer.decay'], { run2: 0.1 });
+assert.deepEqual(nestedComparison.common['model.layers'], [32, 64]);
+assert.equal(nestedComparison.common.optional, null);
+assert.equal(nestedComparison.metadata.totalParams, 4);
+assert.equal(flattenConfig({ 'model.lr': 2, model: { lr: 1 } })['model.lr'], 2);
+assert.deepEqual(flattenConfig({ empty: {} }).empty, {});
+assert.equal(flattenConfig(JSON.parse('{"__proto__": {"value": 7}}'))['__proto__.value'], 7);
+assert.equal({}.value, undefined);
+assert.equal(nestedConfigs.get('run1').model.optimizer.lr, 0.01);
+console.log('✓ Nested configuration leaves, missing keys, arrays, and safe keys work\n');
+
 // Test 2: Metric Summarizer
 console.log('Test 2: Metric Summarization');
 const mockMetric = [
@@ -115,7 +134,8 @@ mockParsedData.set('run1_abc123', {
     config: {
         learning_rate: 0.001,
         batch_size: 32,
-        model: 'transformer'
+        model: 'transformer',
+        hydra: { optimizer: { lr: 0.001 } }
     },
     metrics: {
         'loss/train': mockMetric,
@@ -132,6 +152,7 @@ mockParsedData.set('run1_abc123', {
 });
 
 const context = generateAIContext(mockRuns, mockParsedData, '/test/folder');
+assert.match(context, /\*\*hydra\.optimizer\.lr\*\*/);
 console.log('Generated context length:', context.length, 'characters');
 console.log('Context tokens:', calculateTokenEstimate(context));
 console.log('\nFirst 500 characters:');
@@ -234,7 +255,7 @@ async function testMultiRunHelpers() {
     console.log('✓ Recursive comparison group discovery works\n');
 
     console.log('Test 7: Lightweight Empty-Run Detection');
-    const createHistoryFile = (filePath, steps) => {
+    const createHistoryFile = (filePath, steps, metricCount = 1) => {
         const root = new protobuf.Root();
         const namespace = new protobuf.Namespace('wandb_internal');
         const historyStep = new protobuf.Type('HistoryStep')
@@ -257,7 +278,10 @@ async function testMultiRunHelpers() {
             const payload = Buffer.from(recordType.encode({
                 history: {
                     step: { num: step },
-                    item: [{ key: 'loss', value_json: JSON.stringify(1 / (step + 1)) }]
+                    item: Array.from({ length: metricCount }, (_, index) => ({
+                        key: metricCount === 1 ? 'loss' : `metric-${index}`,
+                        value_json: JSON.stringify(metricCount === 1 ? 1 / (step + 1) : step + 1)
+                    }))
                 }
             }).finish());
             const physical = Buffer.alloc(7 + payload.length);
@@ -282,6 +306,46 @@ async function testMultiRunHelpers() {
         if (!await hasWandbMetricData(populatedRunPath)) {
             throw new Error('A two-point metric must be classified as populated');
         }
+        const livePath = path.join(tempFolder, 'live.wandb');
+        createHistoryFile(livePath, [0, 1], 300);
+        const liveManager = new MultiRunManager(tempFolder, undefined, {}, true);
+        let version = 0;
+        const metadata = () => ({ runId: 'live', runName: 'live', filePath: livePath,
+            isVisible: true, lastModified: ++version, fileSize: fs.statSync(livePath).size });
+        liveManager.addRun(metadata());
+        await liveManager.parseSelectedRuns();
+        const initialData = liveManager.getParsedData('live');
+        assert.equal(liveManager.mergeMetrics().training.length, 300);
+        createHistoryFile(livePath, [0, 1, 2], 300);
+        liveManager.updateRun(metadata());
+        assert.equal(liveManager.getParsedData('live'), initialData, 'file events preserve the displayed snapshot');
+        assert.equal(liveManager.mergeMetrics().training.length, 300, 'an invalidation gap must not erase chart panels');
+        await liveManager.parseSelectedRuns();
+        const updatedData = liveManager.getParsedData('live');
+        assert.notEqual(updatedData, initialData);
+        assert.equal(updatedData.metrics['metric-0'].length, 3, 'stale cached runs must still be reparsed');
+        liveManager.invalidateSelectedRuns();
+        assert.equal(liveManager.getParsedData('live'), updatedData, 'Reload runs retains data until replacement is ready');
+        fs.writeFileSync(livePath, 'invalid log');
+        const originalError = console.error;
+        try {
+            console.error = () => {};
+            await liveManager.parseSelectedRuns();
+            await liveManager.parseSelectedRuns();
+        } finally { console.error = originalError; }
+        assert.equal(liveManager.getParsedData('live'), updatedData, 'failed refreshes retain the last successful snapshot');
+        assert.equal(liveManager.mergeMetrics().training.length, 300);
+        assert.equal(liveManager.getRunContentStatus('live'), 'unknown');
+        createHistoryFile(livePath, [0, 1, 2, 3], 300);
+        await liveManager.parseSelectedRuns();
+        assert.equal(liveManager.getParsedData('live').metrics['metric-0'].length, 4, 'failed reads are retried without toggling runs');
+        assert.equal(liveManager.getRunContentStatus('live'), 'has-data');
+        createHistoryFile(livePath, [0]);
+        liveManager.updateRun(metadata());
+        await liveManager.parseSelectedRuns();
+        assert.equal(liveManager.mergeMetrics().training.length, 0, 'successfully parsed empty replacement files still clear old data');
+        liveManager.removeRun('live');
+        assert.equal(liveManager.getParsedData('live'), undefined);
     } finally {
         fs.rmSync(tempFolder, { recursive: true, force: true });
     }

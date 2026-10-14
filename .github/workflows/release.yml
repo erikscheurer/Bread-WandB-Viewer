@@ -40,6 +40,12 @@ jobs:
       - name: Test AI context generation
         run: node test-ai-context.js
 
+      - name: Test chart interactions
+        run: npm run test:charts
+
+      - name: Test logged images
+        run: npm run test:images
+
       - name: Package extension
         run: npm run package:vsix -- wandb-viewer.vsix
 

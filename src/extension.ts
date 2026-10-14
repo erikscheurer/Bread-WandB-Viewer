@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 import * as fs from 'fs';
+import { flattenConfig } from './configUtils';
 import {
     parseWandbFile,
     parseOutputLog,
@@ -12,6 +13,8 @@ import { WandbViewerPanel } from './webviewPanel';
 import { MultiRunViewerPanel } from './MultiRunViewerPanel';
 import { getChartStyles, getChartScript, getControlsBarHtml, getModalHtml } from './chartTemplate';
 import { getCustomRunName } from './customRunNames';
+import { escapeHtml, serializeForScript } from './webviewHtml';
+import { getImageViewerData, getImageViewerHtml, getImageViewerScript, getImageViewerStyles, registerImageViewer, setImageResourceRoots } from './imageViewer';
 
 export function activate(context: vscode.ExtensionContext) {
     console.log('W&B Viewer extension activated');
@@ -243,9 +246,18 @@ class WandbEditorProvider implements vscode.CustomReadonlyEditorProvider {
         webviewPanel.webview.options = {
             enableScripts: true
         };
+        setImageResourceRoots(webviewPanel.webview, [runDir], this.context.extensionUri);
 
         try {
             const runData = parseWandbFile(wandbFilePath);
+            let imageRunData = runData;
+            const imageListener = registerImageViewer(webviewPanel.webview, () => [{
+                runId: imageRunData.runId,
+                runName: getCustomRunName(this.context.globalState, imageRunData.runId) || imageRunData.runName || imageRunData.runId,
+                runDir,
+                images: imageRunData.images || {}
+            }]);
+            webviewPanel.onDidDispose(() => imageListener.dispose());
             const customRunName = getCustomRunName(
                 this.context.globalState,
                 runData.runId
@@ -289,6 +301,7 @@ class WandbEditorProvider implements vscode.CustomReadonlyEditorProvider {
                 try {
                     console.log('[W&B Viewer] File changed, re-parsing...');
                     const newRunData = parseWandbFile(wandbFilePath);
+                    imageRunData = newRunData;
                     const newLogMetrics = runFiles.outputLog
                         ? parseOutputLog(runFiles.outputLog)
                         : {};
@@ -305,7 +318,13 @@ class WandbEditorProvider implements vscode.CustomReadonlyEditorProvider {
                     webviewPanel.webview.postMessage({
                         command: 'updateData',
                         trainingMetrics: allMetrics,
-                        systemMetrics: newRunData.systemMetrics
+                        systemMetrics: newRunData.systemMetrics,
+                        imageRuns: getImageViewerData([{
+                            runId: newRunData.runId,
+                            runName: getCustomRunName(this.context.globalState, newRunData.runId) || newRunData.runName || newRunData.runId,
+                            runDir,
+                            images: newRunData.images || {}
+                        }])
                     });
                 } catch (error) {
                     console.error('[W&B Viewer] Error refreshing data:', error);
@@ -425,8 +444,8 @@ class WandbEditorProvider implements vscode.CustomReadonlyEditorProvider {
     private generateChartInitScript(allMetrics: any, systemMetrics: any): string {
         return `
             const vscode = acquireVsCodeApi();
-            const trainingMetrics = ${JSON.stringify(allMetrics)};
-            const systemMetrics = ${JSON.stringify(systemMetrics)};
+            const trainingMetrics = ${serializeForScript(allMetrics)};
+            const systemMetrics = ${serializeForScript(systemMetrics)};
             const colors = CHART_COLORS;
 
             function openOutputLog() {
@@ -508,11 +527,11 @@ class WandbEditorProvider implements vscode.CustomReadonlyEditorProvider {
 
             let chartIndex = 0;
             for (const [metric, data] of Object.entries(trainingMetrics)) {
-                createChart('chart-training-' + metric.replace(/[^a-zA-Z0-9]/g, '_'), metric, data, chartIndex++);
+                createChart('chart-training-' + encodeURIComponent(metric), metric, data, chartIndex++);
             }
             chartIndex = 0;
             for (const [metric, data] of Object.entries(systemMetrics)) {
-                createChart('chart-system-' + metric.replace(/[^a-zA-Z0-9]/g, '_'), metric, data, chartIndex++);
+                createChart('chart-system-' + encodeURIComponent(metric), metric, data, chartIndex++);
             }
 
             window.addEventListener('message', event => {
@@ -524,11 +543,15 @@ class WandbEditorProvider implements vscode.CustomReadonlyEditorProvider {
                     Object.keys(chartInstances).forEach(canvasId => {
                         const chart = chartInstances[canvasId];
                         if (chart && chart.data.datasets[0]) {
-                            const metricName = chart.data.datasets[0]._runName;
-                            const data = trainingMetrics[metricName] || systemMetrics[metricName];
+                            const original = chart.data.datasets.find(dataset => dataset._isOriginal);
+                            if (!original) return;
+                            const metricName = original._runName;
+                            const data = canvasId.startsWith('chart-training-')
+                                ? trainingMetrics[metricName]
+                                : systemMetrics[metricName];
                             if (data) {
                                 const newData = data.map(d => ({ x: d.step, y: d.value }));
-                                chart.data.datasets[0]._originalData = newData;
+                                original._originalData = newData;
                                 updateChartSmoothing(chart, globalSmoothing, showRaw);
                             }
                         }
@@ -582,6 +605,7 @@ class WandbEditorProvider implements vscode.CustomReadonlyEditorProvider {
     <style>
         ${this.generatePageStyles()}
         ${getChartStyles()}
+        ${getImageViewerStyles()}
     </style>
 </head>
 <body>
@@ -592,6 +616,7 @@ class WandbEditorProvider implements vscode.CustomReadonlyEditorProvider {
     <div class="tabs">
         <button class="tab active" data-tab="training">Training Metrics</button>
         <button class="tab" data-tab="system">System Metrics</button>
+        <button class="tab" data-tab="images">Images</button>
         <button class="tab" data-tab="config">Configuration</button>
     </div>
 
@@ -607,94 +632,41 @@ class WandbEditorProvider implements vscode.CustomReadonlyEditorProvider {
         ${this.generateConfigHtml(runData.config)}
     </div>
 
+    ${getImageViewerHtml()}
+
     ${getModalHtml()}
 
     <script>
         ${getChartScript()}
         ${this.generateChartInitScript(allMetrics, runData.systemMetrics)}
+        ${getImageViewerScript(getImageViewerData([{
+            runId: runData.runId, runName, runDir, images: runData.images || {}
+        }]))}
     </script>
 </body>
 </html>`;
     }
 
-    private groupMetrics(metrics: any): { name: string; metrics: any }[] {
-        const groups: { [key: string]: any } = {};
-
-        for (const [key, values] of Object.entries(metrics)) {
-            if (!values || (values as any[]).length === 0) continue;
-
-            // Extract group name from the metric's natural hierarchy
-            const groupName = this.extractGroupName(key);
-
-            if (!groups[groupName]) groups[groupName] = {};
-            groups[groupName][key] = values;
-        }
-
-        // Sort groups
-        const result: { name: string; metrics: any }[] = [];
-        const allGroupNames = Object.keys(groups).sort((a, b) => {
-            const priority = ['loss', 'accuracy', 'lr', 'optim', 'perf', 'time', 'step'];
-            const aIdx = priority.findIndex(p => a.toLowerCase().startsWith(p));
-            const bIdx = priority.findIndex(p => b.toLowerCase().startsWith(p));
-
-            if (aIdx !== -1 && bIdx !== -1) return aIdx - bIdx;
-            if (aIdx !== -1) return -1;
-            if (bIdx !== -1) return 1;
-
-            const aIsGpu = a.toLowerCase().startsWith('gpu');
-            const bIsGpu = b.toLowerCase().startsWith('gpu');
-            if (aIsGpu && bIsGpu) return a.localeCompare(b);
-            if (aIsGpu) return 1;
-            if (bIsGpu) return 1;
-
-            return a.localeCompare(b);
-        });
-
-        for (const name of allGroupNames) {
-            result.push({ name, metrics: groups[name] });
-        }
-
-        return result;
+    private groupMetrics(metrics: any): { metrics: any }[] {
+        const nonEmptyMetrics = Object.fromEntries(
+            Object.entries(metrics).filter(([, values]) => Array.isArray(values) && values.length > 0)
+        );
+        return Object.keys(nonEmptyMetrics).length > 0 ? [{ metrics: nonEmptyMetrics }] : [];
     }
 
-    private extractGroupName(key: string): string {
-        if (key.includes('/')) {
-            return key.split('/')[0];
-        }
-
-        if (key.includes('.')) {
-            const parts = key.split('.');
-            if (parts[0] === 'gpu' && parts.length >= 3) {
-                return `gpu.${parts[1]}`;
-            }
-            return parts[0];
-        }
-
-        if (key.includes('_')) {
-            const parts = key.split('_');
-            const commonPrefixes = ['train', 'val', 'test', 'eval'];
-            if (commonPrefixes.includes(parts[0])) {
-                return parts[0];
-            }
-        }
-
-        return key;
-    }
-
-    private generateMetricGroupsHtml(groups: { name: string; metrics: any }[], prefix: string): string {
+    private generateMetricGroupsHtml(groups: { metrics: any }[], prefix: string): string {
         if (groups.length === 0) return '<div class="no-data">No metrics found</div>';
 
         return groups.map(group => `
             <div class="metric-group">
-                <h3>${group.name}</h3>
                 <div class="charts-grid">
                     ${Object.keys(group.metrics).map(key => {
-                        const safeKey = key.replace(/[^a-zA-Z0-9]/g, '_');
+                        const safeKey = encodeURIComponent(key);
                         return `
                         <div class="chart-container">
                             <div class="chart-header">
-                                <div class="chart-title">${key}</div>
-                                <button class="btn-small" onclick="openFullscreen('${key.replace(/'/g, "\\'")}', '${prefix}')">⛶</button>
+                                <div class="chart-title">${escapeHtml(key)}</div>
+                                <button class="btn-small" data-metric-name="${escapeHtml(key)}" data-chart-type="${prefix}" onclick="openFullscreen(this.dataset.metricName, this.dataset.chartType)">⛶</button>
                             </div>
                             <div class="chart-wrapper">
                                 <canvas id="chart-${prefix}-${safeKey}"></canvas>
@@ -710,10 +682,10 @@ class WandbEditorProvider implements vscode.CustomReadonlyEditorProvider {
     private generateConfigHtml(config: any): string {
         if (Object.keys(config).length === 0) return '<div class="no-data">No configuration found</div>';
 
-        return Object.entries(config).map(([key, value]) => `
+        return Object.entries(flattenConfig(config)).map(([key, value]) => `
             <div class="config-item">
-                <div class="config-key">${key}</div>
-                <div class="config-value">${typeof value === 'object' ? JSON.stringify(value, null, 2) : String(value)}</div>
+                <div class="config-key">${escapeHtml(key)}</div>
+                <div class="config-value">${escapeHtml(typeof value === 'object' ? JSON.stringify(value, null, 2) : String(value))}</div>
             </div>
         `).join('');
     }

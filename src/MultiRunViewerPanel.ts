@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import * as fs from 'fs';
+import { flattenConfig } from './configUtils';
 import * as path from 'path';
 import { spawn } from 'child_process';
 import { MultiRunManager, MergedMetric } from './MultiRunManager';
@@ -32,6 +33,7 @@ import {
     validateRunComparisonGroupName
 } from './runComparisonGroups';
 import { normalizeMultiRunPanelRestorationState } from './multiRunPanelState';
+import { getImageViewerData, getImageViewerHtml, getImageViewerScript, getImageViewerStyles, ImageViewerRun, registerImageViewer, setImageResourceRoots } from './imageViewer';
 
 const RUN_SORT_MODES = [
     'created-desc',
@@ -112,6 +114,7 @@ export class MultiRunViewerPanel {
     private _chartColumns: ChartColumns;
     private _maxChartPoints: number;
     private _renderedMetricSignature = '';
+    private _hasRenderedWebview = false;
     private _restoredSelectedRunIds: Set<string> | null;
     private _contentInspectionTimer: NodeJS.Timeout | null = null;
     private _contentInspectionInProgress = false;
@@ -264,6 +267,7 @@ export class MultiRunViewerPanel {
             this._customRunColors,
             selectNewRuns
         );
+        this._disposables.push(registerImageViewer(panel.webview, () => this._getImageRuns()));
 
         // Show loading screen immediately
         this._panel.webview.html = this._getLoadingHtml();
@@ -752,26 +756,33 @@ export class MultiRunViewerPanel {
         }
     }
 
+    private _getChartStructureUpdate(
+        mergedMetrics: { training: MergedMetric[], system: MergedMetric[], summary: MergedMetric[] }
+    ): Record<string, string> | undefined {
+        if (this._getMetricSignature(mergedMetrics) === this._renderedMetricSignature) {
+            return undefined;
+        }
+        return {
+            training: this._generateMetricsHtml(mergedMetrics.training, 'training'),
+            system: this._generateMetricsHtml(mergedMetrics.system, 'system')
+        };
+    }
+
     private async _refreshRunDataInWebview(): Promise<void> {
         await this._manager.parseSelectedRuns();
         const mergedMetrics = this._getMergedMetrics();
         const metricSignature = this._getMetricSignature(mergedMetrics);
 
-        // A data-only message can update existing canvases, but a run that gains
-        // its first metric needs new chart DOM. Rebuild only for that structural
-        // change so the overview appears without toggling the run off and on.
-        if (metricSignature !== this._renderedMetricSignature) {
-            await this._update(false);
-            return;
-        }
-
         await this._panel.webview.postMessage({
             command: 'runDataUpdated',
+            imageRuns: this._getImageViewerData(),
             mergedMetrics,
+            chartHtml: this._getChartStructureUpdate(mergedMetrics),
             numericRunConfigs: this._getNumericRunConfigs(),
             runContentStatuses: this._getRunContentStatuses(),
             runLastModified: this._getRunLastModified()
         });
+        this._renderedMetricSignature = metricSignature;
     }
 
     private async _refreshSelectionInWebview(): Promise<void> {
@@ -779,18 +790,15 @@ export class MultiRunViewerPanel {
         const mergedMetrics = this._getMergedMetrics();
         const metricSignature = this._getMetricSignature(mergedMetrics);
 
-        if (metricSignature !== this._renderedMetricSignature) {
-            await this._update(false);
-            return;
-        }
-
         const selectedRunIds = new Set(this._manager.getSelectedRunIds());
         const selectedRuns = this._manager.getRuns()
             .filter(run => selectedRunIds.has(run.runId))
             .map(run => this._withDisplayRunName(run));
         await this._panel.webview.postMessage({
             command: 'runSelectionDataUpdated',
+            imageRuns: this._getImageViewerData(),
             mergedMetrics,
+            chartHtml: this._getChartStructureUpdate(mergedMetrics),
             numericRunConfigs: this._getNumericRunConfigs(),
             runContentStatuses: this._getRunContentStatuses(),
             runLastModified: this._getRunLastModified(),
@@ -798,6 +806,7 @@ export class MultiRunViewerPanel {
             configComparisonHtml: this._generateConfigComparisonHtml(selectedRuns),
             hasSelection: selectedRuns.length > 0
         });
+        this._renderedMetricSignature = metricSignature;
     }
 
     private async _updateRunActivityInWebview(): Promise<void> {
@@ -956,7 +965,7 @@ export class MultiRunViewerPanel {
                 continue;
             }
             const numericConfig: Record<string, number> = {};
-            for (const [key, value] of Object.entries(runData.config)) {
+            for (const [key, value] of Object.entries(flattenConfig(runData.config))) {
                 if (typeof value === 'number' && Number.isFinite(value)) {
                     numericConfig[key] = value;
                 }
@@ -1015,6 +1024,7 @@ export class MultiRunViewerPanel {
             );
             refreshes.push(panel._panel.webview.postMessage({
                 command: 'runNamesUpdated',
+                imageRuns: panel._getImageViewerData(),
                 runNames: Object.fromEntries(
                     displayRuns.map(candidate => [candidate.runId, candidate.runName])
                 ),
@@ -1583,22 +1593,52 @@ export class MultiRunViewerPanel {
         const mergedMetrics = this._getMergedMetrics();
         console.log(`[4] Merge metrics: ${Date.now() - t4}ms (${mergedMetrics.training.length} training, ${mergedMetrics.system.length} system)`);
 
-        const t6 = Date.now();
         const displayRuns = runs.map(run => this._withDisplayRunName(run));
-        const htmlContent = this._getHtmlContent(
-            displayRuns,
-            selectedRunIds,
-            mergedMetrics
-        );
-        console.log(`[6] Generate HTML: ${Date.now() - t6}ms (${Math.round(htmlContent.length / 1024)}KB)`);
-
-        const t7 = Date.now();
-        this._panel.webview.html = htmlContent;
+        if (this._hasRenderedWebview) {
+            const selectedSet = new Set(selectedRunIds);
+            const selectedRuns = displayRuns.filter(run => selectedSet.has(run.runId));
+            await this._panel.webview.postMessage({
+                command: 'runListUpdated',
+                imageRuns: this._getImageViewerData(),
+                mergedMetrics,
+                chartHtml: this._getChartStructureUpdate(mergedMetrics),
+                runListHtml: this._generateRunListHtml(displayRuns, selectedSet),
+                runCount: displayRuns.length,
+                folderPaths: Array.from(this._folderPaths),
+                numericRunConfigs: this._getNumericRunConfigs(),
+                runContentStatuses: this._getRunContentStatuses(),
+                runLastModified: this._getRunLastModified(),
+                metadataHtml: this._generateMetadataHtml(selectedRuns),
+                configComparisonHtml: this._generateConfigComparisonHtml(selectedRuns),
+                comparisonGroupsHtml: this._generateComparisonGroupsHtml(displayRuns, selectedSet),
+                hasSelection: selectedRuns.length > 0
+            });
+        } else {
+            this._panel.webview.html = this._getHtmlContent(displayRuns, selectedRunIds, mergedMetrics);
+            this._hasRenderedWebview = true;
+        }
         this._renderedMetricSignature = this._getMetricSignature(mergedMetrics);
         this._scheduleContentInspection();
-        console.log(`[7] Set webview HTML: ${Date.now() - t7}ms`);
 
         console.log(`=== Total Update Time: ${Date.now() - overallStart}ms ===\n`);
+    }
+
+    private _getImageRuns(): ImageViewerRun[] {
+        return this._manager.getSelectedRunIds().flatMap(runId => {
+            const run = this._manager.getState().runs.get(runId);
+            const parsed = this._manager.getParsedData(runId);
+            return run && parsed?.images ? [{
+                runId,
+                runName: this._withDisplayRunName(run).runName,
+                runDir: path.dirname(run.filePath),
+                images: parsed.images
+            }] : [];
+        });
+    }
+
+    private _getImageViewerData(): object[] {
+        setImageResourceRoots(this._panel.webview, this._manager.getRuns().map(run => path.dirname(run.filePath)), this._extensionUri);
+        return getImageViewerData(this._getImageRuns());
     }
 
     private _getHtmlContent(
@@ -1613,10 +1653,25 @@ export class MultiRunViewerPanel {
             runs,
             selectedSet
         );
+        const runListHtml = this._generateRunListHtml(runs, selectedSet);
+
+        const metadataHtml = this._generateMetadataHtml(selectedRuns);
+
+        return this._getHtmlDocumentContent(
+            runs,
+            selectedRunIds,
+            mergedMetrics,
+            runListHtml,
+            metadataHtml,
+            comparisonGroupsHtml,
+            configComparisonHtml
+        );
+    }
+
+    private _generateRunListHtml(runs: RunScanResult[], selectedSet: Set<string>): string {
         const wandbGroupColors = this._getWandbGroupColors();
 
-        // Generate sidebar run list
-        const runListHtml = runs.map(run => {
+        return runs.map(run => {
             const isSelected = selectedSet.has(run.runId);
             const color = this._manager.getRunColor(run.runId);
             const contentStatus = this._manager.getRunContentStatus(run.runId);
@@ -1675,23 +1730,12 @@ export class MultiRunViewerPanel {
             `;
         }).join('');
 
-        const metadataHtml = this._generateMetadataHtml(selectedRuns);
-
-        return this._getHtmlDocumentContent(
-            runs,
-            selectedRunIds,
-            mergedMetrics,
-            runListHtml,
-            metadataHtml,
-            comparisonGroupsHtml,
-            configComparisonHtml
-        );
     }
 
     private _generateMetadataHtml(selectedRuns: RunScanResult[]): string {
         return selectedRuns.map(run => {
             const parsedData = this._manager.getParsedData(run.runId);
-            const config = parsedData?.config || {};
+            const config = flattenConfig(parsedData?.config || {});
             const configEntries = Object.entries(config);
 
             return `
@@ -1746,6 +1790,7 @@ export class MultiRunViewerPanel {
     <style>
         ${this._getPageStyles()}
         ${getChartStyles()}
+        ${getImageViewerStyles()}
     </style>
 </head>
 <body style="--wandb-viewer-chart-columns: ${this._chartColumns};">
@@ -1828,6 +1873,7 @@ export class MultiRunViewerPanel {
             <div class="tabs">
                 <button class="tab active" data-tab="training">Training Metrics</button>
                 <button class="tab" data-tab="system">System Metrics</button>
+                <button class="tab" data-tab="images">Images</button>
                 <button class="tab" data-tab="configComparison">Compare Configs</button>
                 <button class="tab" data-tab="customPlots">Custom Plots</button>
             </div>
@@ -1843,6 +1889,8 @@ export class MultiRunViewerPanel {
             <div id="configComparison" class="tab-content">
                 ${configComparisonHtml}
             </div>
+
+            ${getImageViewerHtml()}
 
             <div id="customPlots" class="tab-content">
                 <div class="custom-plot-builder">
@@ -1876,7 +1924,7 @@ export class MultiRunViewerPanel {
         <div class="chart-organizer-header">
             <div>
                 <h3>Organize plots</h3>
-                <p>Drag plots to reorder them. Metric prefix groups stay together.</p>
+                <p>Drag plots to reorder them across all metrics in the active tab.</p>
             </div>
             <button type="button" class="btn-small" onclick="closeChartOrganizer()" aria-label="Close plot organizer">×</button>
         </div>
@@ -1894,6 +1942,7 @@ export class MultiRunViewerPanel {
     <script>
         ${getChartScript()}
         ${this._generateChartInitScript(mergedMetrics)}
+        ${getImageViewerScript(this._getImageViewerData())}
     </script>
 </body>
 </html>`;
@@ -2068,14 +2117,9 @@ export class MultiRunViewerPanel {
             return '<div class="no-data">No metrics found</div>';
         }
 
-        // Group metrics by their prefix (like single-run viewer)
-        const groups = this._groupMetrics(metrics);
-
-        return groups.map(group => `
-            <div class="metric-group">
-                <h3>${group.name}</h3>
+        return `
                 <div class="charts-grid">
-                    ${group.metrics.map(metric => `
+                    ${metrics.map((metric, index) => `
                         <div class="chart-container" data-chart-type="${type}" data-metric-name="${this._escapeHtml(metric.metricName)}">
                             <div class="chart-header">
                                 <div class="chart-title">${this._escapeHtml(metric.metricName)}</div>
@@ -2086,7 +2130,7 @@ export class MultiRunViewerPanel {
                                 </div>
                             </div>
                             <div class="chart-wrapper">
-                                <canvas id="chart-${type}-${metric.index}" data-chart-type="${type}" data-chart-index="${metric.index}" data-metric-name="${this._escapeHtml(metric.metricName)}"></canvas>
+                                <canvas id="chart-${type}-${index}" data-chart-type="${type}" data-chart-index="${index}" data-metric-name="${this._escapeHtml(metric.metricName)}"></canvas>
                             </div>
                             <div
                                 class="chart-resize-handle"
@@ -2102,68 +2146,7 @@ export class MultiRunViewerPanel {
                         </div>
                     `).join('')}
                 </div>
-            </div>
-        `).join('');
-    }
-
-    private _groupMetrics(metrics: MergedMetric[]): Array<{ name: string, metrics: Array<MergedMetric & { index: number }> }> {
-        const groups: { [key: string]: Array<MergedMetric & { index: number }> } = {};
-
-        metrics.forEach((metric, index) => {
-            const groupName = this._extractGroupName(metric.metricName);
-            if (!groups[groupName]) {
-                groups[groupName] = [];
-            }
-            groups[groupName].push({ ...metric, index });
-        });
-
-        // Sort groups by priority
-        const sortedGroupNames = Object.keys(groups).sort((a, b) => {
-            const priority = ['loss', 'accuracy', 'lr', 'optim', 'perf', 'time', 'step'];
-            const aIdx = priority.findIndex(p => a.toLowerCase().startsWith(p));
-            const bIdx = priority.findIndex(p => b.toLowerCase().startsWith(p));
-
-            if (aIdx !== -1 && bIdx !== -1) return aIdx - bIdx;
-            if (aIdx !== -1) return -1;
-            if (bIdx !== -1) return 1;
-
-            const aIsGpu = a.toLowerCase().startsWith('gpu');
-            const bIsGpu = b.toLowerCase().startsWith('gpu');
-            if (aIsGpu && bIsGpu) return a.localeCompare(b);
-            if (aIsGpu) return 1;
-            if (bIsGpu) return 1;
-
-            return a.localeCompare(b);
-        });
-
-        return sortedGroupNames.map(name => ({
-            name,
-            metrics: groups[name]
-        }));
-    }
-
-    private _extractGroupName(key: string): string {
-        if (key.includes('/')) {
-            return key.split('/')[0];
-        }
-
-        if (key.includes('.')) {
-            const parts = key.split('.');
-            if (parts[0] === 'gpu' && parts.length >= 3) {
-                return `gpu.${parts[1]}`;
-            }
-            return parts[0];
-        }
-
-        if (key.includes('_')) {
-            const parts = key.split('_');
-            const commonPrefixes = ['train', 'val', 'test', 'eval'];
-            if (commonPrefixes.includes(parts[0])) {
-                return parts[0];
-            }
-        }
-
-        return key;
+        `;
     }
 
     private _generateChartInitScript(mergedMetrics: { training: MergedMetric[], system: MergedMetric[], summary: MergedMetric[] }): string {
@@ -2173,7 +2156,7 @@ export class MultiRunViewerPanel {
             let systemMetrics = ${this._serializeForScript(mergedMetrics.system)};
             let summaryMetrics = ${this._serializeForScript(mergedMetrics.summary)};
             let numericRunConfigs = ${this._serializeForScript(this._getNumericRunConfigs())};
-            const restoredFolderPaths = ${this._serializeForScript(Array.from(this._folderPaths))};
+            let restoredFolderPaths = ${this._serializeForScript(Array.from(this._folderPaths))};
             let activeFullscreenMetric = null;
             let fullscreenRenderToken = 0;
             const MIN_CHART_HEIGHT = 160;
@@ -2375,7 +2358,9 @@ export class MultiRunViewerPanel {
                             if (!grouped) {
                                 grouped = {
                                     runId: groupKey,
-                                    runName: yDataset.runGroup || yDataset.runName,
+                                    runName: groupWandbRuns && yDataset.runGroup
+                                        ? yDataset.runGroup
+                                        : yDataset.runName,
                                     runGroup: yDataset.runGroup,
                                     groupColor: yDataset.groupColor,
                                     color: yDataset.color,
@@ -2466,7 +2451,10 @@ export class MultiRunViewerPanel {
             function updateCustomPlotBuilderOptions() {
                 const metricNames = Array.from(new Set(
                     getCustomSourceMetrics().map(metric => metric.metricName)
-                )).sort((left, right) => left.localeCompare(right));
+                )).sort((left, right) =>
+                    Number(isSummaryMetric(left)) - Number(isSummaryMetric(right)) ||
+                    left.localeCompare(right)
+                );
                 const xMetricNames = Array.from(new Set(
                     trainingMetrics
                         .map(metric => metric.metricName)
@@ -2531,9 +2519,17 @@ export class MultiRunViewerPanel {
 
                 let migratedSummaryPlot = false;
                 customPlotDefinitions = customPlotDefinitions.map(definition => {
+                    // W&B also writes a summary snapshot of ordinary logged
+                    // metrics. Prefer an exact training-series match so legacy
+                    // summary-name migration cannot overwrite the chosen axes.
+                    const hasTrainingYMetric = trainingMetrics.some(
+                        metric => metric.metricName === definition.yMetric
+                    );
                     const summaryMetricName = isSummaryMetric(definition.yMetric)
                         ? definition.yMetric
-                        : isSummaryMetric('summary/' + definition.yMetric)
+                        : !hasTrainingYMetric && definition.xMetric === '_step' &&
+                            !definition.xMultiplierConfig &&
+                            isSummaryMetric('summary/' + definition.yMetric)
                             ? 'summary/' + definition.yMetric
                             : null;
                     if (summaryMetricName && (
@@ -2915,6 +2911,17 @@ export class MultiRunViewerPanel {
             function applyRunListView(shouldPersist = true) {
                 if (!runFilterInput || !runSortSelect || !runList) return;
 
+                const activeRenameInput = document.activeElement?.matches(
+                    '.run-rename-input'
+                )
+                    ? document.activeElement
+                    : null;
+                const renameSelection = activeRenameInput
+                    ? {
+                        start: activeRenameInput.selectionStart,
+                        end: activeRenameInput.selectionEnd
+                    }
+                    : null;
                 const filterText = runFilterInput.value.trim();
                 const filterPattern = globToRegExp(filterText);
                 const sortMode = runSortSelect.value;
@@ -3075,6 +3082,21 @@ export class MultiRunViewerPanel {
                     });
                 }
                 applyRunGroupColors();
+                if (activeRenameInput?.isConnected) {
+                    queueMicrotask(() => {
+                        activeRenameInput.focus();
+                        if (
+                            renameSelection &&
+                            renameSelection.start !== null &&
+                            renameSelection.end !== null
+                        ) {
+                            activeRenameInput.setSelectionRange(
+                                renameSelection.start,
+                                renameSelection.end
+                            );
+                        }
+                    });
+                }
             }
 
             if (runFilterInput && typeof persistedViewState.runFilter === 'string') {
@@ -3613,21 +3635,7 @@ export class MultiRunViewerPanel {
                     );
                     containers.forEach(container => grid.appendChild(container));
                 });
-                ['training', 'system'].forEach(tabId => {
-                    const tab = document.getElementById(tabId);
-                    if (!tab) return;
-                    const groups = Array.from(tab.querySelectorAll(':scope > .metric-group'));
-                    const getGroupRank = group => Math.min(
-                        ...Array.from(group.querySelectorAll('.chart-container')).map(
-                            container => rank.get(getChartOrganizationKey(container)) ??
-                                Number.MAX_SAFE_INTEGER
-                        )
-                    );
-                    groups.sort((left, right) =>
-                        getGroupRank(left) - getGroupRank(right)
-                    );
-                    groups.forEach(group => tab.appendChild(group));
-                });
+
             }
 
             function getActiveChartContainers() {
@@ -3683,8 +3691,6 @@ export class MultiRunViewerPanel {
                     label.className = 'chart-organizer-label';
                     label.textContent = container.querySelector('.chart-title')?.textContent ||
                         container.dataset.metricName || 'Plot';
-                    const group = container.closest('.metric-group')?.querySelector('h3');
-                    if (group) label.title = 'Group: ' + group.textContent;
                     const collapse = document.createElement('input');
                     collapse.type = 'checkbox';
                     collapse.checked = !container.classList.contains('chart-collapsed');
@@ -4039,7 +4045,7 @@ export class MultiRunViewerPanel {
                 }
             }
 
-            function setRunNameInSidebar(runId, runName) {
+            function setRunNameInSidebar(runId, runName, replaceEditor = false) {
                 const runItem = Array.from(
                     document.querySelectorAll('.run-item[data-run-id]')
                 ).find(item => item.dataset.runId === runId);
@@ -4048,6 +4054,12 @@ export class MultiRunViewerPanel {
                 runItem.dataset.runName = runName;
                 const nameElement = runItem.querySelector('.run-name');
                 if (nameElement) {
+                    // Do not let a background update from this or another panel
+                    // replace a draft that the user is still editing.
+                    if (
+                        !replaceEditor &&
+                        nameElement.querySelector('.run-rename-input')
+                    ) return;
                     nameElement.textContent = runName;
                     nameElement.title = runItem.dataset.contentStatus === 'empty'
                         ? runName + '\\nThis run is empty (no run metrics have values; system metrics do not count).'
@@ -4055,7 +4067,12 @@ export class MultiRunViewerPanel {
                 }
             }
 
-            function beginInlineRunRename(runId) {
+            function beginInlineRunRename(runId, restoredDraft = null) {
+                const existingInput = document.querySelector('.run-rename-input');
+                if (existingInput) {
+                    existingInput.focus();
+                    return;
+                }
                 const runItem = Array.from(
                     document.querySelectorAll('.run-item[data-run-id]')
                 ).find(item => item.dataset.runId === runId);
@@ -4067,11 +4084,38 @@ export class MultiRunViewerPanel {
                 input.type = 'text';
                 input.className = 'run-rename-input';
                 input.maxLength = 200;
-                input.value = previousName;
+                input.value = restoredDraft?.runId === runId &&
+                    typeof restoredDraft.value === 'string'
+                    ? restoredDraft.value.slice(0, 200)
+                    : previousName;
                 input.setAttribute('aria-label', 'Custom run name');
+                input.title = 'Press Enter to save or Escape to cancel';
                 nameElement.replaceChildren(input);
                 input.focus();
-                input.select();
+                if (
+                    restoredDraft?.runId === runId &&
+                    Number.isInteger(restoredDraft.selectionStart) &&
+                    Number.isInteger(restoredDraft.selectionEnd)
+                ) {
+                    input.setSelectionRange(
+                        Math.min(restoredDraft.selectionStart, input.value.length),
+                        Math.min(restoredDraft.selectionEnd, input.value.length)
+                    );
+                } else {
+                    input.select();
+                }
+
+                const persistDraft = () => {
+                    updatePersistedViewState({
+                        runRenameDraft: {
+                            runId,
+                            value: input.value,
+                            selectionStart: input.selectionStart,
+                            selectionEnd: input.selectionEnd
+                        }
+                    });
+                };
+                persistDraft();
 
                 let finished = false;
                 const finish = save => {
@@ -4081,7 +4125,8 @@ export class MultiRunViewerPanel {
                     const displayName = save
                         ? requestedName || runItem.dataset.originalRunName || previousName
                         : previousName;
-                    setRunNameInSidebar(runId, displayName);
+                    updatePersistedViewState({ runRenameDraft: null });
+                    setRunNameInSidebar(runId, displayName, true);
                     if (save) {
                         applyRunListView();
                         vscode.postMessage({
@@ -4092,16 +4137,33 @@ export class MultiRunViewerPanel {
                     }
                 };
                 input.addEventListener('click', event => event.stopPropagation());
+                input.addEventListener('input', persistDraft);
+                input.addEventListener('select', persistDraft);
                 input.addEventListener('keydown', event => {
                     if (event.key === 'Enter') {
                         event.preventDefault();
+                        event.stopPropagation();
                         finish(true);
                     } else if (event.key === 'Escape') {
                         event.preventDefault();
+                        event.stopPropagation();
                         finish(false);
                     }
                 });
-                input.addEventListener('blur', () => finish(true));
+            }
+
+            const savedRunRenameDraft = persistedViewState.runRenameDraft;
+            if (
+                savedRunRenameDraft &&
+                typeof savedRunRenameDraft === 'object' &&
+                typeof savedRunRenameDraft.runId === 'string' &&
+                typeof savedRunRenameDraft.value === 'string' &&
+                savedRunRenameDraft.value.length <= 200
+            ) {
+                queueMicrotask(() => beginInlineRunRename(
+                    savedRunRenameDraft.runId,
+                    savedRunRenameDraft
+                ));
             }
 
             document.addEventListener('click', event => {
@@ -4240,6 +4302,10 @@ export class MultiRunViewerPanel {
                 chart.options.plugins.decimation.enabled = maxPoints > 500;
                 chart.data.datasets = datasets;
                 applyRunVisibility(chart, runVisibility);
+                if (datasets.length === 0) {
+                    chart.update('none');
+                    return;
+                }
 
                 const smoothing = isModal
                     ? parseFloat(document.getElementById('modalSmoothing').value)
@@ -4473,24 +4539,147 @@ export class MultiRunViewerPanel {
                 applyRunListView(false);
             }
 
-            function updateMergedMetrics(mergedMetrics) {
+            function preserveViewerScroll() {
+                const snapshots = [document.scrollingElement,
+                    ...document.querySelectorAll('.main-content, .sidebar-content')]
+                    .filter(element => element && element.clientHeight > 0 &&
+                        element.scrollHeight > element.clientHeight)
+                    .map(element => {
+                        const top = element === document.scrollingElement
+                            ? 0 : element.getBoundingClientRect().top;
+                        const anchor = Array.from(element.querySelectorAll('.chart-container, .run-item'))
+                            .find(item => item.getClientRects().length > 0 &&
+                                item.getBoundingClientRect().bottom > top &&
+                                item.getBoundingClientRect().top < top + element.clientHeight);
+                        return { element, scrollTop: element.scrollTop, anchor,
+                            anchorTop: anchor?.getBoundingClientRect().top };
+                    });
+                return () => snapshots.forEach(snapshot => {
+                    if (snapshot.anchor?.isConnected) {
+                        snapshot.element.scrollTop +=
+                            snapshot.anchor.getBoundingClientRect().top - snapshot.anchorTop;
+                    } else {
+                        snapshot.element.scrollTop = snapshot.scrollTop;
+                    }
+                });
+            }
+
+            function reconcileOverviewCharts(type, html) {
+                if (typeof html !== 'string') return;
+                const tab = document.getElementById(type);
+                if (!tab) return;
+                const template = document.createElement('template');
+                template.innerHTML = html;
+                const incoming = Array.from(template.content.querySelectorAll('.chart-container'));
+                const names = new Set(incoming.map(item => item.dataset.metricName));
+                let grid = tab.querySelector('.charts-grid');
+                if (!grid && incoming.length > 0) {
+                    tab.querySelector('.no-data')?.remove();
+                    grid = document.createElement('div');
+                    grid.className = 'charts-grid';
+                    tab.appendChild(grid);
+                }
+                const existing = new Map(Array.from(tab.querySelectorAll('.chart-container'))
+                    .map(item => [item.dataset.metricName, item]));
+                existing.forEach((container, name) => {
+                    if (names.has(name)) return;
+                    const canvas = container.querySelector('canvas');
+                    if (canvas) {
+                        chartObserver.unobserve(canvas);
+                        const chart = chartInstances[canvas.id];
+                        captureChartViewState(chart);
+                        delete chartInstances[canvas.id];
+                        destroyChartSafely(chart);
+                    }
+                    container.remove();
+                });
+                incoming.forEach(container => {
+                    if (existing.has(container.dataset.metricName)) return;
+                    const canvas = container.querySelector('canvas');
+                    // Incoming indices can collide with retained canvases after
+                    // the metric set changes; identity remains type + metric.
+                    canvas.id = 'chart-' + type + '-live-' + (++nextLiveChartId);
+                    grid.appendChild(container);
+                    initializeChartResize(container);
+                    initializeChartOrganization(container);
+                    if (!container.classList.contains('chart-collapsed')) chartObserver.observe(canvas);
+                });
+                if (incoming.length === 0) {
+                    grid?.remove();
+                    if (!tab.querySelector('.no-data')) {
+                        const empty = document.createElement('div');
+                        empty.className = 'no-data';
+                        empty.textContent = 'No metrics found';
+                        tab.appendChild(empty);
+                    }
+                }
+                applyChartOrganization();
+                filterMetrics();
+            }
+
+            function updateSidebarRuns(message) {
+                if (typeof message.runListHtml !== 'string') return;
+                const template = document.createElement('template');
+                template.innerHTML = message.runListHtml;
+                const incoming = Array.from(template.content.querySelectorAll('.run-item'));
+                const ids = new Set(incoming.map(item => item.dataset.runId));
+                const existing = new Map(Array.from(runList.querySelectorAll('.run-item'))
+                    .map(item => [item.dataset.runId, item]));
+                existing.forEach((item, id) => { if (!ids.has(id)) item.remove(); });
+                incoming.forEach(item => {
+                    const previous = existing.get(item.dataset.runId);
+                    if (!previous) {
+                        runList.appendChild(item);
+                        return;
+                    }
+                    Object.assign(previous.dataset, item.dataset);
+                    if (!previous.classList.contains('selection-loading')) {
+                        previous.querySelector('input[type="checkbox"]').checked =
+                            item.querySelector('input[type="checkbox"]').checked;
+                    }
+                    previous.classList.toggle('empty-run', item.classList.contains('empty-run'));
+                    previous.classList.toggle('running-run', item.classList.contains('running-run'));
+                    setRunNameInSidebar(item.dataset.runId, item.dataset.runName);
+                    const swatch = previous.querySelector('.run-color');
+                    swatch.value = item.querySelector('.run-color').value;
+                    previous.querySelector('.run-meta').replaceChildren(
+                        ...item.querySelector('.run-meta').childNodes
+                    );
+                });
+                const heading = document.getElementById('runCountHeading');
+                if (heading) heading.textContent = 'Runs (' + incoming.length + ')';
+                if (Array.isArray(message.folderPaths)) {
+                    restoredFolderPaths = message.folderPaths.filter(value => typeof value === 'string');
+                }
+                applyRunListView(false);
+                applyFocusedRun(focusedRunId, false);
+                persistRestorablePanelState();
+            }
+
+            let nextLiveChartId = 0;
+
+            function updateMergedMetrics(mergedMetrics, chartHtml) {
                 trainingMetrics = mergedMetrics.training || [];
                 systemMetrics = mergedMetrics.system || [];
                 summaryMetrics = mergedMetrics.summary || [];
+                customMetrics = customPlotDefinitions.map(buildCustomMetric);
+                updateCustomPlotBuilderOptions();
+                if (chartHtml) {
+                    reconcileOverviewCharts('training', chartHtml.training);
+                    reconcileOverviewCharts('system', chartHtml.system);
+                }
 
                 Object.entries(chartInstances).forEach(([canvasId, chart]) => {
                     const canvas = document.getElementById(canvasId);
                     if (!canvas) return;
-                    if (canvas.dataset.chartType === 'custom') return;
-
                     const metrics = getMetricsForType(canvas.dataset.chartType);
                     const metric = metrics.find(
-                        candidate => candidate.metricName === canvas.dataset.metricName
+                        candidate => canvas.dataset.chartType === 'custom'
+                            ? candidate.customPlotId === canvas.dataset.chartStateKey
+                            : candidate.metricName === canvas.dataset.metricName
                     );
                     updateChartData(chart, metric, false);
                 });
-
-                renderCustomPlots();
 
                 if (modalChart && activeFullscreenMetric) {
                     const metrics = getMetricsForType(activeFullscreenMetric.type);
@@ -4505,6 +4694,26 @@ export class MultiRunViewerPanel {
                         updateChartData(modalChart, metric, true);
                     }
                 }
+            }
+
+            function updateRunNamesInCharts(runNames) {
+                if (!runNames || typeof runNames !== 'object') return;
+                const charts = [...Object.values(chartInstances)];
+                if (modalChart) charts.push(modalChart);
+
+                charts.forEach(chart => {
+                    let changed = false;
+                    chart.data.datasets.forEach(dataset => {
+                        const runName = runNames[dataset._runId];
+                        if (typeof runName !== 'string') return;
+                        dataset.label = dataset._isRaw
+                            ? runName + ' (raw)'
+                            : runName;
+                        dataset._runName = runName;
+                        changed = true;
+                    });
+                    if (changed) chart.update('none');
+                });
             }
 
             function updateSelectionDetails(message) {
@@ -4542,85 +4751,99 @@ export class MultiRunViewerPanel {
 
             window.addEventListener('message', event => {
                 const message = event.data;
-                if (message.command === 'chartColumnsUpdated') {
-                    updateChartColumnLayout(message.columns);
-                    return;
-                }
-                if (message.runLastModified) {
-                    updateRunActivityIndicators(message.runLastModified);
-                }
-                if (message.command === 'runSelectionAcknowledged') {
-                    setOptimisticRunSelection(message.runId, message.selected === true);
-                    if (message.accepted !== true) {
+                if (!message || typeof message !== 'object') return;
+                const restoreScroll = preserveViewerScroll();
+                try {
+                    if (message.command === 'chartColumnsUpdated') {
+                        updateChartColumnLayout(message.columns);
+                        return;
+                    }
+                    if (message.runLastModified) {
+                        updateRunActivityIndicators(message.runLastModified);
+                    }
+                    if (message.command === 'runSelectionAcknowledged') {
+                        setOptimisticRunSelection(message.runId, message.selected === true);
+                        if (message.accepted !== true) {
+                            document.querySelectorAll('.run-item.selection-loading')
+                                .forEach(item => item.classList.remove('selection-loading'));
+                        }
+                    }
+                    if (
+                        message.command === 'bulkRunSelectionAcknowledged' &&
+                        Array.isArray(message.selectedRunIds)
+                    ) {
+                        setOptimisticBulkSelection(message.selectedRunIds);
+                    }
+                    if (message.command === 'runSelectionRefreshComplete') {
                         document.querySelectorAll('.run-item.selection-loading')
                             .forEach(item => item.classList.remove('selection-loading'));
                     }
-                }
-                if (
-                    message.command === 'bulkRunSelectionAcknowledged' &&
-                    Array.isArray(message.selectedRunIds)
-                ) {
-                    setOptimisticBulkSelection(message.selectedRunIds);
-                }
-                if (message.command === 'runSelectionRefreshComplete') {
-                    document.querySelectorAll('.run-item.selection-loading')
-                        .forEach(item => item.classList.remove('selection-loading'));
-                }
-                if (message.runContentStatuses) {
-                    updateRunContentStatuses(message.runContentStatuses);
-                }
-                if (
-                    message.numericRunConfigs &&
-                    typeof message.numericRunConfigs === 'object'
-                ) {
-                    numericRunConfigs = message.numericRunConfigs;
-                }
-                if (message.command === 'runSelectionDataUpdated') {
-                    updateSelectionDetails(message);
-                }
-                if (
-                    message.command === 'runNamesUpdated' &&
-                    message.runNames &&
-                    typeof message.runNames === 'object'
-                ) {
-                    Object.entries(message.runNames).forEach(([runId, runName]) => {
-                        if (typeof runName === 'string') {
-                            setRunNameInSidebar(runId, runName);
-                        }
-                    });
-                    applyRunListView(false);
-                    updateSelectionDetails(message);
-                }
-                if (message.command === 'runNameUpdateRejected') {
-                    setRunNameInSidebar(message.runId, message.runName);
-                    if (typeof message.message === 'string') {
-                        vscode.postMessage({
-                            command: 'showWarning',
-                            message: message.message
-                        });
+                    if (message.runContentStatuses) {
+                        updateRunContentStatuses(message.runContentStatuses);
                     }
-                    return;
-                }
-                if (
-                    (
-                        message.command !== 'runDataUpdated' &&
-                        message.command !== 'runColorsUpdated' &&
-                        message.command !== 'runSelectionDataUpdated' &&
-                        message.command !== 'runNamesUpdated'
-                    ) ||
-                    !message.mergedMetrics
-                ) {
-                    return;
-                }
+                    if (
+                        message.numericRunConfigs &&
+                        typeof message.numericRunConfigs === 'object'
+                    ) {
+                        numericRunConfigs = message.numericRunConfigs;
+                    }
+                    if (message.command === 'runListUpdated') {
+                        updateSidebarRuns(message);
+                    }
+                    if (message.command === 'runSelectionDataUpdated' ||
+                        message.command === 'runListUpdated') {
+                        updateSelectionDetails(message);
+                    }
+                    if (
+                        message.command === 'runNamesUpdated' &&
+                        message.runNames &&
+                        typeof message.runNames === 'object'
+                    ) {
+                        Object.entries(message.runNames).forEach(([runId, runName]) => {
+                            if (typeof runName === 'string') {
+                                setRunNameInSidebar(runId, runName);
+                            }
+                        });
+                        applyRunListView(false);
+                        updateSelectionDetails(message);
+                    }
+                    if (message.command === 'runNameUpdateRejected') {
+                        setRunNameInSidebar(message.runId, message.runName);
+                        if (typeof message.message === 'string') {
+                            vscode.postMessage({
+                                command: 'showWarning',
+                                message: message.message
+                            });
+                        }
+                        return;
+                    }
+                    if (
+                        (
+                            message.command !== 'runDataUpdated' &&
+                            message.command !== 'runListUpdated' &&
+                            message.command !== 'runColorsUpdated' &&
+                            message.command !== 'runSelectionDataUpdated' &&
+                            message.command !== 'runNamesUpdated'
+                        ) ||
+                        !message.mergedMetrics
+                    ) {
+                        return;
+                    }
 
-                if (message.command === 'runColorsUpdated') {
-                    updateRunColorSwatches(
-                        message.runColors,
-                        message.runGroupColors,
-                        message.customRunColorIds
-                    );
+                    if (message.command === 'runColorsUpdated') {
+                        updateRunColorSwatches(
+                            message.runColors,
+                            message.runGroupColors,
+                            message.customRunColorIds
+                        );
+                    }
+                    updateMergedMetrics(message.mergedMetrics, message.chartHtml);
+                    if (message.command === 'runNamesUpdated') {
+                        updateRunNamesInCharts(message.runNames);
+                    }
+                } finally {
+                    restoreScroll();
                 }
-                updateMergedMetrics(message.mergedMetrics);
             });
 
             // Fullscreen modal

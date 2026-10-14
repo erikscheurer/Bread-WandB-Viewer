@@ -2,9 +2,12 @@
 .vscode-test/**
 .github/**
 scripts/**
+docs/**
 src/**
 AGENTS.md
 test-ai-context.js
+test-chart-interactions.js
+test-logged-images.js
 .gitignore
 tsconfig.json
 *.vsix

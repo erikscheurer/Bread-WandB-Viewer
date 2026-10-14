@@ -5,6 +5,7 @@
 import { WandbConfig } from '../wandbParser';
 import { ConfigComparison } from './types';
 import { formatNumber } from './formatNumber';
+import { flattenConfig } from '../configUtils';
 
 /**
  * Compare configurations across multiple runs
@@ -17,7 +18,7 @@ export function compareConfigs(runConfigs: Map<string, WandbConfig>): ConfigComp
 
     // Collect all keys and values per run
     for (const [runId, config] of runConfigs) {
-        for (const [key, value] of Object.entries(config)) {
+        for (const [key, value] of Object.entries(flattenConfig(config))) {
             allKeys.add(key);
             if (!keyValues.has(key)) {
                 keyValues.set(key, new Map());
@@ -26,8 +27,8 @@ export function compareConfigs(runConfigs: Map<string, WandbConfig>): ConfigComp
         }
     }
 
-    const common: Record<string, any> = {};
-    const differences: Record<string, Record<string, any>> = {};
+    const common: Record<string, any> = Object.create(null);
+    const differences: Record<string, Record<string, any>> = Object.create(null);
 
     // Categorize each parameter
     for (const key of allKeys) {

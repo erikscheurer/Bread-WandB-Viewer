@@ -9,6 +9,7 @@ import { compareConfigs, formatCommonParams, formatDifferences } from './ConfigD
 import { summarizeMetric, formatMetricSummary, generateCSV, groupMetricsByPrefix } from './MetricSummarizer';
 import { formatNumber } from './formatNumber';
 import * as path from 'path';
+import { flattenConfig } from '../configUtils';
 
 /**
  * Generate AI-optimized context from selected W&B runs
@@ -171,7 +172,7 @@ function formatConfigComparison(runs: RunScanResult[], parsedData: Map<string, W
  * Format single run configuration
  */
 function formatSingleConfig(config: Record<string, any>): string {
-    const entries = Object.entries(config);
+    const entries = Object.entries(flattenConfig(config));
 
     if (entries.length === 0) {
         return '*No configuration parameters*\n';

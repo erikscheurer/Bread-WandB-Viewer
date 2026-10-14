@@ -1,8 +1,8 @@
 {
   "name": "wandb-viewer",
   "displayName": "Bread Wandb Viewer",
-  "description": "View Weights & Biases run metrics and logs directly in VS Code",
-  "version": "0.3.9",
+  "description": "View Weights & Biases run metrics, logged images over time, and logs directly in VS Code",
+  "version": "0.3.10",
   "publisher": "bread-tech",
   "icon": "media/icon.png",
   "repository": {
@@ -204,6 +204,8 @@
     "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
+    "test:charts": "node test-chart-interactions.js",
+    "test:images": "node test-logged-images.js",
     "lint": "eslint src --ext ts",
     "package:vsix": "bash scripts/package-vsix.sh"
   },

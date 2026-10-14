@@ -1,6 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as protobuf from 'protobufjs';
+import { isImageMetadataField, LoggedImageHistory, readHistoryImages } from './loggedImages';
 
 export interface MetricPoint {
     step: number;
@@ -26,6 +27,7 @@ export interface WandbRunData {
     config: WandbConfig;
     metrics: WandbMetrics;
     systemMetrics: WandbMetrics;
+    images?: LoggedImageHistory;
     metadata?: any;
 }
 
@@ -470,6 +472,9 @@ export function parseWandbFile(filePath: string): WandbRunData {
 
     // Post-process: clean up and organize data
     postProcessRunData(runData);
+    for (const frames of Object.values(runData.images || {})) {
+        frames.sort((a, b) => a.step - b.step);
+    }
 
     return runData;
 }
@@ -521,6 +526,7 @@ export async function hasWandbMetricData(
             const step = history.step?.num !== undefined
                 ? Number(history.step.num)
                 : 0;
+            const imageHistory = readHistoryImages(history.item, step);
             for (const item of history.item) {
                 const key = item.key || (
                     Array.isArray(item.nested_key) && item.nested_key.length > 0
@@ -537,12 +543,8 @@ export async function hasWandbMetricData(
                     continue;
                 }
 
-                let value: unknown;
-                try {
-                    value = JSON.parse(item.value_json);
-                } catch {
-                    continue;
-                }
+                if (isImageMetadataField(key, imageHistory.mediaKeys)) continue;
+                const value = imageHistory.values.get(key);
                 if (typeof value !== 'number' || !Number.isFinite(value)) {
                     continue;
                 }
@@ -736,6 +738,12 @@ function parseProtobufRecord(data: Buffer, runData: WandbRunData): void {
         const step = history.step?.num ? Number(history.step.num) : 0;
 
         if (history.item && Array.isArray(history.item)) {
+            const imageHistory = readHistoryImages(history.item, step);
+            for (const [key, frame] of imageHistory.frames) {
+                runData.images = runData.images || Object.create(null);
+                const frames = runData.images![key] || (runData.images![key] = []);
+                frames.push(frame);
+            }
             for (const item of history.item) {
                 // Key can be in 'key' field or in 'nested_key' array
                 const key = item.key || (item.nested_key && item.nested_key.length > 0 ? item.nested_key.join('/') : '');
@@ -745,9 +753,10 @@ function parseProtobufRecord(data: Buffer, runData: WandbRunData): void {
 
                 // Skip internal wandb fields
                 if (key === '_step' || key === '_runtime' || key === '_timestamp') continue;
+                if (isImageMetadataField(key, imageHistory.mediaKeys)) continue;
 
                 try {
-                    const value = JSON.parse(valueJson);
+                    const value = imageHistory.values.get(key);
                     if (typeof value === 'number' && !isNaN(value)) {
                         // All HistoryRecord items are user-logged, so they go to metrics
                         if (!runData.metrics[key]) {

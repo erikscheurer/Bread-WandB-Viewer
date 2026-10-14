@@ -28,12 +28,14 @@ version adds:
 - **Reliable live runs** — active `.wandb` files refresh without being starved by
   continuous writes; missed changes are detected by polling; parsing pauses while
   the panel is hidden and catches up when it becomes visible.
+  Existing charts keep the last successful run data until refreshed parsing
+  succeeds, including when a file is temporarily unreadable.
 - **Run discovery and manual refresh** — newly created runs are found
   periodically or on demand, and displayed runs can be reloaded without rebuilding
   the webview.
 - **Responsive run selection** — sidebar checkboxes update immediately while rapid
-  changes are coalesced; selections with the same metric structure update the
-  existing webview instead of reloading the document.
+  changes are coalesced; selection changes update the existing webview, including
+  when the set of plotted metrics changes.
 - **State-preserving chart updates** — refreshes retain zoom, smoothing, log axes,
   run visibility, active tabs, filters, sidebar size, and fullscreen state.
   Fullscreen charts reopen reliably while keeping legend visibility synchronized
@@ -43,7 +45,8 @@ version adds:
 - **Improved chart interaction** — X-range and box zoom, two-axis panning,
   Ctrl+scroll cursor zoom, collapsible and reorderable chart rows, resizable chart
   heights, visibility-preserving legend isolation, linked run highlighting, and
-  cursor-sorted tooltips with the step taken from the nearest plotted point.
+  cursor-sorted tooltips with a stable position and the step taken from the
+  nearest plotted point.
 - **Better run comparison** — side-by-side configuration comparison with search,
   independent run-row and parameter-column sorting, plus glob run filtering and
   sorting by name, creation time, or latest update.
@@ -67,7 +70,18 @@ version adds:
 - **Derived custom plots** — graph one logged metric against another and scale
   either axis by each run's numeric training-configuration value. Numeric W&B
   summary fields are available only as Y metrics and automatically use `_step`
-  as their X axis.
+  as their X axis. For loss versus images seen, open **Custom Plots**, choose
+  the logged images-seen metric for X and loss for Y, then create the plot.
+  Points are joined within each run by training step, with interpolation between
+  logged X values and no extrapolation beyond their recorded range.
+  Logged training metrics keep their full series even when W&B also records a
+  summary of the same metric; choose `summary/…` explicitly for a summary plot.
+- **Accurate hover values** — each run contributes its nearest sample at the
+  pointer's X position; runs outside their recorded range are omitted. Smoothed
+  tooltips show the matching raw value in parentheses when the raw overlay is on.
+- **Nested config comparison** — object parameters such as
+  `optimizer: {schedule: {lr: 0.001}}` appear as `optimizer.schedule.lr`, including
+  in AI exports and numeric custom-plot multipliers. Arrays remain whole values.
 
 A run is considered empty when none of its run/training metrics contain values.
 System telemetry by itself does not make a run non-empty.
@@ -76,13 +90,14 @@ System telemetry by itself does not make a run non-empty.
 
 ## Features
 
+- 🖼️ **Logged Images Over Time** - Browse local images and image batches with a training-step slider; compare selected runs at the same step.
 - 🔄 **Multi-Run Comparison** - Overlay multiple runs on the same charts with color coding and interactive toggles
 - 🤖 **AI Context Export** - One-click markdown export for Claude Code, Cursor, and Codex with token counting
 - 🎯 **Interactive Charts** - Zoom, pan, fullscreen, smoothing, plot reload, and chart copy
 - 📂 **Automatic File Watching** - Extension detects new .wandb files and refreshes automatically
 - 📊 **System Metrics** - GPU utilization, memory, CPU, disk I/O tracking
 - 🔍 **Metadata Comparison** - Side-by-side config and hyperparameter diff highlighting
-- 🎨 **Smart Grouping** - Metrics auto-organized by prefix (loss/, train/, val/, gpu.0/)
+- ☷ **Plot Organization** - Collapse and reorder plots freely across metric prefixes
 - 🔒 **Local Run Parsing** - Direct `.wandb` parsing with protobuf, without the W&B API or CLI
 - ☁ **Optional Explicit Sync** - Upload selected local runs with an installed W&B CLI after confirmation
 - 🎛️ **Advanced Controls** - Log scales, raw data overlay toggle, adjustable smoothing
@@ -91,6 +106,33 @@ System telemetry by itself does not make a run non-empty.
 ---
 
 ## Quick Start
+
+### Viewing logged images
+
+Open a `.wandb` file or a multi-run comparison and choose **Images**. Select an
+image key, then drag the step slider or use the previous/next buttons to browse
+recorded steps. Image batches appear as a gallery with captions. Comparisons show
+each selected run's most recent images at or before the chosen step, labeled with
+their actual logged step and timestamp when available.
+
+The viewer reads `wandb.Image` and image-list references from local run history,
+including nested keys. Keep the run's `files/media/images/` directory beside its
+`.wandb` file; the binary log contains references, not image pixels. Missing files
+show a placeholder. Nested image folders such as `media/images/validation/` and
+W&B's `latest-run` symlink are supported.
+Images and numeric metrics can share a prefix such as `validation/retrieval`
+without hiding the metric charts.
+When moving between steps, the current gallery stays visible until the next
+images finish loading and decoding, then switches without a blank frame.
+The slider keeps its width while loading and when the step counter changes.
+Image controls stay visible below the chart toolbar while scrolling the gallery.
+**Reload images** retries loading local files. The selected
+key and step are remembered, and staying on the latest step follows live updates.
+Images load only when the Images tab is open. Artifact-only references, W&B tables,
+segmentation masks, and bounding-box overlays are not supported.
+
+An image-only run still counts as empty for the sidebar's metric-based **Hide
+empty** filter; turn that filter off to select it.
 
 ### Installation
 
@@ -132,6 +174,8 @@ identifier, installing this VSIX replaces an installed upstream copy.
 ```bash
 npm install
 npm run compile
+node test-ai-context.js
+npm run test:charts
 npm run package:vsix -- /tmp/wandb-viewer-local.vsix
 code --install-extension /tmp/wandb-viewer-local.vsix --force
 ```
@@ -210,7 +254,8 @@ binary log. The run context menu can assign a custom display name instead. These
 aliases are keyed by run ID in VS Code's extension-global storage, survive viewer
 reloads, and never modify the run file. Submit an empty custom name to restore the
 original name. Renaming uses an immediate inline field in the sidebar, so it does
-not wait for an extension-host dialog or rebuild the chart webview.
+not wait for an extension-host dialog or rebuild the chart webview. Press Enter
+to save or Escape to cancel; unfinished drafts survive background refreshes.
 
 Click a run's color swatch in the comparison sidebar to choose a custom color.
 Custom colors are keyed by run ID in VS Code's extension-global storage, so they
@@ -302,7 +347,9 @@ and refreshes changed run data at a throttled interval. Continually written runs
 therefore keep updating without waiting for training to stop.
 
 - Existing charts update in place, preserving zoom, log axes, smoothing, and
-  fullscreen state
+  fullscreen state and keeping your scroll position
+- New metrics and newly discovered runs update the current viewer without
+  reloading the page; custom plots retain their canvases and chart controls
 - A run that starts empty creates its overview charts as soon as its first metric
   values are written
 - Initially unselected runs are classified in the background with a lightweight,

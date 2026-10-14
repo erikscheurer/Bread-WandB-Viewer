@@ -744,12 +744,75 @@ export function getChartScript(): string {
             }
         };
 
-        function getChartPointerPosition(chart, event) {
-            const rect = chart.canvas.getBoundingClientRect();
+        // Chart.js' default tooltip anchor averages the active elements. Runs
+        // sampled at different steps can therefore make the entire tooltip jump
+        // even while the pointer moves smoothly. Keep the box in one predictable
+        // corner; the highlighted row and values still follow the cursor.
+        Chart.Tooltip.positioners.stableTopRight = function() {
+            const area = this.chart.chartArea;
+            return {
+                x: area.right,
+                y: area.top,
+                xAlign: 'right',
+                yAlign: 'top'
+            };
+        };
+
+        // Index mode pairs unrelated samples when runs have different lengths or
+        // logging frequencies. Find each run's closest sample on the shared X
+        // scale instead, and omit runs outside their recorded range.
+        Chart.Interaction.modes.runX = function(chart, event, _options, useFinalPosition) {
+            const position = Chart.helpers.getRelativePosition(event, chart);
+            if (!isPointInChartArea(chart, position)) return [];
+
+            const pointerX = chart.scales.x.getValueForPixel(position.x);
+            const items = [];
+            chart.getSortedVisibleDatasetMetas().forEach(meta => {
+                const dataset = chart.data.datasets[meta.index];
+                if (dataset._isRaw || meta.data.length === 0) return;
+
+                const firstX = meta.controller.getParsed(0).x;
+                const lastX = meta.controller.getParsed(meta.data.length - 1).x;
+                if (pointerX < firstX || pointerX > lastX) return;
+
+                let low = 0;
+                let high = meta.data.length;
+                while (low < high) {
+                    const middle = Math.floor((low + high) / 2);
+                    if (meta.controller.getParsed(middle).x < pointerX) low = middle + 1;
+                    else high = middle;
+                }
+                let nearestIndex = -1;
+                let nearestDistance = Infinity;
+                [low - 1, low].forEach(index => {
+                    const element = meta.data[index];
+                    if (!element || element.skip) return;
+                    const point = element.getProps(['x', 'y'], useFinalPosition);
+                    if (!Number.isFinite(point.x) || !Number.isFinite(point.y)) return;
+                    const distance = Math.abs(point.x - position.x);
+                    if (distance < nearestDistance) {
+                        nearestIndex = index;
+                        nearestDistance = distance;
+                    }
+                });
+                if (nearestIndex >= 0) {
+                    items.push({
+                        element: meta.data[nearestIndex],
+                        datasetIndex: meta.index,
+                        index: nearestIndex
+                    });
+                }
+            });
+            return items;
+        };
+
+        function getChartPointerPosition(chart, event, constrain = false) {
+            const point = Chart.helpers.getRelativePosition(event, chart);
+            if (!constrain) return point;
             const area = chart.chartArea;
             return {
-                x: Math.min(area.right, Math.max(area.left, event.clientX - rect.left)),
-                y: Math.min(area.bottom, Math.max(area.top, event.clientY - rect.top))
+                x: Math.min(area.right, Math.max(area.left, point.x)),
+                y: Math.min(area.bottom, Math.max(area.top, point.y))
             };
         }
 
@@ -895,7 +958,7 @@ export function getChartScript(): string {
                 if (!pointerDown) return;
 
                 if (gesture && event.type !== 'pointercancel') {
-                    pendingGesturePoint = getChartPointerPosition(chart, event);
+                    pendingGesturePoint = getChartPointerPosition(chart, event, true);
                     if (gestureFrame !== null) {
                         cancelAnimationFrame(gestureFrame);
                         gestureFrame = null;
@@ -987,7 +1050,7 @@ export function getChartScript(): string {
             const onPointerMove = event => {
                 if (!pointerDown) return;
 
-                const point = getChartPointerPosition(chart, event);
+                const point = getChartPointerPosition(chart, event, true);
                 if (!gesture) {
                     const distance = Math.hypot(
                         point.x - pointerDown.point.x,
@@ -1018,6 +1081,7 @@ export function getChartScript(): string {
             };
 
             const onDoubleClick = event => {
+                if (!isPointInChartArea(chart, getChartPointerPosition(chart, event))) return;
                 chart.resetZoom('none');
                 captureChartViewState(chart);
                 event.preventDefault();
@@ -1275,22 +1339,19 @@ export function getChartScript(): string {
                     tooltipRunHighlightPlugin
                 ],
                 options: {
-                    parsing: {
-                        xAxisKey: 'x',
-                        yAxisKey: 'y'
-                    },
-                    decimation: maxPoints > 500 ? {
-                        enabled: true,
-                        algorithm: 'lttb',
-                        samples: 250,
-                        threshold: 500
-                    } : {
-                        enabled: false
-                    },
+                    // All constructors already supply sorted numeric {x, y}
+                    // points. Decimation requires parsing to be disabled.
+                    parsing: false,
                     responsive: true,
                     maintainAspectRatio: false,
-                    interaction: { intersect: false, mode: 'index' },
+                    interaction: { intersect: false, mode: 'runX' },
                     plugins: {
+                        decimation: {
+                            enabled: maxPoints > 500,
+                            algorithm: 'lttb',
+                            samples: 250,
+                            threshold: 500
+                        },
                         legend: {
                             display: true,
                             position: 'top',
@@ -1405,6 +1466,7 @@ export function getChartScript(): string {
                             }
                         },
                         tooltip: {
+                            position: 'stableTopRight',
                             itemSort: function(first, second) {
                                 return Number(second.parsed.y) - Number(first.parsed.y);
                             },
@@ -1452,9 +1514,11 @@ export function getChartScript(): string {
                                     const rawDataset = context.chart.data.datasets.find(dataset => {
                                     return dataset._isRaw && datasetHasRunKey(dataset, runKey);
                                     });
-                                    const rawPoint = rawDataset && rawDataset.data[context.dataIndex];
-                                    const rawValue = rawPoint && typeof rawPoint === 'object'
-                                        ? Number(rawPoint.y)
+                                    // Keep the source value on each smoothed point:
+                                    // decimation and duplicate X values make array
+                                    // indices or X-only lookups ambiguous.
+                                    const rawValue = rawDataset && context.raw
+                                        ? Number(context.raw._rawY)
                                         : NaN;
                                     const rawSuffix = Number.isFinite(rawValue)
                                         ? ' (' + formatValue(rawValue) + ')'
@@ -1542,6 +1606,10 @@ export function getChartScript(): string {
                 // Chart.js clears chart.canvas before running afterDestroy hooks.
                 // Keep the original canvas reference so cleanup remains safe.
                 hoverCanvas.removeEventListener('mouseleave', onChartMouseLeave);
+                if (chart.$legendClickTimer) {
+                    clearTimeout(chart.$legendClickTimer);
+                    chart.$legendClickTimer = null;
+                }
                 chart.$hoverInteractionCleanup = null;
             };
 
@@ -1622,7 +1690,11 @@ export function getChartScript(): string {
 
                     newDatasets.push({
                         label: d._runName,
-                        data: smoothed.map((y, i) => ({ x: d._originalData[i].x, y })),
+                        data: smoothed.map((y, i) => ({
+                            x: d._originalData[i].x,
+                            y,
+                            _rawY: d._originalData[i].y
+                        })),
                         borderColor: d._originalColor,
                         backgroundColor: d._originalColor + '20',
                         fill: false,
@@ -1938,6 +2010,7 @@ export function getChartScript(): string {
                     _originalColor: dataset.color,
                     _runName: dataset.runName,
                     _runId: dataset.runId,
+                    _runIds: dataset.runIds,
                     _isOriginal: true
                 }));
 
@@ -2057,6 +2130,7 @@ export function getChartScript(): string {
                                 _originalColor: dataset.color,
                                 _runName: dataset.runName,
                                 _runId: dataset.runId,
+                                _runIds: dataset.runIds,
                                 _isOriginal: true
                             }));
 

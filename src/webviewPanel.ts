@@ -1,19 +1,24 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 import * as fs from 'fs';
+import { flattenConfig } from './configUtils';
 import { WandbRunData, WandbMetrics } from './wandbParser';
+import { escapeHtml, serializeForScript } from './webviewHtml';
+import { getImageViewerData, getImageViewerHtml, getImageViewerScript, getImageViewerStyles, registerImageViewer, setImageResourceRoots, ImageViewerRun } from './imageViewer';
 
 export class WandbViewerPanel {
     public static currentPanel: WandbViewerPanel | undefined;
     private readonly _panel: vscode.WebviewPanel;
     private readonly _extensionUri: vscode.Uri;
     private _disposables: vscode.Disposable[] = [];
+    private _imageRuns: ImageViewerRun[] = [];
 
     private constructor(panel: vscode.WebviewPanel, extensionUri: vscode.Uri) {
         this._panel = panel;
         this._extensionUri = extensionUri;
 
         this._panel.onDidDispose(() => this.dispose(), null, this._disposables);
+        this._disposables.push(registerImageViewer(panel.webview, () => this._imageRuns));
     }
 
     public static createOrShow(
@@ -54,6 +59,8 @@ export class WandbViewerPanel {
         runDir: string,
         outputLogPath: string | null
     ) {
+        this._imageRuns = [{ runId: runData.runId, runName: runData.runName || runData.runId, runDir, images: runData.images || {} }];
+        setImageResourceRoots(this._panel.webview, [runDir], this._extensionUri);
         this._panel.webview.html = this._getHtmlContent(runData, logMetrics, runDir, outputLogPath);
 
         // Handle messages from the webview
@@ -119,6 +126,7 @@ export class WandbViewerPanel {
     <title>W&B Run Viewer</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
+        ${getImageViewerStyles()}
         * {
             box-sizing: border-box;
         }
@@ -299,6 +307,7 @@ export class WandbViewerPanel {
     <div class="tabs">
         <button class="tab active" data-tab="training">Training Metrics</button>
         <button class="tab" data-tab="system">System Metrics</button>
+        <button class="tab" data-tab="images">Images</button>
         <button class="tab" data-tab="config">Configuration</button>
     </div>
 
@@ -316,8 +325,11 @@ export class WandbViewerPanel {
         </div>
     </div>
 
+    ${getImageViewerHtml()}
+
     <script>
         const vscode = acquireVsCodeApi();
+        ${getImageViewerScript(getImageViewerData(this._imageRuns))}
 
         // Tab switching
         document.querySelectorAll('.tab').forEach(tab => {
@@ -340,8 +352,8 @@ export class WandbViewerPanel {
         ];
 
         // Metric data
-        const trainingMetrics = ${JSON.stringify(allMetrics)};
-        const systemMetrics = ${JSON.stringify(runData.systemMetrics)};
+        const trainingMetrics = ${serializeForScript(allMetrics)};
+        const systemMetrics = ${serializeForScript(runData.systemMetrics)};
 
         // Create charts for all metrics
         function createChart(canvasId, label, data, colorIndex = 0) {
@@ -353,10 +365,9 @@ export class WandbViewerPanel {
             new Chart(ctx, {
                 type: 'line',
                 data: {
-                    labels: data.map(d => d.step),
                     datasets: [{
                         label: label,
-                        data: data.map(d => d.value),
+                        data: data.map(d => ({ x: d.step, y: d.value })),
                         borderColor: color,
                         backgroundColor: color + '20',
                         fill: false,
@@ -370,7 +381,8 @@ export class WandbViewerPanel {
                     maintainAspectRatio: false,
                     interaction: {
                         intersect: false,
-                        mode: 'index'
+                        mode: 'nearest',
+                        axis: 'x'
                     },
                     plugins: {
                         legend: {
@@ -390,6 +402,7 @@ export class WandbViewerPanel {
                     },
                     scales: {
                         x: {
+                            type: 'linear',
                             title: {
                                 display: true,
                                 text: 'Step',
@@ -429,11 +442,11 @@ export class WandbViewerPanel {
         // Initialize all charts
         let chartIndex = 0;
         for (const [metric, data] of Object.entries(trainingMetrics)) {
-            createChart('chart-training-' + metric.replace(/[^a-zA-Z0-9]/g, '_'), metric, data, chartIndex++);
+            createChart('chart-training-' + encodeURIComponent(metric), metric, data, chartIndex++);
         }
         chartIndex = 0;
         for (const [metric, data] of Object.entries(systemMetrics)) {
-            createChart('chart-system-' + metric.replace(/[^a-zA-Z0-9]/g, '_'), metric, data, chartIndex++);
+            createChart('chart-system-' + encodeURIComponent(metric), metric, data, chartIndex++);
         }
     </script>
 </body>
@@ -453,83 +466,14 @@ export class WandbViewerPanel {
 }
 
 interface MetricGroup {
-    name: string;
     metrics: { [key: string]: any[] };
 }
 
 function groupMetrics(metrics: WandbMetrics): MetricGroup[] {
-    // Extract group name from the metric's natural hierarchy - NO HARDCODING
-    const groups: { [key: string]: { [key: string]: any[] } } = {};
-
-    for (const [key, values] of Object.entries(metrics)) {
-        if (!values || values.length === 0) continue;
-
-        const groupName = extractGroupName(key);
-
-        if (!groups[groupName]) {
-            groups[groupName] = {};
-        }
-        groups[groupName][key] = values;
-    }
-
-    // Sort groups: alphabetically, but with common training metrics first
-    const result: MetricGroup[] = [];
-    const allGroupNames = Object.keys(groups).sort((a, b) => {
-        // Priority groups come first (if they exist)
-        const priority = ['loss', 'accuracy', 'lr', 'optim', 'perf', 'time', 'step'];
-        const aIdx = priority.findIndex(p => a.toLowerCase().startsWith(p));
-        const bIdx = priority.findIndex(p => b.toLowerCase().startsWith(p));
-
-        if (aIdx !== -1 && bIdx !== -1) return aIdx - bIdx;
-        if (aIdx !== -1) return -1;
-        if (bIdx !== -1) return 1;
-
-        // GPU groups come after priority groups but before others
-        const aIsGpu = a.toLowerCase().startsWith('gpu');
-        const bIsGpu = b.toLowerCase().startsWith('gpu');
-        if (aIsGpu && bIsGpu) return a.localeCompare(b);
-        if (aIsGpu) return 1;
-        if (bIsGpu) return 1;
-
-        return a.localeCompare(b);
-    });
-
-    for (const name of allGroupNames) {
-        result.push({ name, metrics: groups[name] });
-    }
-
-    return result;
-}
-
-function extractGroupName(key: string): string {
-    // Handle hierarchical names with / (e.g., "loss/mean" -> "loss")
-    if (key.includes('/')) {
-        return key.split('/')[0];
-    }
-
-    // Handle dot-separated names (e.g., "gpu.0.memory" -> "gpu.0")
-    if (key.includes('.')) {
-        const parts = key.split('.');
-        // For gpu.X.metric, group by gpu.X
-        if (parts[0] === 'gpu' && parts.length >= 3) {
-            return `gpu.${parts[1]}`;
-        }
-        // For other dot-separated names, use first component
-        return parts[0];
-    }
-
-    // Handle underscore-separated names with common prefixes
-    // e.g., "train_loss" -> "train", "val_accuracy" -> "val"
-    if (key.includes('_')) {
-        const parts = key.split('_');
-        const commonPrefixes = ['train', 'val', 'test', 'eval'];
-        if (commonPrefixes.includes(parts[0])) {
-            return parts[0];
-        }
-    }
-
-    // For simple names without hierarchy, use the full name as the group
-    return key;
+    const nonEmptyMetrics = Object.fromEntries(
+        Object.entries(metrics).filter(([, values]) => Array.isArray(values) && values.length > 0)
+    );
+    return Object.keys(nonEmptyMetrics).length > 0 ? [{ metrics: nonEmptyMetrics }] : [];
 }
 
 function generateMetricGroupsHtml(groups: MetricGroup[], prefix: string): string {
@@ -539,13 +483,12 @@ function generateMetricGroupsHtml(groups: MetricGroup[], prefix: string): string
 
     return groups.map(group => `
         <div class="metric-group">
-            <h3>${group.name}</h3>
             <div class="charts-grid">
                 ${Object.entries(group.metrics).map(([key, _]) => `
                     <div class="chart-container">
-                        <div class="chart-title">${key}</div>
+                        <div class="chart-title">${escapeHtml(key)}</div>
                         <div class="chart-wrapper">
-                            <canvas id="chart-${prefix}-${key.replace(/[^a-zA-Z0-9]/g, '_')}"></canvas>
+                            <canvas id="chart-${prefix}-${encodeURIComponent(key)}"></canvas>
                         </div>
                     </div>
                 `).join('')}
@@ -559,10 +502,10 @@ function generateConfigHtml(config: { [key: string]: any }): string {
         return '<div class="no-data">No configuration found</div>';
     }
 
-    return Object.entries(config).map(([key, value]) => `
+    return Object.entries(flattenConfig(config)).map(([key, value]) => `
         <div class="config-item">
-            <div class="config-key">${key}</div>
-            <div class="config-value">${typeof value === 'object' ? JSON.stringify(value, null, 2) : String(value)}</div>
+            <div class="config-key">${escapeHtml(key)}</div>
+            <div class="config-value">${escapeHtml(typeof value === 'object' ? JSON.stringify(value, null, 2) : String(value))}</div>
         </div>
     `).join('');
 }

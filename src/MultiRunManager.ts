@@ -125,6 +125,7 @@ export function downsampleMetricPoints(
 export class MultiRunManager {
     private state: MultiRunState;
     private cacheAccessOrder: string[] = []; // For LRU eviction
+    private staleRunIds = new Set<string>();
     private colorPalette: RunColorPaletteName;
     private customRunColors: Readonly<Record<string, string>>;
     private runContentStatuses = new Map<string, RunContentStatus>();
@@ -175,6 +176,7 @@ export class MultiRunManager {
         this.state.runs.delete(runId);
         this.state.selectedRunIds.delete(runId);
         this.state.parsedData.delete(runId);
+        this.staleRunIds.delete(runId);
         this.state.colorMap.delete(runId);
         this.runContentStatuses.delete(runId);
 
@@ -382,7 +384,7 @@ export class MultiRunManager {
         const selectedRuns = Array.from(this.state.selectedRunIds);
 
         for (const runId of selectedRuns) {
-            if (!this.state.parsedData.has(runId)) {
+            if (!this.state.parsedData.has(runId) || this.staleRunIds.has(runId)) {
                 const run = this.state.runs.get(runId);
                 if (run) {
                     try {
@@ -391,15 +393,16 @@ export class MultiRunManager {
                         const parseTime = Date.now() - parseStart;
                         console.log(`  - Parsed run ${run.runName}: ${parseTime}ms (${Object.keys(parsed.metrics).length} metrics, ${Object.values(parsed.metrics).reduce((sum, m) => sum + m.length, 0)} data points)`);
                         this.state.parsedData.set(runId, parsed);
+                        this.staleRunIds.delete(runId);
                         this.runContentStatuses.set(
                             runId,
                             this.hasRunMetricData(parsed) ? 'has-data' : 'empty'
                         );
                         this.updateCacheAccess(runId);
                         this.evictIfNeeded();
-                    } catch (error) {
+                    } catch {
                         this.runContentStatuses.set(runId, 'unknown');
-                        console.error(`Failed to parse run ${runId}:`, error);
+                        console.error('Failed to parse a selected run; retaining its last successfully parsed data.');
                     }
                 }
             } else {
@@ -410,22 +413,19 @@ export class MultiRunManager {
     }
 
     /**
-     * Invalidate cached data for selected runs so they are parsed from disk again.
+     * Mark selected snapshots stale without discarding data already being shown.
      */
     invalidateSelectedRuns(): void {
         for (const runId of this.state.selectedRunIds) {
-            this.state.parsedData.delete(runId);
-            this.runContentStatuses.set(runId, 'unknown');
-
-            const index = this.cacheAccessOrder.indexOf(runId);
-            if (index > -1) {
-                this.cacheAccessOrder.splice(index, 1);
+            if (this.state.parsedData.has(runId)) {
+                this.staleRunIds.add(runId);
             }
+            this.runContentStatuses.set(runId, 'unknown');
         }
     }
 
     /**
-     * Get parsed data for a run (may be null if not parsed yet)
+     * Get the latest successful snapshot, including while a refresh is pending.
      */
     getParsedData(runId: string): WandbRunData | undefined {
         return this.state.parsedData.get(runId);
@@ -574,6 +574,7 @@ export class MultiRunManager {
             }
             const [lruRunId] = this.cacheAccessOrder.splice(lruIndex, 1);
             this.state.parsedData.delete(lruRunId);
+            this.staleRunIds.delete(lruRunId);
             deselectedCacheSize--;
         }
     }
@@ -587,17 +588,16 @@ export class MultiRunManager {
             // Update metadata
             this.state.runs.set(runResult.runId, runResult);
 
-            // Invalidate cached data if file was modified
+            // Keep the previous snapshot usable by concurrent chart/style updates
+            // until parsing succeeds. A transient read failure must not erase it.
             if (
                 existingRun.lastModified !== runResult.lastModified ||
                 existingRun.fileSize !== runResult.fileSize
             ) {
-                this.state.parsedData.delete(runResult.runId);
-                this.runContentStatuses.set(runResult.runId, 'unknown');
-                const index = this.cacheAccessOrder.indexOf(runResult.runId);
-                if (index > -1) {
-                    this.cacheAccessOrder.splice(index, 1);
+                if (this.state.parsedData.has(runResult.runId)) {
+                    this.staleRunIds.add(runResult.runId);
                 }
+                this.runContentStatuses.set(runResult.runId, 'unknown');
             }
         }
     }
